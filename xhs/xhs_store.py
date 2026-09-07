@@ -168,7 +168,7 @@ class XhsStore:
         返回: {"accessToken":..., "refreshToken":..., "expiresIn":...}
         """
         data = self._post("oauth.getAccessToken", {"code": code})
-        self.access_token = data.get("accessToken")
+        self.access_token = data.get("accessToken") or data.get("access_token")
         print(f"[oauth.getAccessToken] 获取成功 accessToken={self.access_token}")
         return data
 
@@ -182,7 +182,7 @@ class XhsStore:
         返回: 新的 token 信息
         """
         data = self._post("oauth.refreshAccessToken", {"refreshToken": refresh_token})
-        self.access_token = data.get("accessToken")
+        self.access_token = data.get("accessToken") or data.get("access_token")
         print(f"[oauth.refreshAccessToken] 刷新成功 accessToken={self.access_token}")
         return data
 
