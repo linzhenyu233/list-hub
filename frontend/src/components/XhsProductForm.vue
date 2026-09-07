@@ -216,7 +216,20 @@ async function submit() {
 onMounted(async () => {
   await loadOptions()
   if (props.itemData) {
-    const d = props.itemData
+    // product.getItemInfo returns itemInfo/skuInfos at the top level; normalize it
+    // before populating the same fields used by the create form.
+    const raw = props.itemData
+    const nested = raw.itemInfo || raw.data?.itemInfo || raw.product || raw.data?.product || raw.data || {}
+    // Some gateway responses also include null placeholders at the top level.
+    // Do not let those placeholders overwrite the real values in itemInfo.
+    const d = { ...nested, ...raw }
+    for (const key of Object.keys(nested)) {
+      if (d[key] == null || d[key] === '') d[key] = nested[key]
+    }
+    if (!d.skus?.length && Array.isArray(raw.skuInfos)) d.skus = raw.skuInfos
+    if (!d.images?.length && Array.isArray(raw.itemInfo?.images)) d.images = raw.itemInfo.images
+    if (!d.imageDescriptions?.length && Array.isArray(raw.itemInfo?.imageDescriptions)) d.imageDescriptions = raw.itemInfo.imageDescriptions
+    if (!d.attributes?.length && Array.isArray(raw.itemInfo?.attributes)) d.attributes = raw.itemInfo.attributes
     form.name = d.name || ''
     form.subName = d.subName || ''
     form.articleNo = d.articleNo || ''
@@ -250,7 +263,12 @@ onMounted(async () => {
     // 加载类目属性和规格
     if (form.categoryId) {
       try {
-        const [attrData, varData] = await Promise.all([xhsApi.categoryAttributes(form.categoryId), xhsApi.categoryVariations(form.categoryId)])
+        const [brandData, attrData, varData] = await Promise.all([
+          xhsApi.brands(form.categoryId),
+          xhsApi.categoryAttributes(form.categoryId),
+          xhsApi.categoryVariations(form.categoryId),
+        ])
+        brands.value = listFrom(brandData, ['brands', 'brandList', 'list'])
         attrDefs.value = listFrom(attrData, ['attributeV3s', 'attributes'])
         varDefs.value = listFrom(varData, ['variations'])
         attrDefs.value.forEach((a) => { attrValues[a.id] = a.isMulti ? [] : '' })
