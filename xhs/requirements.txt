@@ -1,0 +1,4 @@
+# 小红书店铺 API 服务 (xhs_api.py / xhs_store.py / guanyi_sync.py)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+requests>=2.31.0
