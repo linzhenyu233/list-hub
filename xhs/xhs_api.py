@@ -146,13 +146,16 @@ def _refresh_access_token():
     if not refresh:
         raise RuntimeError("没有保存 refreshToken，无法自动续期")
     data = _xhs_call("oauth.refreshAccessToken", {"refreshToken": refresh})
-    access = data.get("accessToken")
+    # 小红书 OAuth 响应用蛇形命名(access_token/refresh_token/expires_in),兼容驼峰写法
+    access = data.get("accessToken") or data.get("access_token")
     if not access:
         raise RuntimeError("刷新接口未返回 accessToken")
     tok["accessToken"] = access
-    if data.get("refreshToken"):
-        tok["refreshToken"] = data["refreshToken"]
-    tok["expireAt"] = int(time.time()) + int(data.get("expiresIn", 7 * 24 * 3600))
+    rk = data.get("refreshToken") or data.get("refresh_token")
+    if rk:
+        tok["refreshToken"] = rk
+    exp = data.get("expiresIn") or data.get("expires_in") or 7 * 24 * 3600
+    tok["expireAt"] = int(time.time()) + int(exp)
     _save_token(tok)
     return access
 
@@ -270,13 +273,18 @@ def token_by_code(body: dict = Body(..., example={"code": "code-xxx"})):
         raise HTTPException(status_code=400, detail="请求体需要 code 字段")
     data = _xhs_call("oauth.getAccessToken", {"code": code})
     tok = _load_token()
-    tok["accessToken"] = data.get("accessToken")
-    if data.get("refreshToken"):
-        tok["refreshToken"] = data["refreshToken"]
-    tok["expireAt"] = int(time.time()) + int(data.get("expiresIn", 7 * 24 * 3600))
+    # 小红书 OAuth 响应用蛇形命名,兼容驼峰写法
+    ak = data.get("accessToken") or data.get("access_token")
+    rk = data.get("refreshToken") or data.get("refresh_token")
+    exp = data.get("expiresIn") or data.get("expires_in") or 7 * 24 * 3600
+    if ak:
+        tok["accessToken"] = ak
+    if rk:
+        tok["refreshToken"] = rk
+    tok["expireAt"] = int(time.time()) + int(exp)
     _save_token(tok)
-    return {"ok": True, "result": {"accessToken": data.get("accessToken"),
-                                   "refreshToken": data.get("refreshToken"),
+    return {"ok": True, "result": {"accessToken": ak,
+                                   "refreshToken": rk,
                                    "expireAt": tok["expireAt"]}}
 
 
@@ -288,12 +296,17 @@ def token_refresh():
     if not refresh:
         raise HTTPException(status_code=400, detail="没有保存 refreshToken,无法续期")
     data = _xhs_call("oauth.refreshAccessToken", {"refreshToken": refresh})
-    tok["accessToken"] = data.get("accessToken")
-    if data.get("refreshToken"):
-        tok["refreshToken"] = data["refreshToken"]
-    tok["expireAt"] = int(time.time()) + int(data.get("expiresIn", 7 * 24 * 3600))
+    # 小红书 OAuth 响应用蛇形命名,兼容驼峰写法
+    ak = data.get("accessToken") or data.get("access_token")
+    rk = data.get("refreshToken") or data.get("refresh_token")
+    exp = data.get("expiresIn") or data.get("expires_in") or 7 * 24 * 3600
+    if ak:
+        tok["accessToken"] = ak
+    if rk:
+        tok["refreshToken"] = rk
+    tok["expireAt"] = int(time.time()) + int(exp)
     _save_token(tok)
-    return {"ok": True, "result": {"accessToken": data.get("accessToken"),
+    return {"ok": True, "result": {"accessToken": ak,
                                    "expireAt": tok["expireAt"]}}
 
 
