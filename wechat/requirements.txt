@@ -1,0 +1,4 @@
+# 微信小店 API 服务 (fastapi_server.py / wechat_store_client.py)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+requests>=2.31.0
