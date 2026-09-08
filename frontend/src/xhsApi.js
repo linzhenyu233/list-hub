@@ -16,6 +16,8 @@ http.interceptors.response.use(
 export const xhsApi = {
   health: () => http.get('/health'),
   tokenInfo: () => http.get('/token/info'),
+  tokenByCode: (code) => http.post('/token/code', { code }),
+  tokenRefresh: () => http.post('/token/refresh'),
   listItems: (params = {}) => http.get('/items', { params }),
   itemStatus: (itemIds) => http.post('/items/status', { item_ids: itemIds }),
   getItem: (itemId) => http.get(`/items/${itemId}`),

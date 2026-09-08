@@ -136,7 +136,7 @@ button, input { font-family: inherit; }
 .switch-list .el-select { width: 150px; }
 .form-actions { position: sticky; bottom: 0; z-index: 5; display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; padding: 15px 0; background: linear-gradient(to bottom, rgba(244,246,248,0), #f4f6f8 22%); }
 
-.settings-panel { max-width: 860px; padding: 26px; }
+.settings-panel { padding: 26px; }
 .connection-status { display: flex; align-items: center; gap: 16px; }
 .connection-status > div:nth-child(2) { flex: 1; }
 .connection-status h3, .connection-status p { margin: 0; }
@@ -147,6 +147,10 @@ button, input { font-family: inherit; }
 .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .setting-row strong, .setting-row span { display: block; }
 .setting-row span { margin-top: 6px; color: var(--muted); font-size: 12px; }
+.xhs-auth-actions { display: flex; align-items: center; gap: 10px; }
+.xhs-code-row { margin-top: 12px; }
+.xhs-code-row .el-input { max-width: 560px; }
+.xhs-auth-tip { margin: 10px 0 0; line-height: 1.7; }
 .security-note { display: flex; gap: 12px; margin-top: 24px; padding: 15px; border: 1px solid #f5d797; border-radius: 6px; background: #fffaf0; color: #8a5b00; }
 .security-note p, .security-note strong { margin: 0; }
 .security-note p { margin-top: 4px; font-size: 12px; }

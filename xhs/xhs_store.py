@@ -181,9 +181,9 @@ class XhsStore:
         - refresh_token: 首次换 token 时返回的 refreshToken
         返回: 新的 token 信息
         """
-        data = self._post("oauth.refreshAccessToken", {"refreshToken": refresh_token})
+        data = self._post("oauth.refreshToken", {"refreshToken": refresh_token})
         self.access_token = data.get("accessToken") or data.get("access_token")
-        print(f"[oauth.refreshAccessToken] 刷新成功 accessToken={self.access_token}")
+        print(f"[oauth.refreshToken] 刷新成功 accessToken={self.access_token}")
         return data
 
     # =================================================================

@@ -145,7 +145,7 @@ def _refresh_access_token():
     refresh = tok.get("refreshToken") or REFRESH_TOKEN
     if not refresh:
         raise RuntimeError("没有保存 refreshToken，无法自动续期")
-    data = _xhs_call("oauth.refreshAccessToken", {"refreshToken": refresh})
+    data = _xhs_call("oauth.refreshToken", {"refreshToken": refresh})
     # 小红书 OAuth 响应用蛇形命名(access_token/refresh_token/expires_in),兼容驼峰写法
     access = data.get("accessToken") or data.get("access_token")
     if not access:
@@ -182,7 +182,7 @@ def _xhs_call(method: str, payload: dict = None) -> dict:
     """调小红书网关。成功返回 data 字段;失败抛 HTTP 400 带完整错误信息"""
     access = None
     # oauth 换 token 的接口不需要 accessToken
-    if method not in ("oauth.getAccessToken", "oauth.refreshAccessToken"):
+    if method not in ("oauth.getAccessToken", "oauth.refreshToken"):
         access = _get_access_token()
 
     store = XhsStore(APP_ID, APP_SECRET, access)
@@ -210,7 +210,7 @@ def _xhs_call(method: str, payload: dict = None) -> dict:
         raise HTTPException(status_code=500, detail=f"请求小红书网关失败: {e}")
 
     expired = data.get("error_code") == 401 or "accessToken expired" in str(data.get("error_msg") or data.get("message") or "")
-    if expired and method not in ("oauth.getAccessToken", "oauth.refreshAccessToken"):
+    if expired and method not in ("oauth.getAccessToken", "oauth.refreshToken"):
         try:
             access = _refresh_access_token()
             store = XhsStore(APP_ID, APP_SECRET, access)
@@ -290,24 +290,37 @@ def token_by_code(body: dict = Body(..., example={"code": "code-xxx"})):
 
 @app.post("/token/refresh")
 def token_refresh():
-    """一键续期(accessToken 7天 / refreshToken 14天,14天内至少续一次)"""
+    """一键续期(accessToken 7天 / refreshToken 14天,14天内至少续一次)
+    小红书官方规则:accessToken 未过期且剩余有效期 > 30分钟 时,刷新不会换发新 token"""
     tok = _load_token()
     refresh = tok.get("refreshToken") or REFRESH_TOKEN
     if not refresh:
         raise HTTPException(status_code=400, detail="没有保存 refreshToken,无法续期")
-    data = _xhs_call("oauth.refreshAccessToken", {"refreshToken": refresh})
+    remain = int(tok.get("expireAt", 0)) - int(time.time())
+    if remain > 1800:
+        # 官方规则:剩余>30分钟刷新不会换发新 token,直接返回当前状态,避免前端误报"已续期"
+        return {"ok": True, "refreshed": False,
+                "result": {"expireAt": tok.get("expireAt"),
+                           "remain_days": round(remain / 86400, 2),
+                           "message": f"accessToken 仍有效（剩余 {round(remain / 86400, 2)} 天），按小红书规则剩余>30分钟不会换发新 token"}}
+    data = _xhs_call("oauth.refreshToken", {"refreshToken": refresh})
     # 小红书 OAuth 响应用蛇形命名,兼容驼峰写法
     ak = data.get("accessToken") or data.get("access_token")
     rk = data.get("refreshToken") or data.get("refresh_token")
-    exp = data.get("expiresIn") or data.get("expires_in") or 7 * 24 * 3600
+    # 官方返回 accessTokenExpiresAt(毫秒时间戳),没有 expiresIn 字段
+    exp_at = data.get("accessTokenExpiresAt") or data.get("accessToken_expires_at")
+    if exp_at:
+        tok["expireAt"] = int(exp_at) // 1000
+    else:
+        exp = data.get("expiresIn") or data.get("expires_in") or 7 * 24 * 3600
+        tok["expireAt"] = int(time.time()) + int(exp)
     if ak:
         tok["accessToken"] = ak
     if rk:
         tok["refreshToken"] = rk
-    tok["expireAt"] = int(time.time()) + int(exp)
     _save_token(tok)
-    return {"ok": True, "result": {"accessToken": ak,
-                                   "expireAt": tok["expireAt"]}}
+    return {"ok": True, "refreshed": True, "result": {"accessToken": ak,
+                                                      "expireAt": tok["expireAt"]}}
 
 
 # ==================================================================

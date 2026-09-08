@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 import { computed } from 'vue'
 import { Picture } from '@element-plus/icons-vue'
 
@@ -24,6 +24,7 @@ const attributes = computed(() => product.value.attrs || product.value.attribute
 
 const statusInfo = computed(() => {
   if (isWechat.value) {
+    if (Number(product.value.status) === 13) return { label: '审核中', type: 'warning' }
     return {
       0: { label: '未上架', type: 'info' },
       5: { label: '销售中', type: 'success' },
@@ -115,16 +116,13 @@ function skuSpecs(sku) {
     const name = item.attr_key || item.name
     const value = item.attr_value || item.value
     return name && value ? `${name}：${value}` : value || name
-  }).filter(Boolean).join('；') || '默认规格'
+  }).filter(Boolean).join('，') || '默认规格'
 }
 
 function skuStatus(sku) {
   if (isWechat.value) {
-    return {
-      0: { label: '未上架', type: 'info' },
-      5: { label: '销售中', type: 'success' },
-      11: { label: '已下架', type: 'warning' },
-    }[Number(sku.status)] || { label: '待确认', type: 'info' }
+    // 微信商品以下架/审核时,所有 SKU 统一显示商品级状态,避免数据延迟造成 SKU 状态与商品状态不一致
+    return statusInfo.value
   }
   return sku.buyable === true || sku.buyable === 1 || sku.available === 1
     ? { label: '销售中', type: 'success' }

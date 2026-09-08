@@ -294,7 +294,7 @@ onMounted(async () => {
 <template>
   <el-form ref="formRef" :model="form" label-position="top" class="product-form">
     <section class="form-section">
-      <div class="section-heading"><div><h3>小红书商品信息</h3><p>字段只用于小红书，不会写入微信小店</p></div><span class="section-index">01</span></div>
+      <div class="section-heading"><div><h3>小红书商品信息</h3><p>字段只用于小红书，不会写入微信平台</p></div><span class="section-index">01</span></div>
       <div class="form-grid form-grid-2">
         <el-form-item label="商品名称" prop="name" :rules="[{ required: true, message: '请输入商品名称' }]"><el-input v-model="form.name" placeholder="请输入商品名称" /></el-form-item>
         <el-form-item label="短标题/副标题"><el-input v-model="form.subName" maxlength="20" show-word-limit placeholder="可选，展示在商品名下方" /></el-form-item>
