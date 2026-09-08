@@ -336,10 +336,10 @@ onMounted(async () => {
 <template>
   <div class="xhs-view">
     <div class="page-heading">
-      <div><h1>小红书商品</h1><p>独立管理小红书商品与 SKU 上下架，审核状态不会与微信小店混用</p></div>
+      <div><h1>小红书商品</h1><p>独立管理小红书商品与 SKU 上下架，审核状态不会与微信平台混用</p></div>
       <div class="heading-actions"><el-button :icon="Refresh" :loading="refreshing" @click="loadItems">刷新状态</el-button><el-button type="primary" :icon="Plus" @click="emit('create')">发布小红书商品</el-button></div>
     </div>
-    <el-alert v-if="!serviceOnline" title="小红书服务未连接" description="请启动 xhs_api.py（默认 8010 端口）。它与微信小店 FastAPI 服务相互独立。" type="warning" show-icon :closable="false" class="offline-alert" />
+    <el-alert v-if="!serviceOnline" title="小红书服务未连接" description="请启动 xhs_api.py（默认 8010 端口）。它与微信 FastAPI 服务相互独立。" type="warning" show-icon :closable="false" class="offline-alert" />
     <el-alert v-else-if="!tokenConfigured" title="小红书尚未配置有效授权令牌" description="请先完成小红书 OAuth 授权或配置 accessToken。" type="warning" show-icon :closable="false" class="offline-alert" />
     <div class="stats-grid">
       <div class="stat-item"><span>商品总数</span><strong>{{ stats.total }}</strong><el-icon><Goods /></el-icon></div>

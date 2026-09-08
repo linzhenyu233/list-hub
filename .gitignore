@@ -1,6 +1,7 @@
 # ---- Python ----
 __pycache__/
 *.py[cod]
+*.pyo
 *.egg-info/
 .venv/
 venv/
@@ -18,46 +19,47 @@ dist/
 **/token_store.json
 *.pem
 *.key
+*.p12
+*.pfx
+*.crt
 
 # ---- 运行时数据 ----
 # 批量中台的 SQLite 目录库
 *.sqlite3
 *.sqlite
+*.db
 # upload_images.py 的输出文件
 uploaded_images.json
 uploaded_images.txt
 # 批量导入的图片缓存目录（bulk_api.py 的 IMAGE_DIR）
 images/
+**/images/
+# 管易云同步产物（含平台 SKU 绑定映射，敏感）
+**/guanyi_xhs_mapping.json
+**/guanyi_sync_state.json
 # 预留：第二档会把所有运行时数据统一收进 data/
 data/
+uploads/
+tmp/
+temp/
 
-# ---- IDE ----
+# ---- IDE / 工具缓存 ----
 .idea/
 .vscode/
-
-# Additional local/runtime files
-*.pyo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.log
 htmlcov/
 .coverage
+
+# ---- 日志 ----
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-*.p12
-*.pfx
-*.crt
-*.sqlite3
-*.db
-images/
-**/images/
-uploads/
-tmp/
-temp/
-uploaded_images.json
+
+# ---- 临时 / 测试产物 ----
 *.xlsx
 *.xls
 *.csv

@@ -1,5 +1,5 @@
-<script setup>
-import { computed, onMounted, ref } from 'vue'
+﻿<script setup>
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowLeft,
@@ -20,6 +20,7 @@ import {
   Upload,
 } from '@element-plus/icons-vue'
 import { storeApi } from './api'
+import { xhsApi } from './xhsApi'
 import ProductForm from './components/ProductForm.vue'
 import XhsProductPanel from './components/XhsProductPanel.vue'
 import XhsProductForm from './components/XhsProductForm.vue'
@@ -35,6 +36,12 @@ const loading = ref(false)
 const actionId = ref('')
 const serviceOnline = ref(false)
 const tokenTesting = ref(false)
+const xhsOnline = ref(false)
+const xhsChecking = ref(false)
+const xhsTokenInfo = ref(null)
+const xhsCode = ref('')
+const xhsAuthorizing = ref(false)
+const xhsRefreshing = ref(false)
 const products = ref([])
 const total = ref(0)
 const statusFilter = ref('')
@@ -57,6 +64,7 @@ const statusMap = {
   0: { label: '未上架', type: 'info' },
   5: { label: '销售中', type: 'success' },
   11: { label: '已下架', type: 'warning' },
+  13: { label: '审核中', type: 'warning' },
 }
 
 const stats = computed(() => ({
@@ -97,7 +105,7 @@ function productStock(row) {
   return row.stock_num ?? '--'
 }
 
-// 将“多个以空格/逗号/分号分隔”的输入拆成 trim 后的数组
+// 将"多个以空格/逗号/分号分隔"的输入拆成 trim 后的数组
 function splitTokens(str) {
   if (!str) return []
   return String(str).split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean)
@@ -231,7 +239,9 @@ async function showDetail(row) {
   detailData.value = null
   try {
     const data = await storeApi.getProduct(productId(row))
-    detailData.value = data.result?.data || data.result
+    const detail = data.result?.data || data.result || {}
+    // 详情接口有时不返回商品状态，沿用列表中的状态，避免审核中被误显示为销售中
+    detailData.value = { ...detail, product: { ...(detail.product || {}), status: detail.product?.status ?? detail.status ?? row.status } }
   } catch (error) {
     ElMessage.error(error.message)
   } finally {
@@ -300,6 +310,72 @@ function afterXhsCreated() {
   activeView.value = 'xhs-products'
 }
 
+async function checkXhsStatus() {
+  xhsChecking.value = true
+  try {
+    await xhsApi.health()
+    xhsOnline.value = true
+    try {
+      xhsTokenInfo.value = await xhsApi.tokenInfo()
+    } catch {
+      xhsTokenInfo.value = null
+    }
+  } catch {
+    xhsOnline.value = false
+    xhsTokenInfo.value = null
+  } finally {
+    xhsChecking.value = false
+  }
+}
+
+function xhsStatusText() {
+  if (!xhsOnline.value) return '服务未连接（请先启动 xhs_api.py，默认 8010 端口）'
+  const remain = xhsTokenInfo.value?.remain_days
+  // 没有过期时间记录 = 服务端没存过 token,当前用的是代码里写死的旧 token(早已过期)
+  if (remain === null || remain === undefined) return '未授权（当前用的是代码内置旧 token，请提交 code 授权）'
+  if (remain <= 0) return '已过期，请点“一键续期”'
+  return `授权有效，剩余 ${remain} 天`
+}
+
+async function authorizeXhs() {
+  const code = xhsCode.value.trim()
+  if (!code) return ElMessage.warning('请先粘贴授权回调里的 code')
+  xhsAuthorizing.value = true
+  try {
+    await xhsApi.tokenByCode(code)
+    ElMessage.success('小红书授权成功')
+    xhsCode.value = ''
+    await checkXhsStatus()
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    xhsAuthorizing.value = false
+  }
+}
+
+async function refreshXhsToken() {
+  xhsRefreshing.value = true
+  try {
+    const res = await xhsApi.tokenRefresh()
+    // 小红书规则:accessToken 剩余>30分钟时不会换发新 token,后端返回 refreshed=false
+    if (res?.refreshed === false) {
+      ElMessage.info(res?.result?.message || 'accessToken 仍有效，暂不需要续期')
+    } else {
+      ElMessage.success('小红书授权已续期')
+    }
+    await checkXhsStatus()
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    xhsRefreshing.value = false
+  }
+}
+
+// 进入连接设置页时自动刷新一次小红书授权状态
+watch(activeView, (value) => {
+  if (value === 'settings') void checkXhsStatus()
+})
+
 onMounted(async () => {
   await checkHealth()
   if (serviceOnline.value) await loadProducts()
@@ -311,7 +387,7 @@ onMounted(async () => {
     <el-aside width="224px" class="sidebar">
       <div class="brand">
         <div class="brand-mark"><el-icon><ShoppingBag /></el-icon></div>
-        <div><strong>微信小店</strong><span>运营工作台</span></div>
+        <div><strong>商品中台</strong><span>多平台运营</span></div>
       </div>
       <el-menu :default-active="activeView" class="nav-menu" @select="activeView = $event">
         <el-menu-item index="products" @click="selectPlatform('wechat')"><el-icon><Goods /></el-icon><span>微信商品</span></el-menu-item>
@@ -319,12 +395,12 @@ onMounted(async () => {
         <el-menu-item index="create" @click="platform = 'wechat'"><el-icon><CirclePlus /></el-icon><span>发布微信商品</span></el-menu-item>
         <el-menu-item index="xhs-create" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
         <el-menu-item index="bulk-publish" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
-        <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射表</span></el-menu-item>
+        <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
         <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
       </el-menu>
       <div class="sidebar-footer">
         <div :class="['service-dot', { online: serviceOnline }]" />
-        <div><strong>{{ serviceOnline ? '服务运行正常' : '后端未连接' }}</strong><span>API · 127.0.0.1:8000</span></div>
+        <div><strong>{{ serviceOnline ? '服务运行正常' : '服务暂时无法连接' }}</strong><span>平台服务</span></div>
       </div>
     </el-aside>
 
@@ -332,7 +408,7 @@ onMounted(async () => {
       <el-header class="topbar">
         <div>
           <span class="breadcrumb">运营中心 /</span>
-          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射表' : '接口设置' }}</strong>
+          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : '连接设置' }}</strong>
         </div>
         <div class="topbar-actions">
           <el-tooltip content="刷新服务状态"><el-button circle :icon="Refresh" @click="checkHealth" /></el-tooltip>
@@ -346,7 +422,7 @@ onMounted(async () => {
         </KeepAlive>
 
         <template v-if="activeView === 'xhs-create'">
-          <div class="page-heading"><div><h1>发布小红书商品</h1><p>小红书专属字段和接口，不会写入微信小店</p></div><el-button :icon="ArrowLeft" @click="activeView = 'xhs-products'">返回小红书商品</el-button></div>
+          <div class="page-heading"><div><h1>发布小红书商品</h1><p>小红书专属字段和接口，不会写入微信平台</p></div><el-button :icon="ArrowLeft" @click="activeView = 'xhs-products'">返回小红书商品</el-button></div>
           <XhsProductForm @created="afterXhsCreated" @cancel="activeView = 'xhs-products'" />
         </template>
 
@@ -358,11 +434,11 @@ onMounted(async () => {
 
         <template v-if="activeView === 'products'">
           <div class="page-heading">
-            <div><h1>商品管理</h1><p>查看微信小店商品状态并完成上下架操作</p></div>
-            <el-button type="primary" :icon="Plus" @click="activeView = 'create'">发布新商品</el-button>
+            <div><h1>微信商品</h1><p>查看微信商品状态并完成上下架操作</p></div>
+            <el-button type="primary" :icon="Plus" @click="activeView = 'create'">发布微信商品</el-button>
           </div>
 
-          <el-alert v-if="!serviceOnline" title="暂时无法连接后端服务" description="请先启动 FastAPI 服务，前端将通过 /api 代理访问 8000 端口。" type="warning" show-icon :closable="false" class="offline-alert" />
+          <el-alert v-if="!serviceOnline" title="暂时无法连接服务" description="请检查平台服务是否已启动。" type="warning" show-icon :closable="false" class="offline-alert" />
 
           <div class="stats-grid">
             <div class="stat-item"><span>商品总数</span><strong>{{ stats.all }}</strong><el-icon><Goods /></el-icon></div>
@@ -374,7 +450,7 @@ onMounted(async () => {
           <section class="content-panel">
             <ProductSearchBar
               v-model="searchForm"
-              code-placeholder="商品编码/SKU编码/条码，空格/逗号分隔"
+              code-placeholder="商品编码/SKU编码/条码，空格或逗号分隔"
               @reset="resetSearch"
             />
             <div class="panel-toolbar">
@@ -391,14 +467,14 @@ onMounted(async () => {
                     <el-image :src="productImage(row)" fit="cover" class="product-thumb">
                       <template #error><div class="image-fallback"><el-icon><Picture /></el-icon></div></template>
                     </el-image>
-                    <div><EllipsisText tag="strong" :text="productTitle(row)" /><EllipsisText :text="`ID：${productId(row) || '--'}`" /></div>
+                    <div><EllipsisText tag="strong" :text="productTitle(row)" /><EllipsisText :text="productId(row)" /></div>
                   </div>
                 </template>
               </el-table-column>
               <el-table-column label="价格" width="120" show-overflow-tooltip><template #default="{ row }"><strong class="price">{{ productPrice(row) }}</strong></template></el-table-column>
               <el-table-column label="库存" width="100" show-overflow-tooltip><template #default="{ row }">{{ productStock(row) }}</template></el-table-column>
               <el-table-column label="状态" width="120" show-overflow-tooltip>
-                <template #default="{ row }"><el-tag :type="statusMap[row.status]?.type || 'info'" effect="light" round>{{ statusMap[row.status]?.label || `状态 ${row.status ?? '--'}` }}</el-tag></template>
+                <template #default="{ row }"><el-tag :type="statusMap[row.status]?.type || 'info'" effect="light" round>{{ statusMap[row.status]?.label || '状态待确认' }}</el-tag></template>
               </el-table-column>
               <el-table-column label="操作" width="250" fixed="right">
                 <template #default="{ row }">
@@ -421,30 +497,43 @@ onMounted(async () => {
                 @size-change="onPageSizeChange"
                 @current-change="onPageChange"
               />
-              <span class="muted-copy">当前筛选显示 {{ filteredProducts.length }} 件</span>
+              <span class="muted-copy">当前筛选显示 {{ filteredProducts.length }} 项</span>
             </div>
           </section>
         </template>
 
         <template v-if="activeView === 'create'">
           <div class="page-heading">
-            <div><h1>发布新商品</h1><p>完成信息录入后先创建草稿，再从商品列表提交上架审核</p></div>
+             <div><h1>发布微信商品</h1><p>完成信息录入后先创建草稿，再从商品列表提交上架审核</p></div>
             <el-button :icon="ArrowLeft" @click="activeView = 'products'">返回商品列表</el-button>
           </div>
           <ProductForm @created="afterCreated" @cancel="activeView = 'products'" />
         </template>
 
         <template v-if="activeView === 'settings'">
-          <div class="page-heading"><div><h1>接口设置</h1><p>检查前端与微信小店服务的连接状态</p></div></div>
+          <div class="page-heading"><div><h1>连接设置</h1><p>查看平台服务的连接状态</p></div></div>
           <section class="settings-panel">
             <div class="connection-status">
               <div :class="['status-icon', { online: serviceOnline }]"><el-icon><Connection /></el-icon></div>
-              <div><h3>{{ serviceOnline ? 'FastAPI 服务已连接' : 'FastAPI 服务未连接' }}</h3><p>当前地址：{{ apiDisplay }}</p></div>
+              <div><h3>平台服务连接状态</h3><p>连接地址：{{ apiDisplay }}</p></div>
               <el-tag :type="serviceOnline ? 'success' : 'danger'" effect="light">{{ serviceOnline ? '正常' : '离线' }}</el-tag>
             </div>
             <el-divider />
-            <div class="setting-row"><div><strong>微信接口凭证</strong><span>调用后端测试 AppID 和 AppSecret 是否可以正常换取 access_token</span></div><el-button type="primary" plain :loading="tokenTesting" :disabled="!serviceOnline" @click="testToken">测试凭证</el-button></div>
-            <div class="security-note"><el-icon><Warning /></el-icon><div><strong>安全提醒</strong><p>AppSecret 应仅通过服务端环境变量配置，不应出现在前端、代码仓库或接口响应中。</p></div></div>
+            <div class="setting-row"><div><strong>微信账号授权</strong><span>检查微信账号授权是否正常</span></div><el-button type="primary" plain :loading="tokenTesting" :disabled="!serviceOnline" @click="testToken">检查授权</el-button></div>
+            <el-divider />
+            <div class="setting-row">
+              <div><strong>小红书账号授权</strong><span>{{ xhsStatusText() }}</span></div>
+              <div class="xhs-auth-actions">
+                <el-button plain :loading="xhsChecking" @click="checkXhsStatus">检查状态</el-button>
+                <el-button type="primary" plain :loading="xhsRefreshing" :disabled="!xhsOnline || !xhsTokenInfo?.has_refresh_token" @click="refreshXhsToken">一键续期</el-button>
+              </div>
+            </div>
+            <div class="setting-row xhs-code-row">
+              <el-input v-model="xhsCode" placeholder="粘贴授权回调地址里的 code（形如 ?code=xxx，10 分钟内有效）" clearable />
+              <el-button type="primary" :loading="xhsAuthorizing" :disabled="!xhsOnline" @click="authorizeXhs">提交授权</el-button>
+            </div>
+            <p class="muted-copy xhs-auth-tip">获取 code：浏览器打开授权链接（appId 换成应用 ID、redirectUri 换成回调地址），用店铺主账号登录后从回调地址复制 code。授权成功后 token 保存在服务端，快过期时会自动续期。</p>
+            <div class="security-note"><el-icon><Warning /></el-icon><div><strong>安全提醒</strong><p>账号授权信息仅由服务端保存，不会显示在前端或返回给页面</p></div></div>
           </section>
         </template>
       </el-main>
