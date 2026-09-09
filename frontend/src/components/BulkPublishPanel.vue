@@ -28,8 +28,15 @@ const platformSettings = ref({ xhsShipping: [], xhsLogistics: [], wechatBrand: '
 const batchPlatformSettings = reactive({ wechatFreightId: '', xhsShippingId: '', xhsLogisticsId: '' })
 const groupAttrDefs = reactive({})
 const attrConfigLoading = ref(false)
-const activeAttrGroups = reactive({})
+const attrDrawerVisible = ref(false)
+const attrDrawerGroup = ref('')
+function openAttrDrawer(key) {
+  attrDrawerGroup.value = key
+  attrDrawerVisible.value = true
+}
 const attrMatchStatus = reactive({})
+// 有未匹配属性的类目数(用于工具栏提示)
+const unmatchedCategoryCount = computed(() => Object.values(attrMatchStatus).filter((s) => (s?.unmatched || 0) > 0).length)
 const reviewVisible = ref(false)
 const reviewProduct = ref(null)
 const currentJob = ref(null)
@@ -223,6 +230,11 @@ async function autoMatchWechatCategories() {
             }
             return
           }
+          // 兜底:搜索返回 0 结果(内部类目名不在微信 cats_v2 关键词里)但别名已存,直接信任已存别名
+          if (candidates.length === 0 && savedChain.length) {
+            mappings[product.product_code] = { ...freight, wechat_category: alias.wechat.category, wechat_category_chain: savedChain, status: '微信类目已按映射表匹配' }
+            return
+          }
         }
         const exact = candidates.filter((item) => {
           const names = (item.chain || []).map((node) => String(node.name || '').trim())
@@ -257,7 +269,7 @@ async function autoMatchWechatCategories() {
       const current = mappings[product.product_code] || {}
       const categoryId = current.xhs_category_id
       let brandId = current.xhs_brand_id || ''
-      if (categoryId && product.brand && !brandId) {
+      if (categoryId && !brandId) {
         try {
           // 与单独发布页保持一致：先读取该末级类目的完整店铺品牌列表，避免关键词查询漏品牌
           const cacheKey = String(categoryId)
@@ -265,9 +277,13 @@ async function autoMatchWechatCategories() {
           xhsBrandCache[cacheKey] = brandData
           const brands = listFrom(brandData, ['brands', 'brandList', 'list'])
           const normalizeBrand = (value) => String(value || '').replace(/[\s（）()·・]/g, '').toLowerCase()
-          const targetBrand = normalizeBrand(product.brand)
-          const exact = brands.filter((item) => normalizeBrand(optionName(item)) === targetBrand)
-          if (exact.length === 1) brandId = settingId(exact[0])
+          if (product.brand) {
+            const targetBrand = normalizeBrand(product.brand)
+            const exact = brands.filter((item) => normalizeBrand(optionName(item)) === targetBrand)
+            if (exact.length === 1) brandId = settingId(exact[0])
+          }
+          // 兜底:Excel 没填品牌时,默认取该类目下第一个品牌(运营可在「审核编辑」里逐条改)
+          if (!brandId && brands.length) brandId = settingId(brands[0])
         } catch { /* brand remains unconfirmed */ }
       }
       mappings[product.product_code] = { ...current, xhs_brand_id: brandId,
@@ -354,7 +370,6 @@ async function loadGroupAttrDefs(silent = false) {
       if (existing?.xhs?.defaults) { for (const [k, v] of Object.entries(existing.xhs.defaults)) { if (v !== '' && !(Array.isArray(v) && !v.length)) config.xhs.defaults[k] = v } }
       if (existing?.xhs?.spec_map) Object.assign(config.xhs.spec_map, existing.xhs.spec_map)
       groupAttrDefs[group.internal_category] = config
-      activeAttrGroups[group.internal_category] = true
     }))
     ElMessage.success(`已加载 ${groups.length} 个类目组的属性定义`)
     const result = autoMatchProductAttributes()
@@ -391,6 +406,42 @@ function wxTypeLabel(t) {
   return wxTypeLabels[t] || t || ''
 }
 
+// 货盘「商品属性」键名 → 平台属性名 的别名(同义/缩略名兜底)。全店通用,不随类目变
+const ATTR_KEY_ALIASES = {
+  '主体材质': '材质',
+  '赠链材质': '材质',
+  '主钻克拉数': '主钻分数（最低）',
+  '主钻分数': '主钻分数（最低）',
+  '切工级别': '钻石切工',
+  '镶嵌': '镶嵌方式',
+  '鉴定证书': '鉴定标识',
+}
+// 货盘属性值 → 平台属性值(名称) 的别名(枚举值对不上时兜底)
+const ATTR_VALUE_ALIASES = {
+  '鉴定标识': {
+    'NGTC（国检）': '国内鉴定',
+    'NGTC': '国内鉴定',
+    'IGI+NGTC': '国际鉴定',
+    'GTC(省检）': '国内鉴定',
+    'GDTC（省检）': '国内鉴定',
+  },
+  // 钻石切工:平台候选是「英文/中文」格式(如 Very good/优良),货盘可能写 VG/很好、VG、很好、Very good 等
+  '钻石切工': {
+    'Very good/优良': 'Very good/优良', 'VG/很好': 'Very good/优良',
+    'Very good': 'Very good/优良', '优良': 'Very good/优良', 'VG': 'Very good/优良', 'vg': 'Very good/优良', '很好': 'Very good/优良',
+    'Good/良好': 'Good/良好', 'GD/良好': 'Good/良好',
+    'Good': 'Good/良好', '良好': 'Good/良好', 'GD': 'Good/良好', 'gd': 'Good/良好',
+    'Excellent/极优': 'Excellent/极优', 'EX/极优': 'Excellent/极优',
+    'Excellent': 'Excellent/极优', '极优': 'Excellent/极优', 'EX': 'Excellent/极优', 'ex': 'Excellent/极优',
+    'Poor/未分级': 'Poor/未分级', '未分级': 'Poor/未分级',
+  },
+}
+// 平台属性默认值(货盘没有对应数据的属性,如 认证标识/鉴定类别)。按属性 id 记,值为平台 valueId 或数组
+const ATTR_DEFAULTS = {
+  '62b2846fa21ae000011a7686': ['662650ac2c821c0001a44630'],  // 认证标识(多选) = CMA
+  '62b2846fa21ae000011a77aa': ['662650ac2c821c0001a44621'],  // 鉴定类别(多选) = 国家珠宝玉石质量监督检验中心(NGTC国检)
+}
+
 function autoMatchProductAttributes() {
   let matched = 0, unmatched = 0
   for (const group of mappingGroups.value) {
@@ -404,7 +455,14 @@ function autoMatchProductAttributes() {
       if (firstSku) {
         const specNames = (firstSku.specs || []).map((s) => s.name).filter(Boolean)
         for (const varDef of config.xhs.var_defs) {
-          const hitName = specNames.find((n) => n === varDef.name || varDef.name.includes(n) || n.includes(varDef.name))
+          // 货盘规格名 → xhs 规格维度名 别名表(模糊匹配的补充)
+          const SPEC_NAME_ALIASES = { '颜色': '颜色分类', '颜色分类': '颜色分类', '钻石颜色': '颜色分类', '尺码': '尺寸', '尺寸': '尺寸', '主钻分数': '尺寸', '款式': '款式', '净度': '钻石净度', '钻石净度': '钻石净度', '圈号': '圈口', '圈口': '圈口', '规格': '规格', '长度': '长度', '重量': '规格/重量', '大小': '大小' }
+          const hitName = specNames.find((n) => {
+            if (n === varDef.name) return n
+            if (varDef.name.includes(n) || n.includes(varDef.name)) return n
+            if (SPEC_NAME_ALIASES[n] === varDef.name) return n  // 别名兜底
+            return null
+          })
           if (hitName) config.xhs.spec_map[varDef.id] = hitName
         }
       }
@@ -416,20 +474,44 @@ function autoMatchProductAttributes() {
       const wxAttrs = { ...(prodMapping.wechat_attrs || {}) }
       const xhsAttrs = { ...(prodMapping.xhs_attrs || {}) }
       for (const [name, val] of Object.entries(excelAttrs)) {
+        // 键名先走别名(主体材质→材质、主钻克拉数→主钻分数…)
+        const resolvedName = ATTR_KEY_ALIASES[name] || name
         // 微信: 名称匹配(精确+模糊)，值直接用文本
-        const wxDef = (config.wechat.attr_defs || []).find((d) => d.name === name)
-          || (config.wechat.attr_defs || []).find((d) => d.name.includes(name) || name.includes(d.name))
+        const wxDef = (config.wechat.attr_defs || []).find((d) => d.name === resolvedName)
+          || (config.wechat.attr_defs || []).find((d) => d.name.includes(resolvedName) || resolvedName.includes(d.name))
         if (wxDef) { wxAttrs[wxDef.name] = val; gMatched++ } else { gUnmatched++ }
         // 小红书: 名称匹配(精确+模糊) + 候选值匹配 valueId
-        const xhsDef = (config.xhs.attr_defs || []).find((d) => d.name === name)
-          || (config.xhs.attr_defs || []).find((d) => d.name.includes(name) || name.includes(d.name))
+        const xhsDef = (config.xhs.attr_defs || []).find((d) => d.name === resolvedName)
+          || (config.xhs.attr_defs || []).find((d) => d.name.includes(resolvedName) || resolvedName.includes(d.name))
         if (xhsDef) {
           const cands = config.xhs.candidates[xhsDef.id] || []
+          // 兜底:货盘值带 / 时(如「VG/很好」),拆开前后段都试一次查别名表
+          const aliasMap = ATTR_VALUE_ALIASES[xhsDef.name] || {}
+          let valueAlias = aliasMap[val]
+          if (!valueAlias && val.includes('/')) {
+            valueAlias = aliasMap[val.split('/')[0].trim()] || aliasMap[val.split('/').pop().trim()]
+          }
           const hit = cands.find((c) => c.valueName === val) || cands.find((c) => c.valueName.includes(val) || val.includes(c.valueName))
           if (hit) { xhsAttrs[xhsDef.id] = { propertyId: xhsDef.id, name: xhsDef.name, valueId: hit.valueId, value: hit.valueName }; gMatched++ }
+          else if (valueAlias) {
+            // 值别名兜底:货盘值(如 NGTC（国检）)映射成平台值(国内鉴定)
+            const aliases = Array.isArray(valueAlias) ? valueAlias : [valueAlias]
+            const mapped = aliases.map((av) => { const ac = cands.find((c) => c.valueName === av); return { propertyId: xhsDef.id, name: xhsDef.name, valueId: ac?.valueId || '', value: ac?.valueName || av } })
+            xhsAttrs[xhsDef.id] = xhsDef.isMulti ? mapped : mapped[0]
+            gMatched++
+          }
           else if (xhsDef.inputType === 0 || xhsDef.customizable) { xhsAttrs[xhsDef.id] = { propertyId: xhsDef.id, name: xhsDef.name, valueId: '', value: val }; gMatched++ }
           else { gUnmatched++ }
         } else { gUnmatched++ }
+      }
+      // 应用平台默认值(货盘没有对应数据的属性,如 认证标识/鉴定类别)
+      for (const [attrId, defVal] of Object.entries(ATTR_DEFAULTS)) {
+        const def = (config.xhs.attr_defs || []).find((d) => d.id === attrId)
+        if (!def) continue
+        const cands = config.xhs.candidates[attrId] || []
+        const ids = Array.isArray(defVal) ? defVal : [defVal]
+        const mapped = ids.map((vid) => { const c = cands.find((cc) => cc.valueId === vid); return { propertyId: attrId, name: def.name, valueId: vid, value: c?.valueName || vid } })
+        xhsAttrs[attrId] = def.isMulti ? mapped : mapped[0]
       }
       // SKU 规格值 → 小红书 valueId
       const skuVariants = {}
@@ -451,7 +533,10 @@ function autoMatchProductAttributes() {
       // 更新组级默认显示(用第一个商品的值)
       if (product === groupProducts[0]) {
         Object.assign(config.wechat.defaults, wxAttrs)
-        for (const [id, attr] of Object.entries(xhsAttrs)) { if (attr.valueId) config.xhs.defaults[id] = attr.valueId }
+        for (const [id, attr] of Object.entries(xhsAttrs)) {
+          if (Array.isArray(attr)) config.xhs.defaults[id] = attr.map((a) => a.valueId).filter(Boolean)
+          else if (attr.valueId) config.xhs.defaults[id] = attr.valueId
+        }
       }
       mapping.value.products[product.product_code] = { ...prodMapping, wechat_attrs: wxAttrs, xhs_attrs: xhsAttrs, xhs_sku_variants: skuVariants }
     }
@@ -708,51 +793,59 @@ async function publish() {
         <template v-for="(options, level) in (xhsCascade[group.internal_category]?.levels || [])" :key="level"><el-select :model-value="xhsCascade[group.internal_category]?.selected?.[level]" :placeholder="`第${level + 1}级类目`" @change="(value) => confirmXhsCategory(group, level, value)"><el-option v-for="item in options" :key="item.id || item.categoryId" :label="item.name" :value="item.id || item.categoryId" /></el-select></template>
       </div>
     </div>
+    <div v-if="step === 2 && Object.keys(groupAttrDefs).length" style="display: flex; gap: 8px; align-items: center; margin: 12px 0">
+      <span class="muted-copy">共 {{ Object.keys(groupAttrDefs).length }} 个类目，{{ unmatchedCategoryCount }} 个有未匹配属性 · 点击「配置属性」在抽屉中填写</span>
+    </div>
     <div v-if="step === 2 && Object.keys(groupAttrDefs).length" class="mapping-confirm-list">
       <div v-for="group in mappingGroups.filter((g) => groupAttrDefs[g.internal_category])" :key="`attr-${group.internal_category}`" class="attr-config-group">
         <div class="mapping-confirm-row" style="flex-wrap: wrap; gap: 8px">
           <strong>{{ group.internal_category }}</strong>
           <span class="muted-copy">（{{ group.products.length }} 个商品）</span>
           <el-tag v-if="attrMatchStatus[group.internal_category]" size="small" :type="attrMatchStatus[group.internal_category].unmatched ? 'warning' : 'success'">属性匹配 {{ attrMatchStatus[group.internal_category].matched }}✓{{ attrMatchStatus[group.internal_category].unmatched ? ` / ${attrMatchStatus[group.internal_category].unmatched}✗` : '' }}</el-tag>
-          <el-button size="small" text @click="activeAttrGroups[group.internal_category] = !activeAttrGroups[group.internal_category]">{{ activeAttrGroups[group.internal_category] ? '收起' : '展开' }}</el-button>
-        </div>
-        <div v-if="activeAttrGroups[group.internal_category]" style="padding: 12px 0">
-          <div v-if="groupAttrDefs[group.internal_category]?.wechat?.attr_defs?.length" style="margin-bottom: 16px">
-            <h4 style="margin: 0 0 8px">微信商品属性 <small class="muted-copy">(已从 Excel “商品属性”列自动匹配，未匹配的可手动填写)</small></h4>
-            <div class="form-grid form-grid-2">
-              <div v-for="a in groupAttrDefs[group.internal_category].wechat.attr_defs" :key="a.name" class="attr-config-item">
-                <label>{{ a.is_required ? '* ' : '' }}{{ a.name }}<small v-if="a.type_v2" class="muted-copy"> ({{ wxTypeLabel(a.type_v2) }})</small></label>
-                <el-select v-if="a.type_v2 === 'select_many'" multiple :model-value="groupAttrDefs[group.internal_category].wechat.defaults[a.name]" placeholder="请选择" @update:model-value="(v) => setGroupWxAttr(group.internal_category, a.name, v)"><el-option v-for="opt in attrOptions(a.value)" :key="opt" :label="opt" :value="opt" /></el-select>
-                <el-select v-else-if="a.type_v2 === 'select_one'" :model-value="groupAttrDefs[group.internal_category].wechat.defaults[a.name]" placeholder="请选择" @update:model-value="(v) => setGroupWxAttr(group.internal_category, a.name, v)"><el-option v-for="opt in attrOptions(a.value)" :key="opt" :label="opt" :value="opt" /></el-select>
-                <el-input-number v-else-if="a.type_v2?.includes('integer') || a.type_v2?.includes('decimal')" :model-value="groupAttrDefs[group.internal_category].wechat.defaults[a.name]" @update:model-value="(v) => setGroupWxAttr(group.internal_category, a.name, v)" />
-                <el-input v-else :model-value="groupAttrDefs[group.internal_category].wechat.defaults[a.name]" placeholder="请输入" @update:model-value="(v) => setGroupWxAttr(group.internal_category, a.name, v)" />
-              </div>
-            </div>
-          </div>
-          <div v-if="groupAttrDefs[group.internal_category]?.xhs?.attr_defs?.length" style="margin-bottom: 16px">
-            <h4 style="margin: 0 0 8px">小红书商品属性 <small class="muted-copy">(已自动匹配属性值，未匹配的可手动选择)</small></h4>
-            <div class="form-grid form-grid-2">
-              <div v-for="a in groupAttrDefs[group.internal_category].xhs.attr_defs" :key="a.id" class="attr-config-item">
-                <label>{{ a.isRequired ? '* ' : '' }}{{ a.name }}<small v-if="a.isMulti" class="muted-copy"> (多选)</small></label>
-                <el-select v-if="a.isMulti" multiple :model-value="groupAttrDefs[group.internal_category].xhs.defaults[a.id]" placeholder="请选择" @update:model-value="(v) => setGroupXhsAttr(group.internal_category, a.id, v)"><el-option v-for="c in (groupAttrDefs[group.internal_category].xhs.candidates[a.id] || [])" :key="c.valueId" :label="c.valueName" :value="c.valueId" /></el-select>
-                <el-select v-else-if="a.inputType === 1 && (groupAttrDefs[group.internal_category].xhs.candidates[a.id] || []).length" :model-value="groupAttrDefs[group.internal_category].xhs.defaults[a.id]" placeholder="请选择" @update:model-value="(v) => setGroupXhsAttr(group.internal_category, a.id, v)"><el-option v-for="c in (groupAttrDefs[group.internal_category].xhs.candidates[a.id] || [])" :key="c.valueId" :label="c.valueName" :value="c.valueId" /></el-select>
-                <el-input v-else :model-value="groupAttrDefs[group.internal_category].xhs.defaults[a.id]" placeholder="请输入" @update:model-value="(v) => setGroupXhsAttr(group.internal_category, a.id, v)" />
-              </div>
-            </div>
-          </div>
-          <div v-if="groupAttrDefs[group.internal_category]?.xhs?.var_defs?.length">
-            <h4 style="margin: 0 0 8px">小红书规格映射 <small class="muted-copy">(已自动按名称匹配，可手动调整)</small></h4>
-            <p class="muted-copy" style="margin: 0 0 8px">Excel 规格列（规格1、规格2、规格3…可自由增减）→ 小红书规格维度，SKU 规格值已自动翻译为平台属性值</p>
-            <div class="form-grid form-grid-2">
-              <div v-for="v in groupAttrDefs[group.internal_category].xhs.var_defs" :key="v.id" class="attr-config-item">
-                <label>{{ v.name }}</label>
-                <el-select :model-value="groupAttrDefs[group.internal_category].xhs.spec_map[v.id] || ''" placeholder="不映射" @update:model-value="(val) => setGroupSpecMap(group.internal_category, v.id, val)"><el-option label="不映射" value="" /><el-option v-for="dim in groupSpecDimensions(group.internal_category)" :key="dim" :label="dim" :value="dim" /></el-select>
-              </div>
-            </div>
-          </div>
+          <el-button size="small" type="primary" text @click="openAttrDrawer(group.internal_category)">配置属性</el-button>
         </div>
       </div>
     </div>
+    <el-drawer v-model="attrDrawerVisible" :title="`${attrDrawerGroup} · 属性配置`" size="720px">
+      <template v-if="groupAttrDefs[attrDrawerGroup]">
+        <div v-if="groupAttrDefs[attrDrawerGroup]?.wechat?.attr_defs?.length" style="margin-bottom: 20px">
+          <h4 style="margin: 0 0 8px">微信商品属性 <small class="muted-copy">(已从 Excel “商品属性”列自动匹配，未匹配的可手动填写)</small></h4>
+          <div class="form-grid form-grid-2">
+            <div v-for="a in groupAttrDefs[attrDrawerGroup].wechat.attr_defs" :key="a.name" class="attr-config-item">
+              <label>{{ a.is_required ? '* ' : '' }}{{ a.name }}<small v-if="a.type_v2" class="muted-copy"> ({{ wxTypeLabel(a.type_v2) }})</small></label>
+              <el-select v-if="a.type_v2 === 'select_many'" multiple :model-value="groupAttrDefs[attrDrawerGroup].wechat.defaults[a.name]" placeholder="请选择" @update:model-value="(v) => setGroupWxAttr(attrDrawerGroup, a.name, v)"><el-option v-for="opt in attrOptions(a.value)" :key="opt" :label="opt" :value="opt" /></el-select>
+              <el-select v-else-if="a.type_v2 === 'select_one'" :model-value="groupAttrDefs[attrDrawerGroup].wechat.defaults[a.name]" placeholder="请选择" @update:model-value="(v) => setGroupWxAttr(attrDrawerGroup, a.name, v)"><el-option v-for="opt in attrOptions(a.value)" :key="opt" :label="opt" :value="opt" /></el-select>
+              <el-input-number v-else-if="a.type_v2?.includes('integer') || a.type_v2?.includes('decimal')" :model-value="groupAttrDefs[attrDrawerGroup].wechat.defaults[a.name]" @update:model-value="(v) => setGroupWxAttr(attrDrawerGroup, a.name, v)" />
+              <el-input v-else :model-value="groupAttrDefs[attrDrawerGroup].wechat.defaults[a.name]" placeholder="请输入" @update:model-value="(v) => setGroupWxAttr(attrDrawerGroup, a.name, v)" />
+            </div>
+          </div>
+        </div>
+        <div v-if="groupAttrDefs[attrDrawerGroup]?.xhs?.attr_defs?.length" style="margin-bottom: 20px">
+          <h4 style="margin: 0 0 8px">小红书商品属性 <small class="muted-copy">(已自动匹配属性值，未匹配的可手动选择)</small></h4>
+          <div class="form-grid form-grid-2">
+            <div v-for="a in groupAttrDefs[attrDrawerGroup].xhs.attr_defs" :key="a.id" class="attr-config-item">
+              <label>{{ a.isRequired ? '* ' : '' }}{{ a.name }}<small v-if="a.isMulti" class="muted-copy"> (多选)</small></label>
+              <el-select v-if="a.isMulti" multiple :model-value="groupAttrDefs[attrDrawerGroup].xhs.defaults[a.id]" placeholder="请选择" @update:model-value="(v) => setGroupXhsAttr(attrDrawerGroup, a.id, v)"><el-option v-for="c in (groupAttrDefs[attrDrawerGroup].xhs.candidates[a.id] || [])" :key="c.valueId" :label="c.valueName" :value="c.valueId" /></el-select>
+              <el-select v-else-if="a.inputType === 1 && (groupAttrDefs[attrDrawerGroup].xhs.candidates[a.id] || []).length" :model-value="groupAttrDefs[attrDrawerGroup].xhs.defaults[a.id]" placeholder="请选择" @update:model-value="(v) => setGroupXhsAttr(attrDrawerGroup, a.id, v)"><el-option v-for="c in (groupAttrDefs[attrDrawerGroup].xhs.candidates[a.id] || [])" :key="c.valueId" :label="c.valueName" :value="c.valueId" /></el-select>
+              <el-input v-else :model-value="groupAttrDefs[attrDrawerGroup].xhs.defaults[a.id]" placeholder="请输入" @update:model-value="(v) => setGroupXhsAttr(attrDrawerGroup, a.id, v)" />
+            </div>
+          </div>
+        </div>
+        <div v-if="groupAttrDefs[attrDrawerGroup]?.xhs?.var_defs?.length">
+          <h4 style="margin: 0 0 8px">小红书规格映射 <small class="muted-copy">(已自动按名称匹配，可手动调整)</small></h4>
+          <p class="muted-copy" style="margin: 0 0 8px">Excel 规格列（规格1、规格2、规格3…可自由增减）→ 小红书规格维度，SKU 规格值已自动翻译为平台属性值</p>
+          <div class="form-grid form-grid-2">
+            <div v-for="v in groupAttrDefs[attrDrawerGroup].xhs.var_defs" :key="v.id" class="attr-config-item">
+              <label>{{ v.name }}</label>
+              <el-select :model-value="groupAttrDefs[attrDrawerGroup].xhs.spec_map[v.id] || ''" placeholder="不映射" @update:model-value="(val) => setGroupSpecMap(attrDrawerGroup, v.id, val)"><el-option label="不映射" value="" /><el-option v-for="dim in groupSpecDimensions(attrDrawerGroup)" :key="dim" :label="dim" :value="dim" /></el-select>
+            </div>
+          </div>
+        </div>
+        <div class="form-actions">
+          <el-button type="primary" @click="attrDrawerVisible = false">完成</el-button>
+        </div>
+      </template>
+    </el-drawer>
     <section v-if="step === 0" class="content-panel bulk-card"><div class="bulk-drop"><el-icon><Upload /></el-icon><h3>选择商品 Excel</h3><p>每个 SKU 一行；.xlsx 支持主图和详情图列中的内嵌图片或公网图片链接</p><input type="file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" @change="file = $event.target.files[0]" /><strong v-if="file">{{ file.name }}</strong></div><el-button type="primary" :loading="loading" @click="importFile">导入并校验 <el-icon><Right /></el-icon></el-button></section>
     <section v-else-if="step === 1" class="content-panel bulk-card"><div class="bulk-summary"><span>批次 {{ batch.id }}</span><el-tag type="success">可发布 {{ validCount }}</el-tag><el-tag type="danger">错误 {{ errorCount }}</el-tag></div><el-table :data="items" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="line" label="行" width="70" /><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip /><el-table-column prop="sku_code" label="SKU编码" width="150" show-overflow-tooltip /><el-table-column prop="price" label="售价" width="100" /><el-table-column prop="stock" label="库存" width="90" /><el-table-column label="校验结果" min-width="220" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.errors?.length" type="danger">{{ row.errors.join('；') }}</el-tag><el-tag v-else type="success">通过</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="160" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '继承组级默认' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button @click="step = 0">重新导入</el-button><el-button type="primary" :loading="loading" @click="validateBatch">重新校验并继续</el-button></div></section>
     <section v-else-if="step === 2" class="content-panel bulk-card"><h3>平台映射</h3><p class="muted-copy">系统会按每个商品的 Excel 内部类目分别匹配微信和小红书类目，运营不需要填写全店统一类目。匹配不到的商品会单独标记。</p><el-table :data="mappingRows" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="product_code" label="商品编码" width="170" show-overflow-tooltip /><el-table-column prop="internal_category" label="Excel 内部类目" min-width="240" show-overflow-tooltip /><el-table-column label="微信类目" min-width="180" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.wechat_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="小红书类目" min-width="180" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.xhs_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="匹配状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag type="warning">{{ row.mapping.status || '待处理' }}</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="140" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '未配置' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button @click="step = 1">返回</el-button><el-button type="primary" :loading="loading" @click="saveAndNext">保存自动映射并继续</el-button></div></section>

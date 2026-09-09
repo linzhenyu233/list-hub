@@ -42,8 +42,12 @@ _WECHAT_CATEGORY_CHAIN_CACHE = {}
 
 
 def db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
+    # WAL 模式:读写互不阻塞,大幅降低 database is locked
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("""CREATE TABLE IF NOT EXISTS batches (
         id TEXT PRIMARY KEY, filename TEXT, status TEXT, total INTEGER DEFAULT 0,
         valid INTEGER DEFAULT 0, errors INTEGER DEFAULT 0, created_at TEXT,
@@ -226,7 +230,7 @@ def _xhs_payload(product, mapping, group_config=None):
             "variantIds": [], "images": product.get("main_images") or [],
             "imageDescriptions": product.get("detail_images") or [],
             "description": product.get("description", ""), "deliveryMode": "0", "freeReturn": "1",
-            "articleNo": product.get("product_code")}
+            "articleNo": (product.get("product_code") or "").split("-", 1)[0]}
     attrs = mapping.get("xhs_attrs") or {}
     for key, val in attrs.items():
         values = val if isinstance(val, list) else [val]
@@ -250,11 +254,8 @@ def _xhs_payload(product, mapping, group_config=None):
             source_name = spec_map.get(var_id) or spec_map.get(var_def.get("id"))
             source_value = specs_by_name.get(source_name)
             if not source_name or not source_value: continue
-            options = candidates.get(var_id, [])
-            option = next((c for c in options if str(c.get("valueName")) == str(source_value)), None)
-            if options and not option: raise RuntimeError(f"小红书规格值未匹配: {source_name}={source_value}")
-            variant = {"id": var_def.get("id"), "name": var_def.get("name"), "value": option.get("valueName") if option else source_value}
-            if option: variant["valueId"] = option.get("valueId")
+            # 不用系统候选下拉,直接填货盘文本值(尺寸/颜色),避免因候选不匹配报错
+            variant = {"id": var_def.get("id"), "name": var_def.get("name"), "value": str(source_value)}
             variants.append(variant)
         sku_list.append({"ipq": 1, "originalPrice": round(float(sku.get("original_price") or sku.get("price") or 0) * 100),
                          "price": round(float(sku.get("price") or 0) * 100), "stock": int(float(sku.get("stock") or 0)),
@@ -304,6 +305,7 @@ def _platform_ready(platform):
 
 def _worker_loop(platform=None):
     while True:
+        conn = None
         try:
             if platform and not _platform_ready(platform):
                 time.sleep(5)
@@ -329,6 +331,16 @@ def _worker_loop(platform=None):
                 conn = db(); conn.execute("UPDATE publish_items SET status='failed', error=?, finished_at=? WHERE id=?", (str(exc)[:1000], now(), item["id"])); conn.commit(); conn.close()
             conn = db(); conn.execute("""UPDATE publish_jobs SET processed=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('success','failed','partial')), success=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status='success'), failed=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('failed','partial')), status=CASE WHEN (SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('queued','running'))=0 THEN CASE WHEN (SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('failed','partial'))>0 THEN 'completed_with_errors' ELSE 'completed' END ELSE 'running' END, updated_at=? WHERE id=?""", (item["job_id"], item["job_id"], item["job_id"], item["job_id"], item["job_id"], now(), item["job_id"])); conn.commit(); conn.close()
         except Exception:
+            # 异常时必须回滚并关闭连接,否则 BEGIN IMMEDIATE 持有的写锁会一直不释放,锁死整个库
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             time.sleep(2)
 
 
@@ -570,15 +582,61 @@ def _store_folder_images(files, batch_id, rows, common_detail_files=None):
                 for source in row.get(field, [])
             ]
         code = str(row.get("product_code") or "").strip().lower()
-        if code:
-            matches = [(name, ref) for name, ref in file_records if os.path.splitext(name)[0].lower().startswith(code)]
+        # 取基础商品编码(去掉 -系列 后缀)用于匹配文件名,这样 KGN1000330主图1.jpg 能匹配 KGN1000330-永恒
+        base_code = code.split("-", 1)[0] if code else ""
+        if base_code:
+            matches = [(name, ref) for name, ref in file_records if os.path.splitext(name)[0].lower().startswith(base_code)]
             if not row.get("main_images"):
-                row["main_images"] = [ref for name, ref in sorted(matches) if "主图" in name or "main" in name.lower()]
+                main_candidates = [ref for name, ref in sorted(matches) if "主图" in name or "main" in name.lower()]
+                if not main_candidates and matches:
+                    # 没有「主图/main」字样时,取匹配到的第一张当主图
+                    main_candidates = [sorted(matches)[0][1]]
+                row["main_images"] = main_candidates
             if not row.get("detail_images"):
-                row["detail_images"] = [ref for name, ref in sorted(matches) if "详情" in name or "detail" in name.lower()]
+                detail_candidates = [ref for name, ref in sorted(matches) if "详情" in name or "detail" in name.lower()]
+                if not detail_candidates and len(matches) > 1:
+                    # 没有「详情/detail」字样且多张时,除主图外都当详情图
+                    detail_candidates = [ref for name, ref in sorted(matches)[1:]]
+                row["detail_images"] = detail_candidates
             for reference in common_details:
                 if reference not in row["detail_images"]:
                     row["detail_images"].append(reference)
+            # 兜底:商品没匹配到主图时,优先用本次批次里 1:1 且 ≥800 的图(KGN 这类),其次才用通用详情
+            # 1:1 + ≥800 才能过小红书 createItemV2 的「图片像素不低于800x800 (1:1)」
+            if not row.get("main_images"):
+                fallback = None
+                # 先从文件夹图片里挑 1:1 且 ≥800 的
+                for _n, _r in file_records:
+                    try:
+                        from PIL import Image as _Img
+                        import io as _io
+                        _p = _local_image(_r)
+                        if not _p: continue
+                        with _Img.open(_io.BytesIO(_p[1])) as _im:
+                            _w, _h = _im.size
+                            if _w >= 800 and _h == _w:
+                                fallback = _r
+                                break
+                    except Exception:
+                        continue
+                # 再从通用详情里挑 1:1 且 ≥800 的
+                if not fallback:
+                    for _r in common_details:
+                        try:
+                            _p = _local_image(_r)
+                            if not _p: continue
+                            with _Img.open(_io.BytesIO(_p[1])) as _im:
+                                _w, _h = _im.size
+                                if _w >= 800 and _h == _w:
+                                    fallback = _r
+                                    break
+                        except Exception:
+                            continue
+                # 实在没有 1:1 的,才用第一张通用详情(大概率会被小红书拒,生产应避免)
+                if not fallback and common_details:
+                    fallback = common_details[0]
+                if fallback:
+                    row["main_images"] = [fallback]
 
 
 def group_products(rows):

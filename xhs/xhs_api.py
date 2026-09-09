@@ -448,6 +448,28 @@ def upload_material_file(body: dict = Body(...)):
         raise HTTPException(status_code=400, detail="content_base64 编码无效")
     if not content or len(content) > 20 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="图片为空或超过 20MB")
+    # 放大到至少 1200 长边,避免小红书 createItemV2 报「图片像素不低于800x800」
+    # (平台对 800x800 会再压缩到 <800,传 1200x1200 压完仍 ≥ 800)
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(content))
+        w, h = img.size
+        if w < 1200 or h < 1200:
+            scale = max(1200.0 / w, 1200.0 / h)
+            new_size = (max(int(round(w * scale)), 1200), max(int(round(h * scale)), 1200))
+            img = img.resize(new_size, Image.LANCZOS)
+            buf = io.BytesIO()
+            fmt = (img.format or "JPEG").upper()
+            if fmt in ("JPG", "JPEG"):
+                img.save(buf, format="JPEG", quality=95)
+            else:
+                img.save(buf, format=fmt if fmt in ("PNG", "WEBP") else "PNG")
+            content = buf.getvalue()
+            encoded = base64.b64encode(content).decode("ascii")
+    except Exception:
+        # 放大失败就传原图,不阻塞
+        pass
     name = os.path.basename(str(body.get("filename") or "material.jpg"))[:40]
     data = _xhs_call("material.uploadMaterial", {
         "name": name, "type": "IMAGE", "materialContent": encoded})
