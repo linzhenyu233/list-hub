@@ -1,17 +1,37 @@
 <script setup>
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Check, Download, Upload, Refresh, Right, Search } from '@element-plus/icons-vue'
+import { ArrowLeft, Check, Download, Upload, Refresh, Right, Search } from '@element-plus/icons-vue'
 import { bulkApi } from '../bulkApi'
 import { xhsApi } from '../xhsApi'
 import { storeApi } from '../api'
 import CategoryAliasPanel from './CategoryAliasPanel.vue'
 import ProductReviewDrawer from './ProductReviewDrawer.vue'
 
+// 本页没有其它出口按钮,由父级 App.vue 监听 back 事件切回商品列表
+const emit = defineEmits(['back'])
 const step = ref(0)
 const file = ref(null)
+// 原生 input[type=file] 太丑:隐藏它,用 Element Plus 按钮触发,并把文件名单独展示
+const excelInput = ref(null)
+function pickExcelFile() {
+  const input = excelInput.value
+  if (!input) return
+  input.value = ''   // 允许重复选同一个文件
+  input.click()
+}
 const folderFiles = ref([])
 const commonDetailFiles = ref([])
+// 图片直读(共享盘): root 只能从服务端白名单里选(见 GET /image-roots); months 为空=扫全部月份
+const imageRoot = ref('')
+const imageRootOptions = ref([])
+const imageMonths = ref([])
+const IMAGE_MONTH_OPTIONS = ['1-3月', '4-6月份', '7-9月份', '培育裸钻']
+// 货盘直读: 只列出服务端货盘目录(HUOPAI_DIR)下的 .xlsx, 前端不提供自由填写路径的入口
+const huopaiFiles = ref([])
+const huopaiPath = ref('')
+const imageScanResult = ref(null)
+const scanning = ref(false)
 const loading = ref(false)
 const batch = ref(null)
 const platforms = ref(['wechat', 'xhs'])
@@ -24,6 +44,8 @@ const itemKeyword = ref('')
 const itemErrorFilter = ref('all')
 const itemPage = ref(1)
 const itemPageSize = ref(20)
+const mappingPage = ref(1)
+const mappingPageSize = ref(20)
 const platformSettings = ref({ xhsShipping: [], xhsLogistics: [], wechatBrand: '平台无品牌', wechatDelivery: '快递发货' })
 const batchPlatformSettings = reactive({ wechatFreightId: '', xhsShippingId: '', xhsLogisticsId: '' })
 const groupAttrDefs = reactive({})
@@ -33,6 +55,38 @@ const attrDrawerGroup = ref('')
 function openAttrDrawer(key) {
   attrDrawerGroup.value = key
   attrDrawerVisible.value = true
+  // 候选值不再持久化,打开抽屉时按需补拉(用户已确认:稍等可接受)
+  void ensureGroupCandidates(key)
+}
+// 本组件在 App.vue 中被 <KeepAlive> 缓存:切走再切回时,若抽屉仍停留在"已打开"状态,
+// 再次点击配置属性会把 true 再赋一次 true(无变化),表现为"点击没反应"。失活时强制关掉。
+onDeactivated(() => { attrDrawerVisible.value = false })
+
+// 按需确保某类目组的候选值已加载(供抽屉/编辑使用),已加载的跳过
+const _candidatesLoading = new Set()
+async function ensureGroupCandidates(key) {
+  const config = groupAttrDefs[key]
+  if (!config?.xhs) return
+  const xid = (mappingGroups.value.find((g) => g.internal_category === key) || {}).mapping?.xhs_category_id
+    || config.xhs.category_id || ''
+  if (!xid) return
+  const defs = config.xhs.attr_defs || []
+  const missing = defs.filter((d) => !config.xhs.candidates[d.id] || !config.xhs.candidates[d.id].length)
+  if (!missing.length) return
+  // 去重:同一类目并发打开时只拉一次
+  const lockKey = `${key}:${xid}`
+  if (_candidatesLoading.has(lockKey)) return
+  _candidatesLoading.add(lockKey)
+  try {
+    await Promise.all(missing.map(async (d) => {
+      try {
+        const v = await xhsApi.attributeValues(xid, d.id || d.propertyId)
+        config.xhs.candidates[d.id] = listFrom(v, ['attributeValueV3s', 'values'])
+      } catch { config.xhs.candidates[d.id] = [] }
+    }))
+  } finally {
+    _candidatesLoading.delete(lockKey)
+  }
 }
 const attrMatchStatus = reactive({})
 // 有未匹配属性的类目数(用于工具栏提示)
@@ -53,6 +107,8 @@ const items = computed(() => pagedItems.value)
 const products = computed(() => batch.value?.products || [])
 const validCount = computed(() => allItems.value.filter((item) => !(item.errors || []).length).length)
 const errorCount = computed(() => allItems.value.length - validCount.value)
+// 缺规格图的 SKU 数:校验可能照样通过, 但要能单独筛出来集中补图
+const missingImageCount = computed(() => allItems.value.filter((item) => !item.sku_image).length)
 // 存在 SKU 间商品属性不一致提醒的商品数（不阻断发布，仅提醒）
 const productWarningCount = computed(() => products.value.filter((product) => (product.warnings || []).length).length)
 const filteredItems = computed(() => {
@@ -61,15 +117,24 @@ const filteredItems = computed(() => {
     const matchesKeyword = !keyword || [item.product_code, item.title, item.sku_code]
       .some((value) => String(value || '').toLowerCase().includes(keyword))
     const hasError = (item.errors || []).length > 0
-    const matchesError = itemErrorFilter.value === 'all'
+    const missingImage = !item.sku_image
+    const matchesFilter = itemErrorFilter.value === 'all'
       || (itemErrorFilter.value === 'error' && hasError)
       || (itemErrorFilter.value === 'valid' && !hasError)
-    return matchesKeyword && matchesError
+      || (itemErrorFilter.value === 'no_image' && missingImage)
+    return matchesKeyword && matchesFilter
   })
 })
 const pagedItems = computed(() => {
   const start = (itemPage.value - 1) * itemPageSize.value
   return filteredItems.value.slice(start, start + itemPageSize.value)
+})
+// step3「确认发布」表格独立分页:800 行全量渲染会卡,只渲染当前页
+const productPage = ref(1)
+const productPageSize = ref(50)
+const pagedProducts = computed(() => {
+  const start = (productPage.value - 1) * productPageSize.value
+  return products.value.slice(start, start + productPageSize.value)
 })
 function resetItemPage() { itemPage.value = 1 }
 const mappingRows = computed(() => products.value.map((product) => ({
@@ -88,6 +153,35 @@ const mappingGroups = computed(() => {
   }
   return [...groups.values()]
 })
+// 「类目属性匹配」列表:类目一多,逐条卡片堆叠会非常占高度、很难扫。
+// 改成可搜索/可筛选的精简表格(内部滚动),未匹配数多的排前面,问题类目一眼可见。
+const attrGroupKeyword = ref('')
+const attrGroupFilter = ref('all')
+const attrGroupTotal = computed(() => mappingGroups.value.filter((g) => groupAttrDefs[g.internal_category]).length)
+const attrGroupRows = computed(() => {
+  const keyword = attrGroupKeyword.value.trim().toLowerCase()
+  return mappingGroups.value
+    .filter((group) => groupAttrDefs[group.internal_category])
+    .map((group) => {
+      const status = attrMatchStatus[group.internal_category]
+      return {
+        internal_category: group.internal_category,
+        product_count: group.products.length,
+        matched: status?.matched || 0,
+        unmatched: status?.unmatched || 0,
+        has_status: !!status,
+      }
+    })
+    .filter((row) => !keyword || row.internal_category.toLowerCase().includes(keyword))
+    .filter((row) => attrGroupFilter.value !== 'unmatched' || row.unmatched > 0)
+    .sort((a, b) => b.unmatched - a.unmatched || a.internal_category.localeCompare(b.internal_category))
+})
+// step2「平台映射」主表格独立分页：几百个商品时只渲染当前页，避免页面上下滚动
+const pagedMappingRows = computed(() => {
+  const start = (mappingPage.value - 1) * mappingPageSize.value
+  return mappingRows.value.slice(start, start + mappingPageSize.value)
+})
+function resetMappingPage() { mappingPage.value = 1 }
 function confirmWechatCategory(group, value) {
   const candidate = group.mapping.wechat_candidates?.find((item) => item.path === value)
   if (!candidate) return
@@ -359,7 +453,16 @@ async function loadGroupAttrDefs(silent = false) {
           config.xhs.var_defs = listFrom(vd, ['variations'])
           config.xhs.defaults = {};
           config.xhs.attr_defs.forEach((a) => { config.xhs.defaults[a.id] = a.isMulti ? [] : '' })
-          await Promise.all([...config.xhs.attr_defs, ...config.xhs.var_defs].map(async (d) => {
+          // 性能优化:只拉「货盘实际用到的」商品属性的候选值(「材质」单属性就有 1731 条);
+          // 规格维度(var_defs)的候选值不再需要——后端 SKU 规格值已改为直接用货盘文本
+          const groupProds = products.value.filter((p) => (p.internal_category || '(未填写内部类目)') === group.internal_category)
+          const usedNames = new Set()
+          for (const p of groupProds) {
+            for (const rawKey of Object.keys(p.attributes || {})) usedNames.add(ATTR_KEY_ALIASES[rawKey] || rawKey)
+          }
+          const usedList = [...usedNames]
+          const needDefs = config.xhs.attr_defs.filter((d) => usedList.some((n) => d.name === n || d.name.includes(n) || n.includes(d.name)))
+          await Promise.all(needDefs.map(async (d) => {
             try { const v = await xhsApi.attributeValues(xid, d.id || d.propertyId); config.xhs.candidates[d.id] = listFrom(v, ['attributeValueV3s', 'values']) } catch { config.xhs.candidates[d.id] = [] }
           }))
         } catch (e) { /* xhs attr load failed */ }
@@ -436,10 +539,24 @@ const ATTR_VALUE_ALIASES = {
     'Poor/未分级': 'Poor/未分级', '未分级': 'Poor/未分级',
   },
 }
-// 平台属性默认值(货盘没有对应数据的属性,如 认证标识/鉴定类别)。按属性 id 记,值为平台 valueId 或数组
+// 平台属性默认值(货盘没有对应数据的属性,如 认证标识/鉴定类别)。
+// 这里存的是【文案 valueName】(人类可读),代码会自动从 candidates 里查 valueId
 const ATTR_DEFAULTS = {
-  '62b2846fa21ae000011a7686': ['662650ac2c821c0001a44630'],  // 认证标识(多选) = CMA
-  '62b2846fa21ae000011a77aa': ['662650ac2c821c0001a44621'],  // 鉴定类别(多选) = 国家珠宝玉石质量监督检验中心(NGTC国检)
+  '62b2846fa21ae000011a7686': ['CMA'],  // 认证标识(多选) — CMA 标识
+  '62b2846fa21ae000011a77aa': ['国家珠宝玉石质量监督检验中心(NGTC国检)'],  // 鉴定类别(多选) — NGTC国检
+}
+// SKU 规格值别名:货盘里常用英文 SKU 编码 → 平台中文 valueName(用于规格匹配兜底)
+const SPEC_VALUE_ALIASES = {
+  '粉红色':   ['SHINING PINK', '粉色', '粉红', 'PINK', 'Rose'],
+  '浅蓝色':   ['ICE BLUE', '浅蓝', 'LIGHT BLUE'],
+  '香槟金色': ['CHAMPAGNE GOLD', '香槟金', 'CHAMPAGNE'],
+  '玫瑰金色': ['ROSE GOLD', '玫瑰金'],
+  '黄金色':   ['YELLOW GOLD', '黄金', 'GOLD'],
+  '18K金色':  ['18K GOLD', '18K金'],
+  '白色':     ['WHITE'],
+  '黑色':     ['BLACK'],
+  '无色':     ['COLORLESS', '透明'],
+  // 其它颜色/规格值按需补充
 }
 
 function autoMatchProductAttributes() {
@@ -454,16 +571,31 @@ function autoMatchProductAttributes() {
       const firstSku = groupProducts[0]?.skus?.[0]
       if (firstSku) {
         const specNames = (firstSku.specs || []).map((s) => s.name).filter(Boolean)
+        // 货盘规格名 → xhs 规格维度名 别名表(模糊匹配的补充)。
+        // 值为「候选维度名数组」:同一货盘规格在不同类目下能挂的维度不同,按类目实际存在的维度择优。
+        // 例:「主钻分数」在天然钻戒指类目挂「尺寸」;培育钻戒指类目没有「尺寸」维度,
+        //     只能挂到「套装规格」(自由输入维度,已验证可承载分数且无需 valueId)。
+        //     若仍按旧的单值别名只认「尺寸」,培育钻戒指就只剩「颜色分类」1 维 →
+        //     同色多个分数报「重复的规格[红色]」。
+        const SPEC_NAME_ALIASES = {
+          '颜色': ['颜色分类'], '颜色分类': ['颜色分类'], '钻石颜色': ['颜色分类'], '戒托颜色': ['颜色分类'],
+          '尺码': ['尺寸'], '尺寸': ['尺寸'],
+          '主钻分数': ['尺寸', '套装规格', '重量/克拉'],
+          '款式': ['款式'], '净度': ['钻石净度'], '钻石净度': ['钻石净度'],
+          '圈号': ['圈口'], '圈口': ['圈口'], '规格': ['规格'], '长度': ['长度'],
+          '重量': ['规格/重量'], '大小': ['大小'],
+        }
+        const usedSpecNames = new Set()   // 一个货盘规格列只能挂到一个维度,避免被两个维度抢
         for (const varDef of config.xhs.var_defs) {
-          // 货盘规格名 → xhs 规格维度名 别名表(模糊匹配的补充)
-          const SPEC_NAME_ALIASES = { '颜色': '颜色分类', '颜色分类': '颜色分类', '钻石颜色': '颜色分类', '尺码': '尺寸', '尺寸': '尺寸', '主钻分数': '尺寸', '款式': '款式', '净度': '钻石净度', '钻石净度': '钻石净度', '圈号': '圈口', '圈口': '圈口', '规格': '规格', '长度': '长度', '重量': '规格/重量', '大小': '大小' }
           const hitName = specNames.find((n) => {
+            if (usedSpecNames.has(n)) return null
             if (n === varDef.name) return n
             if (varDef.name.includes(n) || n.includes(varDef.name)) return n
-            if (SPEC_NAME_ALIASES[n] === varDef.name) return n  // 别名兜底
+            const alias = SPEC_NAME_ALIASES[n]   // 别名兜底
+            if (alias && (Array.isArray(alias) ? alias : [alias]).includes(varDef.name)) return n
             return null
           })
-          if (hitName) config.xhs.spec_map[varDef.id] = hitName
+          if (hitName) { config.xhs.spec_map[varDef.id] = hitName; usedSpecNames.add(hitName) }
         }
       }
     }
@@ -509,8 +641,13 @@ function autoMatchProductAttributes() {
         const def = (config.xhs.attr_defs || []).find((d) => d.id === attrId)
         if (!def) continue
         const cands = config.xhs.candidates[attrId] || []
-        const ids = Array.isArray(defVal) ? defVal : [defVal]
-        const mapped = ids.map((vid) => { const c = cands.find((cc) => cc.valueId === vid); return { propertyId: attrId, name: def.name, valueId: vid, value: c?.valueName || vid } })
+        const vals = Array.isArray(defVal) ? defVal : [defVal]
+        // ATTR_DEFAULTS 存的是文案 valueName,自动从 cands 里查 valueId
+        const mapped = vals.map((vname) => {
+          const c = cands.find((cc) => cc.valueName === vname)
+            || cands.find((cc) => (cc.valueName || '').includes(vname) || vname.includes(cc.valueName || ''))
+          return { propertyId: attrId, name: def.name, valueId: c?.valueId || '', value: c?.valueName || vname }
+        })
         xhsAttrs[attrId] = def.isMulti ? mapped : mapped[0]
       }
       // SKU 规格值 → 小红书 valueId
@@ -524,8 +661,23 @@ function autoMatchProductAttributes() {
             const specVal = resolveSpecValue(sku, mapKey)
             if (!specVal) continue
             const cands = config.xhs.candidates[varDef.id] || []
-            const hit = cands.find((c) => c.valueName === specVal) || cands.find((c) => c.valueName.includes(specVal) || specVal.includes(c.valueName))
-            variants.push(hit ? { id: varDef.id, name: varDef.name, value: hit.valueName, valueId: hit.valueId } : { id: varDef.id, name: varDef.name, value: specVal, valueId: '' })
+            // 优先用 cands 精确/模糊匹配;找不到时用 SPEC_VALUE_ALIASES(英文 SKU 编码→中文 valueName)兜底
+            // 注:var_defs 的 candidates 是空数组(性能优化未拉),所以 hit 几乎一定走 fallback
+            let hit = cands.find((c) => c.valueName === specVal) || cands.find((c) => c.valueName.includes(specVal) || specVal.includes(c.valueName))
+            let displayValue = specVal
+            let valueId = ''
+            if (hit) {
+              displayValue = hit.valueName
+              valueId = hit.valueId
+            } else {
+              for (const [valueName, aliases] of Object.entries(SPEC_VALUE_ALIASES)) {
+                if (aliases.includes(specVal)) {
+                  displayValue = valueName  // 英文 SKU 编码 → 中文 valueName
+                  break
+                }
+              }
+            }
+            variants.push({ id: varDef.id, name: varDef.name, value: displayValue, valueId: valueId })
           }
           if (variants.length) skuVariants[sku.sku_code] = variants
         }
@@ -574,10 +726,15 @@ function groupSpecDimensions(catKey) {
   }
   return names
 }
+// 这些属性全店统一、逐行都靠组级默认值继承,展示出来没有信息量,表格里不再单独占列。
+// 需要恢复某列时从下面集合里删掉即可。
+const HIDDEN_TABLE_ATTRS = new Set(['镶嵌', '合成方法', '主钻克拉数', '圈号'])
 const requiredAttrNames = computed(() => {
   const names = new Set()
   for (const config of Object.values(groupAttrDefs)) {
-    for (const a of (config.wechat?.attr_defs || [])) if (a.is_required) names.add(a.name)
+    for (const a of (config.wechat?.attr_defs || [])) {
+      if (a.is_required && !HIDDEN_TABLE_ATTRS.has(a.name)) names.add(a.name)
+    }
   }
   return [...names]
 })
@@ -588,8 +745,49 @@ function getProductAttrValue(product, attrName) {
   return groupAttrDefs[key]?.wechat?.defaults?.[attrName] || ''
 }
 
+// 补规格图: 点表格里的「缺图」选一张本地图片 → 上传落盘 → 写回该行 sku_image 并持久化
+const skuImageInput = ref(null)
+const pendingSkuImageRow = ref(null)
+const uploadingSkuImage = ref(false)
+function pickSkuImage(row) {
+  pendingSkuImageRow.value = row
+  const input = skuImageInput.value
+  if (!input) return
+  input.value = ''          // 允许再次选择同一张图
+  input.click()
+}
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '')
+    reader.onerror = () => reject(new Error('读取本地图片失败'))
+    reader.readAsDataURL(file)
+  })
+}
+async function onSkuImagePicked(event) {
+  const file = event?.target?.files?.[0]
+  const row = pendingSkuImageRow.value
+  pendingSkuImageRow.value = null
+  if (!file || !row) return
+  uploadingSkuImage.value = true
+  try {
+    const contentBase64 = await fileToBase64(file)
+    const data = await bulkApi.uploadSkuImage(batch.value.id, { filename: file.name, content_base64: contentBase64 })
+    const ref = data?.result?.ref || data?.ref
+    if (!ref) throw new Error('上传未返回图片引用')
+    row.sku_image = ref
+    await bulkApi.updateItems(batch.value.id, allItems.value)
+    ElMessage.success('规格图已补上')
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    uploadingSkuImage.value = false
+  }
+}
+
 watch(step, (value) => {
   if (value === 2) {
+    resetMappingPage()
     void loadPlatformSettings(); void autoMatchWechatCategories()
     if (mapping.value.attr_groups) Object.assign(groupAttrDefs, mapping.value.attr_groups)
   }
@@ -622,6 +820,46 @@ async function readCommonDetailFiles(fileList) {
   })))
 }
 
+// 图片直读: 扫描共享盘目录, 按编码把商品图/SKU 图挂到批次上(固定取该 SKU 的「主图2」)
+async function scanImages(silent = false) {
+  if (!batch.value?.id) return
+  scanning.value = true
+  try {
+    const data = await bulkApi.scanImages(batch.value.id, {
+      root: imageRoot.value || null,
+      months: imageMonths.value.length ? imageMonths.value : null,
+      dry_run: false,
+    })
+    imageScanResult.value = data
+    batch.value = (await bulkApi.getBatch(batch.value.id)).result
+    if (!silent) {
+      ElMessage.success(`图片匹配完成：商品 ${data.products_matched}/${data.products_total}，SKU ${data.skus_matched}/${data.skus_total}`)
+    }
+  } catch (error) { ElMessage.error(`图片扫描失败：${error.message}`) } finally { scanning.value = false }
+}
+
+// 可选的服务端路径(货盘表 / 图片根目录)全部由后端白名单与目录列表提供,
+// 前端不再接受手填任意服务器路径, 避免接口被当作任意文件读取入口
+async function loadServerPaths() {
+  try {
+    const data = await bulkApi.huopaiFiles()
+    huopaiFiles.value = data.files || []
+    if (!huopaiPath.value && data.default) huopaiPath.value = data.default
+  } catch (error) {
+    huopaiFiles.value = []
+    ElMessage.warning(`读取货盘目录失败：${error.message}`)
+  }
+  try {
+    const data = await bulkApi.imageRoots()
+    imageRootOptions.value = data.roots || []
+    if (!imageRoot.value && data.default) imageRoot.value = data.default
+  } catch {
+    imageRootOptions.value = []
+  }
+}
+
+onMounted(() => { void loadServerPaths() })
+
 async function downloadTemplate() {
   try {
     const response = await bulkApi.template()
@@ -642,7 +880,34 @@ async function importFile() {
     resetItemPage()
     step.value = 1
     ElMessage.success(`已导入 ${data.total} 行 SKU`)
+    // 必须等扫描完成:否则用户马上点「重新校验并继续/保存映射」时,会用还没挂上规格图的前端数据
+    // 调 updateItems, 把后端刚写入的 sku_image 覆盖掉 —— 表现就是"明明有图却显示缺图"。
+    await scanImages(true)
   } catch (error) { ElMessage.error(error.message) } finally { loading.value = false }
+}
+
+async function importHuopai() {
+  // 直接从服务器货盘目录导入(不走浏览器上传大文件),后端自动跑货盘→标准模板转换。
+  // path 必须是服务端货盘目录内的文件(后端白名单会再校验一次);传空则用服务端默认货盘表。
+  clearJobProgress()
+  loading.value = true
+  try {
+    const data = await bulkApi.importHuopai(huopaiPath.value)
+    batch.value = (await bulkApi.getBatch(data.batch_id)).result
+    itemKeyword.value = ''
+    itemErrorFilter.value = 'all'
+    resetItemPage()
+    step.value = 1
+    ElMessage.success(`已从货盘导入 ${data.total} 行 SKU（${data.product_count} 个商品）`)
+    // 同上:等扫描完成再结束,避免后续 updateItems 用旧数据覆盖掉 sku_image
+    await scanImages(true)
+  } catch (error) { ElMessage.error(error.message) } finally { loading.value = false }
+}
+
+// 标题栏「返回」:还有上一步就退一步;第 0 步(导入)没有上一步,交给父级回商品列表
+function goBackStep() {
+  if (step.value > 0) { step.value -= 1; return }
+  emit('back')
 }
 
 async function validateBatch() {
@@ -668,7 +933,10 @@ async function saveAndNext() {
     }
     const attrGroupsSnapshot = {}
     for (const [key, config] of Object.entries(groupAttrDefs)) {
-      attrGroupsSnapshot[key] = { wechat: { attr_defs: config.wechat?.attr_defs || [], defaults: { ...(config.wechat?.defaults || {}) } }, xhs: { attr_defs: config.xhs?.attr_defs || [], var_defs: config.xhs?.var_defs || [], defaults: { ...(config.xhs?.defaults || {}) }, spec_map: { ...(config.xhs?.spec_map || {}) }, candidates: { ...(config.xhs?.candidates || {}) } } }
+      // 性能优化:不持久化 candidates(「材质」单属性 1731 条,4 类目就 500KB+)。
+      // 值翻译结果已存进 mapping.products[].xhs_attrs,发布链路不依赖 candidates;
+      // 需要下拉选项时(打开属性抽屉)由 ensureGroupCandidates 按需重新拉取。
+      attrGroupsSnapshot[key] = { wechat: { attr_defs: config.wechat?.attr_defs || [], defaults: { ...(config.wechat?.defaults || {}) } }, xhs: { attr_defs: config.xhs?.attr_defs || [], var_defs: config.xhs?.var_defs || [], defaults: { ...(config.xhs?.defaults || {}) }, spec_map: { ...(config.xhs?.spec_map || {}) } } }
     }
     mapping.value = { mode: 'auto', products: productsMapping, attr_groups: attrGroupsSnapshot }
     await bulkApi.updateMappings(batch.value.id, mapping.value)
@@ -679,6 +947,8 @@ async function saveAndNext() {
 function openReview(product) {
   reviewProduct.value = product
   reviewVisible.value = true
+  // 候选值不再持久化,打开审核抽屉时按需补拉(响应式更新,下拉框数据到达后自动填选项)
+  void ensureGroupCandidates(product.internal_category)
 }
 function handleReviewSave(data) {
   const code = data.product_code
@@ -744,6 +1014,32 @@ async function retryFailedItems(itemIds = []) {
 }
 onBeforeUnmount(() => { if (jobTimer) clearTimeout(jobTimer) })
 
+function exportJobResult() {
+  const items = currentJob.value?.items || []
+  if (!items.length) return ElMessage.info('暂无发布结果可导出')
+  // 带平台商品ID:发布成功后平台会生成 product_id,导出后可直接回平台核对/定位
+  const headers = ['商品编码', '平台', '状态', '平台商品ID', '失败原因']
+  const rows = items.map((it) => [
+    it.product_code || '',
+    it.platform === 'wechat' ? '微信' : '小红书',
+    jobStatusText(it.status),
+    it.platform_product_id || '',
+    it.error || '',
+  ])
+  const csv = [headers, ...rows]
+    .map((r) => r.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(','))
+    .join('\r\n')
+  // 加 BOM,避免 Excel 打开中文乱码
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `发布结果_${currentJob.value?.job_id || 'job'}.csv`
+  anchor.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${items.length} 条发布结果`)
+}
+
 async function publish() {
   if (errorCount.value) return ElMessage.warning('请先修正全部校验错误')
   loading.value = true
@@ -760,18 +1056,17 @@ async function publish() {
 
 <template>
   <div class="bulk-view">
-    <div class="page-heading"><div><h1>批量发布商品</h1><p>一次导入标准商品，分别映射并发布到微信和小红书</p></div><el-button :icon="Download" @click="downloadTemplate">下载模板</el-button></div>
+    <div class="page-heading"><div><h1>批量发布商品</h1><p>一次导入标准商品，分别映射并发布到微信和小红书</p></div><div style="display:flex;gap:10px"><el-button :icon="Download" @click="downloadTemplate">下载模板</el-button><el-button v-if="step === 0" :icon="ArrowLeft" @click="goBackStep">返回商品列表</el-button></div></div>
     <el-steps :active="step" finish-status="success" class="bulk-steps"><el-step v-for="title in steps" :key="title" :title="title" /></el-steps>
     <div v-if="step === 1" class="bulk-filters">
       <el-input v-model="itemKeyword" clearable :prefix-icon="Search" placeholder="搜索商品编码、标题或 SKU" @clear="resetItemPage" @input="resetItemPage" />
-      <el-select v-model="itemErrorFilter" style="width: 150px" @change="resetItemPage"><el-option label="全部记录" value="all" /><el-option label="仅看异常" value="error" /><el-option label="仅看通过" value="valid" /></el-select>
+      <el-select v-model="itemErrorFilter" style="width: 180px" @change="resetItemPage"><el-option label="全部记录" value="all" /><el-option label="仅看异常" value="error" /><el-option label="仅看通过" value="valid" /><el-option :label="`仅看缺图 (${missingImageCount})`" value="no_image" /></el-select>
       <span class="muted-copy">匹配 {{ filteredItems.length }} 条</span>
     </div>
     <div v-if="step === 2" class="bulk-filters">
       <el-button type="primary" :loading="categoryMatching" @click="autoMatchWechatCategories">立即匹配微信/小红书类目</el-button>
       <el-button :loading="attrConfigLoading" @click="loadGroupAttrDefs()">重新加载属性</el-button>
       <el-button @click="aliasPanelVisible = true">核对类目映射表</el-button>
-      <span class="muted-copy">系统按一级、二级、末级叶子类目逐级匹配</span>
     </div>
     <div v-if="step === 2" class="bulk-filters">
       <span>微信本批次设置</span>
@@ -793,23 +1088,21 @@ async function publish() {
         <template v-for="(options, level) in (xhsCascade[group.internal_category]?.levels || [])" :key="level"><el-select :model-value="xhsCascade[group.internal_category]?.selected?.[level]" :placeholder="`第${level + 1}级类目`" @change="(value) => confirmXhsCategory(group, level, value)"><el-option v-for="item in options" :key="item.id || item.categoryId" :label="item.name" :value="item.id || item.categoryId" /></el-select></template>
       </div>
     </div>
-    <div v-if="step === 2 && Object.keys(groupAttrDefs).length" style="display: flex; gap: 8px; align-items: center; margin: 12px 0">
-      <span class="muted-copy">共 {{ Object.keys(groupAttrDefs).length }} 个类目，{{ unmatchedCategoryCount }} 个有未匹配属性 · 点击「配置属性」在抽屉中填写</span>
+    <div v-if="step === 2 && attrGroupTotal" class="bulk-filters" style="margin: 12px 0">
+      <el-input v-model="attrGroupKeyword" clearable :prefix-icon="Search" placeholder="搜索内部类目" style="width: 240px" />
+      <el-select v-model="attrGroupFilter" style="width: 180px"><el-option label="全部类目" value="all" /><el-option :label="`仅看未匹配 (${unmatchedCategoryCount})`" value="unmatched" /></el-select>
+      <span class="muted-copy">共 {{ attrGroupTotal }} 个类目 · {{ unmatchedCategoryCount }} 个有未匹配属性</span>
     </div>
-    <div v-if="step === 2 && Object.keys(groupAttrDefs).length" class="mapping-confirm-list">
-      <div v-for="group in mappingGroups.filter((g) => groupAttrDefs[g.internal_category])" :key="`attr-${group.internal_category}`" class="attr-config-group">
-        <div class="mapping-confirm-row" style="flex-wrap: wrap; gap: 8px">
-          <strong>{{ group.internal_category }}</strong>
-          <span class="muted-copy">（{{ group.products.length }} 个商品）</span>
-          <el-tag v-if="attrMatchStatus[group.internal_category]" size="small" :type="attrMatchStatus[group.internal_category].unmatched ? 'warning' : 'success'">属性匹配 {{ attrMatchStatus[group.internal_category].matched }}✓{{ attrMatchStatus[group.internal_category].unmatched ? ` / ${attrMatchStatus[group.internal_category].unmatched}✗` : '' }}</el-tag>
-          <el-button size="small" type="primary" text @click="openAttrDrawer(group.internal_category)">配置属性</el-button>
-        </div>
-      </div>
-    </div>
-    <el-drawer v-model="attrDrawerVisible" :title="`${attrDrawerGroup} · 属性配置`" size="720px">
+    <el-table v-if="step === 2 && attrGroupTotal" :data="attrGroupRows" max-height="420" size="small" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
+      <el-table-column prop="internal_category" label="内部类目" min-width="260" show-overflow-tooltip />
+      <el-table-column prop="product_count" label="商品数" width="90" align="center" />
+      <el-table-column label="属性匹配" width="150" align="center"><template #default="{ row }"><el-tag v-if="row.has_status" size="small" :type="row.unmatched ? 'warning' : 'success'">匹配 {{ row.matched }}✓{{ row.unmatched ? ` / ${row.unmatched}✗` : '' }}</el-tag><span v-else class="muted-copy">待加载</span></template></el-table-column>
+      <el-table-column label="操作" width="120" align="center"><template #default="{ row }"><el-button size="small" type="primary" text @click="openAttrDrawer(row.internal_category)">配置属性</el-button></template></el-table-column>
+    </el-table>
+    <el-drawer v-model="attrDrawerVisible" append-to-body :title="`${attrDrawerGroup} · 属性配置`" size="720px">
       <template v-if="groupAttrDefs[attrDrawerGroup]">
         <div v-if="groupAttrDefs[attrDrawerGroup]?.wechat?.attr_defs?.length" style="margin-bottom: 20px">
-          <h4 style="margin: 0 0 8px">微信商品属性 <small class="muted-copy">(已从 Excel “商品属性”列自动匹配，未匹配的可手动填写)</small></h4>
+          <h4 style="margin: 0 0 8px">微信商品属性 <small class="muted-copy">(未匹配的可手动填写)</small></h4>
           <div class="form-grid form-grid-2">
             <div v-for="a in groupAttrDefs[attrDrawerGroup].wechat.attr_defs" :key="a.name" class="attr-config-item">
               <label>{{ a.is_required ? '* ' : '' }}{{ a.name }}<small v-if="a.type_v2" class="muted-copy"> ({{ wxTypeLabel(a.type_v2) }})</small></label>
@@ -821,7 +1114,7 @@ async function publish() {
           </div>
         </div>
         <div v-if="groupAttrDefs[attrDrawerGroup]?.xhs?.attr_defs?.length" style="margin-bottom: 20px">
-          <h4 style="margin: 0 0 8px">小红书商品属性 <small class="muted-copy">(已自动匹配属性值，未匹配的可手动选择)</small></h4>
+          <h4 style="margin: 0 0 8px">小红书商品属性 <small class="muted-copy">(未匹配的可手动选择)</small></h4>
           <div class="form-grid form-grid-2">
             <div v-for="a in groupAttrDefs[attrDrawerGroup].xhs.attr_defs" :key="a.id" class="attr-config-item">
               <label>{{ a.isRequired ? '* ' : '' }}{{ a.name }}<small v-if="a.isMulti" class="muted-copy"> (多选)</small></label>
@@ -832,8 +1125,7 @@ async function publish() {
           </div>
         </div>
         <div v-if="groupAttrDefs[attrDrawerGroup]?.xhs?.var_defs?.length">
-          <h4 style="margin: 0 0 8px">小红书规格映射 <small class="muted-copy">(已自动按名称匹配，可手动调整)</small></h4>
-          <p class="muted-copy" style="margin: 0 0 8px">Excel 规格列（规格1、规格2、规格3…可自由增减）→ 小红书规格维度，SKU 规格值已自动翻译为平台属性值</p>
+          <h4 style="margin: 0 0 8px">小红书规格映射 <small class="muted-copy">(可手动调整)</small></h4>
           <div class="form-grid form-grid-2">
             <div v-for="v in groupAttrDefs[attrDrawerGroup].xhs.var_defs" :key="v.id" class="attr-config-item">
               <label>{{ v.name }}</label>
@@ -846,26 +1138,28 @@ async function publish() {
         </div>
       </template>
     </el-drawer>
-    <section v-if="step === 0" class="content-panel bulk-card"><div class="bulk-drop"><el-icon><Upload /></el-icon><h3>选择商品 Excel</h3><p>每个 SKU 一行；.xlsx 支持主图和详情图列中的内嵌图片或公网图片链接</p><input type="file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" @change="file = $event.target.files[0]" /><strong v-if="file">{{ file.name }}</strong></div><el-button type="primary" :loading="loading" @click="importFile">导入并校验 <el-icon><Right /></el-icon></el-button></section>
-    <section v-else-if="step === 1" class="content-panel bulk-card"><div class="bulk-summary"><span>批次 {{ batch.id }}</span><el-tag type="success">可发布 {{ validCount }}</el-tag><el-tag type="danger">错误 {{ errorCount }}</el-tag></div><el-table :data="items" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="line" label="行" width="70" /><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip /><el-table-column prop="sku_code" label="SKU编码" width="150" show-overflow-tooltip /><el-table-column prop="price" label="售价" width="100" /><el-table-column prop="stock" label="库存" width="90" /><el-table-column label="校验结果" min-width="220" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.errors?.length" type="danger">{{ row.errors.join('；') }}</el-tag><el-tag v-else type="success">通过</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="160" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '继承组级默认' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button @click="step = 0">重新导入</el-button><el-button type="primary" :loading="loading" @click="validateBatch">重新校验并继续</el-button></div></section>
-    <section v-else-if="step === 2" class="content-panel bulk-card"><h3>平台映射</h3><p class="muted-copy">系统会按每个商品的 Excel 内部类目分别匹配微信和小红书类目，运营不需要填写全店统一类目。匹配不到的商品会单独标记。</p><el-table :data="mappingRows" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="product_code" label="商品编码" width="170" show-overflow-tooltip /><el-table-column prop="internal_category" label="Excel 内部类目" min-width="240" show-overflow-tooltip /><el-table-column label="微信类目" min-width="180" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.wechat_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="小红书类目" min-width="180" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.xhs_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="匹配状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag type="warning">{{ row.mapping.status || '待处理' }}</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="140" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '未配置' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button @click="step = 1">返回</el-button><el-button type="primary" :loading="loading" @click="saveAndNext">保存自动映射并继续</el-button></div></section>
-    <section v-else class="content-panel bulk-card"><h3>确认发布</h3><p>默认先创建微信草稿；小红书创建商品和 SKU 后进入审核，不自动上架。</p><el-alert v-if="productWarningCount" type="warning" :closable="false" show-icon :title="`${productWarningCount} 个商品存在 SKU 间属性不一致提醒`" description="商品属性是 SPU 级，各 SKU 行填了不同值时仅第一行生效。点“审核编辑”查看具体提醒，必要时把该差异提升为规格维度。" style="margin-bottom:12px" /><el-checkbox-group v-model="platforms"><el-checkbox label="wechat">微信</el-checkbox><el-checkbox label="xhs">小红书</el-checkbox></el-checkbox-group><el-alert v-if="errorCount" type="error" :closable="false" show-icon title="仍有校验错误，不能发布" /><div class="bulk-summary"><span>商品行数：{{ products.length }}</span><span>通过：{{ validCount }}</span><span>错误：{{ errorCount }}</span><el-tag v-if="batch.status">{{ batch.status }}</el-tag></div><el-table :data="products" max-height="360" style="margin-bottom:16px" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip /><el-table-column prop="internal_category" label="内部类目" min-width="180" show-overflow-tooltip /><el-table-column label="属性状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag :type="(mapping.products?.[row.product_code]?.wechat_attrs && Object.keys(mapping.products[row.product_code].wechat_attrs).length) ? 'success' : 'info'" size="small">{{ Object.keys(mapping.products?.[row.product_code]?.wechat_attrs || {}).length + Object.keys(mapping.products?.[row.product_code]?.xhs_attrs || {}).length }} 项已配</el-tag></template></el-table-column><el-table-column label="SKU 提醒" width="110"><template #default="{ row }"><el-tooltip v-if="row.warnings?.length" placement="top"><template #content><div v-for="(w, i) in row.warnings" :key="i">{{ w }}</div></template><el-tag type="warning" size="small">{{ row.warnings.length }} 项不一致</el-tag></el-tooltip><span v-else class="muted-copy">--</span></template></el-table-column><el-table-column label="操作" width="100" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openReview(row)">审核编辑</el-button></template></el-table-column></el-table><div class="form-actions"><el-button @click="step = 2">返回映射</el-button><el-button type="primary" :loading="loading" :disabled="!platforms.length || errorCount > 0" :icon="Check" @click="publish">创建批量发布任务</el-button></div></section>
+    <section v-if="step === 0" class="content-panel bulk-card"><div class="bulk-drop" @click="pickExcelFile"><el-icon><Upload /></el-icon><h3>选择商品 Excel</h3><p>每个 SKU 一行</p><div class="bulk-drop__picker"><el-button type="primary" :icon="Upload" @click.stop="pickExcelFile">选择文件</el-button><span v-if="file" class="bulk-drop__filename">{{ file.name }}</span><span v-else class="muted-copy">未选择文件</span></div><input ref="excelInput" type="file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" style="display:none" @change="file = $event.target.files[0]" /></div><div style="display:flex;gap:12px;align-items:center;margin-top:12px"><el-button type="primary" :loading="loading" @click="importFile">导入并校验 <el-icon><Right /></el-icon></el-button><el-select v-model="huopaiPath" placeholder="选择服务器货盘表" clearable style="width:320px"><el-option v-for="item in huopaiFiles" :key="item.path" :label="item.name" :value="item.path" /></el-select><el-button :loading="loading" @click="importHuopai">直接导入货盘表</el-button></div><div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap"><span class="muted-copy">商品图片根目录</span><el-select v-model="imageRoot" placeholder="默认（服务端配置的图片根目录）" clearable style="width:400px"><el-option v-for="item in imageRootOptions" :key="item.path" :label="item.available ? item.path : `${item.path}（不可访问）`" :value="item.path" :disabled="!item.available" /></el-select><el-select v-model="imageMonths" multiple collapse-tags placeholder="全部月份" style="width:210px"><el-option v-for="m in IMAGE_MONTH_OPTIONS" :key="m" :label="m" :value="m" /></el-select><el-button :loading="scanning" :disabled="!batch?.id" @click="scanImages(false)">重新扫描图片</el-button></div><div class="folder-upload" style="margin-top: 12px"><label class="el-button el-button--default"><span>选择商品图片文件夹</span><input type="file" webkitdirectory directory multiple accept="image/*" hidden @change="readFolderFiles($event.target.files)" /></label><span v-if="folderFiles.length" class="muted-copy">已选择 {{ folderFiles.length }} 张商品图片</span><label class="el-button el-button--default" style="margin-left: 8px"><span>选择通用详情图文件夹</span><input type="file" webkitdirectory directory multiple accept="image/*" hidden @change="readCommonDetailFiles($event.target.files)" /></label><span v-if="commonDetailFiles.length" class="muted-copy">已选择 {{ commonDetailFiles.length }} 张通用详情图</span></div></section>
+    <section v-else-if="step === 1" class="content-panel bulk-card"><input ref="skuImageInput" type="file" accept="image/*" style="display:none" @change="onSkuImagePicked" /><div class="bulk-summary"><span>批次 {{ batch.id }}</span><el-tag type="success">可发布 {{ validCount }}</el-tag><el-tag type="danger">错误 {{ errorCount }}</el-tag><el-tag v-if="missingImageCount" type="warning">缺图 {{ missingImageCount }}</el-tag></div><el-alert v-if="imageScanResult" :type="imageScanResult.unmatched_sku_count ? 'warning' : 'success'" :closable="false" show-icon style="margin-bottom:12px"><template #title>图片匹配：商品 {{ imageScanResult.products_matched }}/{{ imageScanResult.products_total }}，SKU {{ imageScanResult.skus_matched }}/{{ imageScanResult.skus_total }}</template><template #default><div>扫描 {{ imageScanResult.folders }} 个商品文件夹 / {{ imageScanResult.scanned_images }} 张图；通用详情图 {{ imageScanResult.common_detail_images }} 张。</div><div v-if="imageScanResult.unmatched_sku_count">未匹配到规格图的 SKU {{ imageScanResult.unmatched_sku_count }} 个：{{ (imageScanResult.unmatched_skus || []).slice(0, 20).join('、') }}{{ imageScanResult.unmatched_sku_count > 20 ? ' …' : '' }}（图库里没有该款，需补图）</div></template></el-alert><el-table :data="items" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="line" label="行" width="70" /><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip /><el-table-column prop="sku_code" label="SKU编码" width="150" show-overflow-tooltip /><el-table-column label="规格图" width="120" align="center"><template #default="{ row }"><el-image v-if="row.sku_image" :src="bulkApi.imagePreviewUrl(row.sku_image)" :preview-src-list="[bulkApi.imagePreviewUrl(row.sku_image)]" preview-teleported fit="cover" style="width:54px;height:54px;border-radius:4px" /><el-tag v-else type="warning" size="small" style="cursor:pointer" title="点击上传该 SKU 的规格图" @click="pickSkuImage(row)">{{ uploadingSkuImage ? '上传中…' : '缺图·点击补图' }}</el-tag></template></el-table-column><el-table-column prop="price" label="售价" width="100" /><el-table-column prop="stock" label="库存" width="90" /><el-table-column label="校验结果" min-width="220" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.errors?.length" type="danger">{{ row.errors.join('；') }}</el-tag><el-tag v-else type="success">通过</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="160" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '继承组级默认' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><el-button type="primary" :loading="loading" @click="validateBatch">重新校验并继续</el-button></div></section>
+    <section v-else-if="step === 2" class="content-panel bulk-card"><h3>平台映射</h3><el-table :data="pagedMappingRows" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="product_code" label="商品编码" width="170" show-overflow-tooltip /><el-table-column prop="internal_category" label="Excel 内部类目" min-width="240" show-overflow-tooltip /><el-table-column label="微信类目" min-width="180" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.wechat_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="小红书类目" min-width="180" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.xhs_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="匹配状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag type="warning">{{ row.mapping.status || '待处理' }}</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="140" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '未配置' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><el-button type="primary" :loading="loading" @click="saveAndNext">保存自动映射并继续</el-button></div></section>
+    <section v-else class="content-panel bulk-card"><h3>确认发布</h3><p>默认先创建微信草稿；小红书创建商品和 SKU 后进入审核，不自动上架。</p><el-alert v-if="productWarningCount" type="warning" :closable="false" show-icon :title="`${productWarningCount} 个商品存在 SKU 间属性不一致提醒`" description="商品属性是 SPU 级，各 SKU 行填了不同值时仅第一行生效。点“审核编辑”查看具体提醒，必要时把该差异提升为规格维度。" style="margin-bottom:12px" /><div class="platform-picker"><span class="platform-picker__label">发布到平台</span><el-checkbox-group v-model="platforms"><el-checkbox-button label="wechat">微信</el-checkbox-button><el-checkbox-button label="xhs">小红书</el-checkbox-button></el-checkbox-group><span class="muted-copy">可多选，至少选一个</span></div><el-alert v-if="errorCount" type="error" :closable="false" show-icon title="仍有校验错误，不能发布" /><div class="bulk-summary"><span>商品行数：{{ products.length }}</span><span>通过：{{ validCount }}</span><span>错误：{{ errorCount }}</span><el-tag v-if="batch.status">{{ batch.status }}</el-tag></div><el-table :data="pagedProducts" max-height="360" style="margin-bottom:16px" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip /><el-table-column prop="internal_category" label="内部类目" min-width="180" show-overflow-tooltip /><el-table-column label="属性状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag :type="(mapping.products?.[row.product_code]?.wechat_attrs && Object.keys(mapping.products[row.product_code].wechat_attrs).length) ? 'success' : 'info'" size="small">{{ Object.keys(mapping.products?.[row.product_code]?.wechat_attrs || {}).length + Object.keys(mapping.products?.[row.product_code]?.xhs_attrs || {}).length }} 项已配</el-tag></template></el-table-column><el-table-column label="SKU 提醒" width="110"><template #default="{ row }"><el-tooltip v-if="row.warnings?.length" placement="top"><template #content><div v-for="(w, i) in row.warnings" :key="i">{{ w }}</div></template><el-tag type="warning" size="small">{{ row.warnings.length }} 项不一致</el-tag></el-tooltip><span v-else class="muted-copy">--</span></template></el-table-column><el-table-column label="操作" width="100" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openReview(row)">审核编辑</el-button></template></el-table-column></el-table><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><el-button type="primary" :loading="loading" :disabled="!platforms.length || errorCount > 0" :icon="Check" @click="publish">创建批量发布任务</el-button></div></section>
     <section v-if="currentJob" class="content-panel bulk-card" style="margin-top:16px">
-      <div class="bulk-summary"><strong>发布进度</strong><span>{{ currentJob.processed }}/{{ currentJob.total }}</span><el-tag>{{ jobStatusText(currentJob.status) }}</el-tag><el-button v-if="currentJob.items?.some((item) => item.status === 'failed')" size="small" type="warning" :loading="retrying" @click="retryFailedItems()">重试全部失败</el-button></div>
+      <div class="bulk-summary"><strong>发布进度</strong><span>{{ currentJob.processed }}/{{ currentJob.total }}</span><el-tag>{{ jobStatusText(currentJob.status) }}</el-tag><el-button v-if="currentJob.items?.length" size="small" @click="exportJobResult">导出结果</el-button><el-button v-if="currentJob.items?.some((item) => item.status === 'failed')" size="small" type="warning" :loading="retrying" @click="retryFailedItems()">重试全部失败</el-button></div>
       <el-progress :percentage="currentJob.total ? Math.round(currentJob.processed * 100 / currentJob.total) : 0" />
       <el-table :data="currentJob.items" max-height="320" style="margin-top:12px" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
         <el-table-column prop="product_code" label="商品编码" show-overflow-tooltip />
         <el-table-column label="平台" width="100"><template #default="{ row }">{{ row.platform === 'wechat' ? '微信' : '小红书' }}</template></el-table-column>
         <el-table-column label="状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag :type="row.status === 'success' ? 'success' : row.status === 'failed' || row.status === 'partial' ? 'danger' : 'info'">{{ jobStatusText(row.status) }}</el-tag></template></el-table-column>
+        <el-table-column prop="platform_product_id" label="平台商品ID" width="180" show-overflow-tooltip />
         <el-table-column prop="error" label="失败原因" min-width="280" show-overflow-tooltip />
         <el-table-column label="操作" width="90" fixed="right"><template #default="{ row }"><el-button v-if="row.status === 'failed'" link type="primary" :loading="retrying" @click="retryFailedItems([row.id])">重试</el-button><span v-else class="muted-copy">--</span></template></el-table-column>
       </el-table>
     </section>
     <ProductReviewDrawer v-model:visible="reviewVisible" :product="reviewProduct" :product-mapping="mapping.products?.[reviewProduct?.product_code] || {}" :group-config="getReviewGroupConfig(reviewProduct)" :platforms="platforms" @save="handleReviewSave" />
     <div v-if="step === 1" class="bulk-pagination"><el-pagination v-model:current-page="itemPage" v-model:page-size="itemPageSize" :page-sizes="[20, 50, 100]" layout="total, sizes, prev, pager, next, jumper" :total="filteredItems.length" /></div>
+    <div v-if="step === 2" class="bulk-pagination"><el-pagination v-model:current-page="mappingPage" v-model:page-size="mappingPageSize" :page-sizes="[20, 50, 100]" layout="total, sizes, prev, pager, next, jumper" :total="mappingRows.length" /></div>
+    <div v-if="step === 3" class="bulk-pagination"><el-pagination v-model:current-page="productPage" v-model:page-size="productPageSize" :page-sizes="[50, 100, 200]" layout="total, sizes, prev, pager, next, jumper" :total="products.length" /></div>
     <el-dialog v-model="aliasPanelVisible" title="类目映射表" width="920px">
       <CategoryAliasPanel dialog />
     </el-dialog>
-    <div v-if="step === 0" class="folder-upload" style="margin-top: 12px"><label class="el-button el-button--default"><span>选择商品图片文件夹</span><input type="file" webkitdirectory directory multiple accept="image/*" hidden @change="readFolderFiles($event.target.files)" /></label><span v-if="folderFiles.length" class="muted-copy">已选择 {{ folderFiles.length }} 张商品图片</span><label class="el-button el-button--default" style="margin-left: 8px"><span>选择通用详情图文件夹</span><input type="file" webkitdirectory directory multiple accept="image/*" hidden @change="readCommonDetailFiles($event.target.files)" /></label><span v-if="commonDetailFiles.length" class="muted-copy">已选择 {{ commonDetailFiles.length }} 张通用详情图</span><span v-if="!folderFiles.length && !commonDetailFiles.length" class="muted-copy">可选，系统会自动按商品编号匹配主图并追加通用详情图</span></div>
   </div>
 </template>

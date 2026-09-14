@@ -67,12 +67,22 @@ const statusMap = {
   13: { label: '审核中', type: 'warning' },
 }
 
-const stats = computed(() => ({
-  all: total.value || products.value.length,
-  online: products.value.filter((item) => Number(item.status) === 5).length,
-  offline: products.value.filter((item) => Number(item.status) === 11).length,
-  draft: products.value.filter((item) => Number(item.status) === 0).length,
-}))
+// 全店统计:微信接口支持按状态筛选,各状态只拉 1 条取接口返回的 total(代价很小)。
+// 之前是「只统计当前这一页(最多20条)」,数字会明显偏小。
+const stats = ref({ all: 0, online: 0, offline: 0, draft: 0, ready: false })
+async function loadStats() {
+  const totalOf = async (status) => {
+    const params = { page_size: 1 }
+    if (status !== undefined) params.status = status
+    return unwrapProducts(await storeApi.listProducts(params)).total
+  }
+  try {
+    const [all, draft, online, offline] = await Promise.all([totalOf(), totalOf(0), totalOf(5), totalOf(11)])
+    stats.value = { all, draft, online, offline, ready: true }
+  } catch {
+    stats.value = { ...stats.value, ready: false }
+  }
+}
 
 function unwrapProducts(data) {
   const result = data?.result || {}
@@ -164,12 +174,15 @@ function resetSearch() {
   searchForm.value = { ids: '', codes: '', keyword: '', minPrice: null, maxPrice: null, minStock: null, maxStock: null }
 }
 
-async function checkHealth() {
+// silent=true 供页面自动探活;手动点刷新按钮时给明确反馈,否则点了像没反应
+async function checkHealth(silent = true) {
   try {
     await storeApi.health()
     serviceOnline.value = true
+    if (!silent) ElMessage.success('服务连接正常')
   } catch {
     serviceOnline.value = false
+    if (!silent) ElMessage.error('无法连接服务，请检查后端服务是否已启动')
   }
 }
 
@@ -185,7 +198,20 @@ async function testToken() {
   }
 }
 
+// 微信接口慢:每一页都要重新「拉 ID 列表 + 逐个查详情」。翻回已经看过的页时直接复用缓存,
+// 不再转圈;点顶栏刷新 / 上架下架后由 refreshFromStart 清缓存,保证能看到最新数据。
+const productPageCache = new Map()
+const pageCacheKey = (cursor) => `${statusFilter.value}|${pageSize.value}|${cursor || ''}`
+
 async function loadProducts(cursor = null, pushHistory = false) {
+  const cached = productPageCache.get(pageCacheKey(cursor))
+  if (cached) {
+    if (pushHistory) pageHistory.value.push(cursor)
+    products.value = cached.list
+    total.value = cached.total
+    nextKey.value = cached.nextKey
+    return true
+  }
   loading.value = true
   try {
     const params = { page_size: pageSize.value }
@@ -196,9 +222,12 @@ async function loadProducts(cursor = null, pushHistory = false) {
     products.value = data.list
     total.value = data.total
     nextKey.value = data.nextKey
+    productPageCache.set(pageCacheKey(cursor), { list: data.list, total: data.total, nextKey: data.nextKey })
+    return true
   } catch (error) {
     products.value = []
     ElMessage.error(error.message)
+    return false
   } finally {
     loading.value = false
   }
@@ -223,8 +252,26 @@ function onPageChange(targetPage) {
 }
 
 function refreshFromStart() {
+  productPageCache.clear()   // 强制重拉:清掉分页缓存,避免看到旧数据
   pageHistory.value = []
   loadProducts()
+}
+
+// 切换状态筛选:不清缓存(缓存键含 status),切回看过的状态能秒开
+function switchStatus() {
+  pageHistory.value = []
+  loadProducts()
+}
+
+// 顶栏圆圈刷新:以前只探活,所以只弹"服务连接正常"、列表不动,容易被误解为"没反应"。
+// 现在探活通过后同时刷新当前页数据:微信列表在本组件刷新,小红书列表通过 refreshTick 通知子组件。
+const globalRefreshTick = ref(0)
+async function globalRefresh() {
+  await checkHealth()
+  if (!serviceOnline.value) { ElMessage.error('无法连接服务，请检查后端服务是否已启动'); return }
+  globalRefreshTick.value += 1
+  if (activeView.value === 'products') { await loadProducts(); void loadStats() }
+  ElMessage.success('已刷新')
 }
 
 async function previousPage() {
@@ -266,6 +313,7 @@ async function runAction(row, action) {
     if (action === 'delete') await storeApi.deleteProduct(id)
     ElMessage.success(`${actionText}操作已提交`)
     await refreshFromStart()
+    void loadStats()
   } catch (error) {
     ElMessage.error(error.message)
   } finally {
@@ -378,7 +426,7 @@ watch(activeView, (value) => {
 
 onMounted(async () => {
   await checkHealth()
-  if (serviceOnline.value) await loadProducts()
+  if (serviceOnline.value) { await loadProducts(); void loadStats() }
 })
 </script>
 
@@ -411,14 +459,14 @@ onMounted(async () => {
           <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : '连接设置' }}</strong>
         </div>
         <div class="topbar-actions">
-          <el-tooltip content="刷新服务状态"><el-button circle :icon="Refresh" @click="checkHealth" /></el-tooltip>
+          <el-tooltip content="刷新服务状态与当前列表"><el-button circle :icon="Refresh" @click="globalRefresh" /></el-tooltip>
           <div class="operator"><span>运营</span><div class="avatar">OP</div></div>
         </div>
       </el-header>
 
       <el-main class="main-content">
         <KeepAlive>
-          <XhsProductPanel v-if="activeView === 'xhs-products'" @create="activeView = 'xhs-create'" />
+          <XhsProductPanel v-if="activeView === 'xhs-products'" :refresh-tick="globalRefreshTick" @create="activeView = 'xhs-create'" />
         </KeepAlive>
 
         <template v-if="activeView === 'xhs-create'">
@@ -427,7 +475,7 @@ onMounted(async () => {
         </template>
 
         <KeepAlive>
-          <BulkPublishPanel v-if="activeView === 'bulk-publish'" />
+          <BulkPublishPanel v-if="activeView === 'bulk-publish'" @back="activeView = 'products'" />
         </KeepAlive>
 
         <CategoryAliasPanel v-if="activeView === 'category-aliases'" />
@@ -441,10 +489,10 @@ onMounted(async () => {
           <el-alert v-if="!serviceOnline" title="暂时无法连接服务" description="请检查平台服务是否已启动。" type="warning" show-icon :closable="false" class="offline-alert" />
 
           <div class="stats-grid">
-            <div class="stat-item"><span>商品总数</span><strong>{{ stats.all }}</strong><el-icon><Goods /></el-icon></div>
-            <div class="stat-item"><span>销售中</span><strong>{{ stats.online }}</strong><el-icon class="green"><CircleCheck /></el-icon></div>
-            <div class="stat-item"><span>未上架</span><strong>{{ stats.draft }}</strong><el-icon class="gray"><EditPen /></el-icon></div>
-            <div class="stat-item"><span>已下架</span><strong>{{ stats.offline }}</strong><el-icon class="amber"><Remove /></el-icon></div>
+            <div class="stat-item"><span>商品总数</span><strong>{{ stats.ready ? stats.all : '—' }}</strong><el-icon><Goods /></el-icon></div>
+            <div class="stat-item"><span>销售中</span><strong>{{ stats.ready ? stats.online : '—' }}</strong><el-icon class="green"><CircleCheck /></el-icon></div>
+            <div class="stat-item"><span>未上架</span><strong>{{ stats.ready ? stats.draft : '—' }}</strong><el-icon class="gray"><EditPen /></el-icon></div>
+            <div class="stat-item"><span>已下架</span><strong>{{ stats.ready ? stats.offline : '—' }}</strong><el-icon class="amber"><Remove /></el-icon></div>
           </div>
 
           <section class="content-panel">
@@ -457,8 +505,7 @@ onMounted(async () => {
               <el-segmented v-model="statusFilter" :options="[
                 { label: '全部', value: '' }, { label: '未上架', value: 0 },
                 { label: '销售中', value: 5 }, { label: '已下架', value: 11 },
-              ]" @change="refreshFromStart" />
-              <el-button :icon="Refresh" @click="refreshFromStart">刷新</el-button>
+              ]" @change="switchStatus" />
             </div>
             <el-table v-loading="loading" :data="filteredProducts" class="product-table" empty-text="暂无商品数据" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
               <el-table-column label="商品" min-width="310">

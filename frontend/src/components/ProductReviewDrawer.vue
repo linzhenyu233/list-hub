@@ -1,6 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { bulkApi } from '../bulkApi'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -284,6 +285,12 @@ function handleSave() {
         </div>
         <el-table :data="editForm.skus" size="small" max-height="320" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
           <el-table-column prop="sku_code" label="SKU编码" width="130" show-overflow-tooltip />
+          <el-table-column label="规格图" width="78" align="center">
+            <template #default="{ row }">
+              <el-image v-if="row.sku_image" :src="bulkApi.imagePreviewUrl(row.sku_image)" :preview-src-list="[bulkApi.imagePreviewUrl(row.sku_image)]" preview-teleported fit="cover" style="width:48px;height:48px;border-radius:4px" />
+              <el-tag v-else type="warning" size="small">缺图</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column v-for="(dim, di) in specDims" :key="di" width="180">
             <template #header>
               <div class="spec-dim-head">

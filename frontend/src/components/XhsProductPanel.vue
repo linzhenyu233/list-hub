@@ -1,7 +1,7 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { CircleCheck, Clock, Goods, Picture, Plus, Refresh, Remove } from '@element-plus/icons-vue'
+import { CircleCheck, Clock, Goods, Picture, Plus, Remove } from '@element-plus/icons-vue'
 import { xhsApi } from '../xhsApi'
 import XhsProductForm from './XhsProductForm.vue'
 import ProductSearchBar from './ProductSearchBar.vue'
@@ -9,8 +9,9 @@ import ProductDetailView from './ProductDetailView.vue'
 import EllipsisText from './EllipsisText.vue'
 
 const emit = defineEmits(['create'])
+// 顶栏全局刷新:App.vue 递增 refreshTick 通知本页重拉列表(见文件末尾 watch)
+const props = defineProps({ refreshTick: { type: Number, default: 0 } })
 const loading = ref(false)
-const refreshing = ref(false)
 const statusLoaded = ref(false)
 const summaryLoading = ref(false)
 const summaryReady = ref(false)
@@ -144,7 +145,6 @@ function unwrapList(data) {
 async function loadItems() {
   const version = ++loadVersion.value
   loading.value = true
-  refreshing.value = true
   summaryLoading.value = true
   summaryReady.value = false
   try {
@@ -167,7 +167,6 @@ async function loadItems() {
     ElMessage.error(error.message)
   } finally {
     loading.value = false
-    refreshing.value = false
   }
 }
 
@@ -331,13 +330,16 @@ onMounted(async () => {
   await checkHealth()
   if (serviceOnline.value) await loadItems()
 })
+
+// 顶栏全局刷新:父组件递增 refreshTick 时重拉列表
+watch(() => props.refreshTick, () => { if (serviceOnline.value) void loadItems() })
 </script>
 
 <template>
   <div class="xhs-view">
     <div class="page-heading">
       <div><h1>小红书商品</h1><p>独立管理小红书商品与 SKU 上下架，审核状态不会与微信平台混用</p></div>
-      <div class="heading-actions"><el-button :icon="Refresh" :loading="refreshing" @click="loadItems">刷新状态</el-button><el-button type="primary" :icon="Plus" @click="emit('create')">发布小红书商品</el-button></div>
+      <div class="heading-actions"><el-button type="primary" :icon="Plus" @click="emit('create')">发布小红书商品</el-button></div>
     </div>
     <el-alert v-if="!serviceOnline" title="小红书服务未连接" description="请启动 xhs_api.py（默认 8010 端口）。它与微信 FastAPI 服务相互独立。" type="warning" show-icon :closable="false" class="offline-alert" />
     <el-alert v-else-if="!tokenConfigured" title="小红书尚未配置有效授权令牌" description="请先完成小红书 OAuth 授权或配置 accessToken。" type="warning" show-icon :closable="false" class="offline-alert" />
@@ -355,7 +357,7 @@ onMounted(async () => {
         @search="page = 1"
         @reset="resetSearch"
       />
-      <div class="panel-toolbar xhs-filter-toolbar"><nav class="xhs-status-tabs" aria-label="小红书商品状态筛选"><button v-for="option in filterOptions" :key="option.value" :class="{ active: stateFilter === option.value }" @click="selectState(option.value)">{{ option.label }}</button></nav><div class="page-scope"><span>{{ summaryLoading ? '全店统计后台更新中' : '全店统计已更新' }}</span><el-button :icon="Refresh" @click="loadItems">刷新列表</el-button></div></div>
+      <div class="panel-toolbar xhs-filter-toolbar"><nav class="xhs-status-tabs" aria-label="小红书商品状态筛选"><button v-for="option in filterOptions" :key="option.value" :class="{ active: stateFilter === option.value }" @click="selectState(option.value)">{{ option.label }}</button></nav><div class="page-scope"><span>{{ summaryLoading ? '全店统计后台更新中' : '全店统计已更新' }}</span></div></div>
       <el-table v-loading="loading" :data="pagedItems" class="product-table" empty-text="当前分类暂无小红书商品" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
         <el-table-column label="商品" min-width="320"><template #default="{ row }"><div class="product-cell"><el-image :src="itemImage(row)" fit="cover" class="product-thumb"><template #error><div class="image-fallback"><el-icon><Picture /></el-icon></div></template></el-image><div><EllipsisText tag="strong" :text="itemName(row)" /><EllipsisText :text="`ID：${itemId(row) || '--'}`" /></div></div></template></el-table-column>
         <el-table-column label="售价" width="150" show-overflow-tooltip><template #default="{ row }"><strong class="price">{{ itemPrice(row) }}</strong></template></el-table-column>

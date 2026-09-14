@@ -94,7 +94,10 @@ button, input { font-family: inherit; }
 .bulk-view { width: 100%; }
 .bulk-steps { margin: 0 0 22px; padding: 18px 24px; border: 1px solid var(--border); border-radius: 7px; background: #fff; }
 .bulk-card { padding: 24px; }
-.bulk-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 220px; margin-bottom: 18px; border: 1px dashed #b8c4d6; border-radius: 7px; background: #fafcff; color: #667085; }
+.bulk-drop { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 220px; margin-bottom: 18px; border: 1px dashed #b8c4d6; border-radius: 7px; background: #fafcff; color: #667085; cursor: pointer; transition: border-color .18s ease, background .18s ease; }
+.bulk-drop:hover { border-color: var(--brand); background: #f4f9ff; }
+.bulk-drop__picker { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.bulk-drop__filename { max-width: 320px; overflow: hidden; color: #20242a; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .bulk-drop .el-icon { font-size: 32px; color: var(--brand); }
 .bulk-drop h3 { margin: 12px 0 4px; color: #20242a; }
 .bulk-drop p { margin: 0 0 16px; font-size: 13px; }
@@ -226,6 +229,28 @@ button, input { font-family: inherit; }
 
 .bulk-filters .el-input {
   width: min(360px, 100%);
+}
+
+/* 发布平台选择:原来两个裸复选框太不显眼,改成分段按钮卡片 */
+.platform-picker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+}
+
+.platform-picker__label {
+  font-weight: 600;
+  color: #20242a;
+}
+
+.platform-picker .el-checkbox-button__inner {
+  min-width: 96px;
+  font-size: 14px;
 }
 
 .bulk-pagination {

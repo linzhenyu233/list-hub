@@ -34,6 +34,7 @@ import sys
 import struct
 import time    # 用来算 token 过期时间、测试时等待
 import requests  # 发 HTTP 请求的库(微信接口都是 HTTP 接口)
+from concurrent.futures import ThreadPoolExecutor  # 列表要逐个查详情,并发拉缩短耗时
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
@@ -76,6 +77,9 @@ class WxStore:
         self._token_expire_at = 0     # token 的过期时间戳(Unix时间)
         self._cat_cache = None        # 类目树缓存(发品归一化类目用,避免每次拉15000+节点)
         self._cat_cache_ts = 0.0
+        self._qua_cache = {}          # 类目资质缓存 {leaf_cat_id: product_qua_list}
+        # 发品前是否先调 categoryprecheck 做类目权限预校验(可关:批量发品想省一次请求时)
+        self.precheck_before_submit = True
 
     # =================================================================
     # 第 1 步(所有接口的前提):获取 access_token
@@ -144,9 +148,18 @@ class WxStore:
         hints = []
         if "6600016" in text or "类目错误" in text:
             hints.append(
-                "【6600016 类目错误】请确认请求只包含最新 cats_v2 完整链路，并检查"
-                "开发者资质认证、店铺类目授权、保证金和 product_qua_infos 类目资质。"
-                "若均已完成，请凭上方 rid 联系微信小店官方查询具体限制。"
+                "【6600016 类目错误】按实测经验按序排查: "
+                "① cats_v2 只能是最新 cats_v2 完整链路——category/all 同时返回旧 cats 与新 "
+                "cats_v2 两套树,叶子ID相同但父级ID完全不同,混用即报类目错误; "
+                "② 调 /shop/ec/category/get_category_relation_list 查店铺真实类目权限: "
+                "目标类目不在 status=1(生效中)列表 = 店铺没有该类目权限; "
+                "在列表里但 qua_id=0 且 audit_info.certificate 为空 = 权限生效但未提交资质, "
+                "需调 /channels/ec/category/add 补交证照组 license_group_list"
+                "(图片必须用「上传资质图片」接口取 file_id,普通图片上传会报 10020094); "
+                "③ 发品需带 product_qua_infos 声明类目要求的资质"
+                "(从 /channels/ec/category/detail 的 product_qua_list 取 qua_id)。 "
+                "注: 商家自研模式不需要开发者资质认证,权限问题通常报 48001/61007 而非本错误。"
+                "若均已处理,请凭上方 rid 联系微信小店官方查询具体限制。"
             )
         if "10020083" in text or "10020048" in text or "10020070" in text or "保证金" in text:
             hints.append("【保证金不足】请前往微信小店网页端添加一次该类目商品,完成保证金补缴后再用 API 发品。")
@@ -286,6 +299,27 @@ class WxStore:
         sku_attrs 填 [{attr_key: name, attr_value: 用户选的值}]。"""
         data = self._post("/shop/ec/category/detail", {"cat_id": int(cat_id)})
         return data.get("attr", {})
+
+    def get_category_product_rule(self, cat_id, release_mode=0):
+        """获取类目下商品发布规则(getcategoryproductrule)。
+        用于发品前动态构建发布表单,返回:
+          - product_attr_list: 商品属性(含 required_rule 必填规则、候选值 value)
+          - sale_attr_list:    销售规格(有规格时 sku_attrs 按此填)
+          - product_qua_list:  类目资质要求(如珠宝的「鉴定证书」)
+          - size_chart:        尺码表
+          - presale_rule:      预售规则(含价格下限相关)
+          - extra_service_list: 可用额外服务
+          - product_requirement / restricted_brand_list / is_need_bar_code
+        - cat_id:       叶子类目ID
+        - release_mode: 0=普通模式 1=极简模式(极简模式属性/资质要求为空,
+                        适用于简化发品场景)
+        官方发品流程: categoryprecheck 校验通过后调本接口拿规则再发品。"""
+        data = self._post("/shop/ec/category/getcategoryproductrule",
+                          {"cat_id": int(cat_id), "release_mode": release_mode})
+        rule = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(rule, dict):
+            rule = {k: v for k, v in rule.items() if k not in ("errcode", "errmsg")}
+        return rule
 
     def get_freight_template_detail(self, template_id):
         """查询单个运费模板详情(getfreighttemplatedetail)。
@@ -552,6 +586,101 @@ class WxStore:
             raise RuntimeError(f"叶子类目 {leaf} 不存在于最新 cats_v2 类目树")
         return product
 
+    # -----------------------------------------------------------------
+    # 发品前类目权限预校验 + 类目资质(product_qua_infos)
+    # 背景: 6600016「类目错误」其实混杂了多种原因(类目链路错 / 类目未授权 /
+    #       保证金不足 / 类目资质未提交)。微信提供 categoryprecheck 专门校验
+    #       「店铺+类目权限」,返回 all_pass 与 fail_reasons,能在真正发品前
+    #       就把原因说清楚,而不是笼统报一个 6600016。
+    # -----------------------------------------------------------------
+    def precheck_category(self, cat_id=None, cats_v2=None):
+        """发品前校验店铺与类目权限(categoryprecheck)。
+        - cat_id:  叶子类目ID
+        - cats_v2: 完整链路 [{"cat_id":..}, ...],同时传时以 cats_v2 为准
+        返回 {"all_pass": True/False/None, "fail_reasons": [...], "raw": {...}}
+        ⚠️ all_pass=None 表示接口本身没调通(权限/网络),调用方应放行而不是阻断,
+           否则接口一抖动就无法发品。"""
+        payload = {}
+        if cats_v2:
+            payload["cats_v2"] = [
+                {"cat_id": self._as_cat_id(c.get("cat_id"))}
+                for c in cats_v2 if isinstance(c, dict) and c.get("cat_id") is not None
+            ]
+        if cat_id is not None:
+            payload["cat_id"] = self._as_cat_id(cat_id)
+        if not payload:
+            return {"all_pass": None, "fail_reasons": [], "raw": {}}
+        try:
+            data = self._post("/channels/ec/product/categoryprecheck", payload)
+        except Exception as e:
+            print(f"[precheck] categoryprecheck 调用失败(不阻断发品): {e}")
+            return {"all_pass": None, "fail_reasons": [], "raw": {}}
+        return {
+            "all_pass": bool(data.get("all_pass")),
+            "fail_reasons": data.get("fail_reasons") or [],
+            "raw": data,
+        }
+
+    def get_category_qua_list(self, cat_id):
+        """读类目要求的资质清单(product_qua_list),带缓存。
+        ⚠️ 不能用既有的 get_category_detail():它只返回 data["attr"],
+           把 product_qua_list(类目资质)丢掉了,而资质正是 6600016 的常见根因。
+        product_qua_list 每项形如:
+          {qua_id, name, need_to_apply(是否需先申请), mandatory, cert_group_list, tips}
+          cert_group_list 非空 = 店铺已提交该类资质凭证;为空 = 尚未提交。"""
+        key = str(cat_id)
+        if key in self._qua_cache:
+            return self._qua_cache[key]
+        try:
+            data = self._post("/channels/ec/category/detail", {"cat_id": int(cat_id)})
+        except Exception as e:
+            print(f"[qua] 类目 {cat_id} 资质查询失败(不阻断发品): {e}")
+            self._qua_cache[key] = []
+            return []
+        qua = data.get("product_qua_list") or []
+        self._qua_cache[key] = qua
+        return qua
+
+    def build_product_qua_infos(self, leaf_cat_id):
+        """按类目资质清单构造 product_qua_infos(声明本商品适用的类目资质)。
+        返回 [{"qua_id": "...", "qua_url": []}]。
+        ⚠️ 真实结构以本店铺在售商品为准:实测 product/get 返回
+           product_qua_infos = [{"qua_id": "50000041", "qua_url": []}],
+           即资质凭证由店铺在后台提交并全局生效,发品时只需声明 qua_id,
+           qua_url 传空数组即可(不要臆造 cert_group_list 之类的结构)。
+           缺这个字段正是珠宝类目 API 发品报 6600016 的常见原因。
+        只读 need_to_apply=true 的资质;类目无资质要求时返回 []。"""
+        infos = []
+        for q in self.get_category_qua_list(leaf_cat_id):
+            qua_id = str(q.get("qua_id") or "").strip()
+            if not qua_id or not q.get("need_to_apply"):
+                continue
+            infos.append({"qua_id": qua_id, "qua_url": []})
+        return infos
+
+    def get_category_relation_list(self, status=None):
+        """获取店铺真实拥有的类目权限(get_category_relation_list)。
+        - status: 1=生效中 2=已失效;None=全部
+        返回 [{id, status, qua_id, uneffective_reason, effective_time, ...}]
+        ⚠️ 这是判断「店铺到底能发哪些类目」的权威依据:
+           category/all 是全量类目树,里面有的类目不代表店铺有权限;
+           本接口才是店铺实际权限,6600016 排查时优先看它。
+           条目 qua_id=0 且 audit_info.certificate 为空 = 权限生效但未提交资质,
+           这种情况下类目在生效列表里,发品仍会被判类目错误。"""
+        payload = {"page_size": 50}
+        if status is not None:
+            payload["status"] = status
+        try:
+            data = self._post("/shop/ec/category/get_category_relation_list", payload)
+        except Exception as e:
+            print(f"[cat_relation] 类目权限查询失败: {e}")
+            return []
+        lst = data.get("list") or []
+        # 实测接口侧的 status 过滤不生效(传 1 仍返回全部状态),故在本地再过滤一次
+        if status is not None:
+            lst = [x for x in lst if x.get("status") == status]
+        return lst
+
     def _prepare_for_submit(self, product: dict):
         """发品/更新前统一整备 payload,补齐官方要求但前端易漏的字段(不覆盖调用方已填值):
         1. 类目归一化为官方格式(cats_v2:[新树链路])并移除 cats;
@@ -560,6 +689,31 @@ class WxStore:
         3. 售后:after_sale_info.after_sale_address_id 现为必填,缺失时用默认退货地址兜底。
         仅在字段缺失时补默认值,调用方已显式提供的值一律保留,不改变既有行为。"""
         product = self.normalize_category(product)
+
+        # 叶子类目ID(归一化后 cats_v2 的末位就是叶子)
+        leaf_id = None
+        cats_v2 = product.get("cats_v2") or []
+        if cats_v2 and isinstance(cats_v2[-1], dict):
+            leaf_id = cats_v2[-1].get("cat_id")
+
+        # ① 类目权限预校验:明确不通过时在此失败,避免发到微信才吃一个笼统的 6600016。
+        #    all_pass is False 才阻断;None 表示接口没调通,放行(不能让接口抖动卡住发品)。
+        if self.precheck_before_submit and leaf_id is not None:
+            ck = self.precheck_category(cats_v2=cats_v2)
+            if ck["all_pass"] is False:
+                reasons = ck["fail_reasons"] or ck["raw"]
+                raise RuntimeError(
+                    f"类目权限预校验未通过(叶子类目={leaf_id}): {reasons}。"
+                    f"请按上述原因在微信小店后台处理(类目授权/保证金/类目资质)后再发品。"
+                )
+
+        # ② 类目资质 product_qua_infos:珠宝等类目必需,缺失会被判 6600016。
+        #    调用方显式提供了就不覆盖;否则按类目资质清单自动补(仅补店铺已提交的)。
+        if leaf_id is not None and not product.get("product_qua_infos"):
+            infos = self.build_product_qua_infos(leaf_id)
+            if infos:
+                product["product_qua_infos"] = infos
+                print(f"[qua] 已自动带上类目资质: {[i['qua_id'] for i in infos]}")
 
         # 运费模板 → express_info.template_id(官方字段在 express_info 内,顶层字段会被忽略)
         top_tid = product.pop("freight_template_id", None)
@@ -664,17 +818,28 @@ class WxStore:
             payload["next_key"] = next_key
         data = self._post("/channels/ec/product/list/get", payload)
         d = data.get("data", data)  # 兼容 data 包装或顶层返回
-        # 微信只返回商品ID列表,逐个查详情组装(单个失败不阻塞整页)
-        products = []
-        for pid in d.get("product_ids", []):
+        # 微信的 list 接口只返回商品ID,必须逐个查详情才有标题/价格/SKU。
+        # 串行查 20 条约 28 秒(每次 ~1.4s) —— 这就是商品列表慢的根因;
+        # 改成并发后总耗时约 1~2 秒,单个失败仍不阻塞整页。
+        self.get_access_token()   # 先取一次 token,避免多线程同时去换 token
+        ids = d.get("product_ids", []) or []
+        products = [None] * len(ids)
+
+        def fetch(indexed):
+            index, pid = indexed
             try:
                 p = self.get_product(pid)
                 prod = p.get("product", {})
                 # 审核信息在顶层,合并进商品对象供前端直接展示
                 prod["audit_info"] = p.get("audit_info")
-                products.append(prod)
+                return index, prod
             except RuntimeError as e:
-                products.append({"product_id": pid, "title": f"(详情获取失败:{e})"})
+                return index, {"product_id": pid, "title": f"(详情获取失败:{e})"}
+
+        if ids:
+            with ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+                for index, prod in pool.map(fetch, list(enumerate(ids))):
+                    products[index] = prod
         return {
             "products": products,
             "next_key": d.get("next_key"),

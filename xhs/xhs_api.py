@@ -642,11 +642,17 @@ def update_item(item_id: str, body: dict = Body(..., example={
 @app.put("/skus/{sku_id}")
 def update_sku(sku_id: str, body: dict = Body(..., example={
     "sku": {"price": 9000, "stock": 50}, "updated_fields": ["price", "stock"]})):
-    """改 SKU(价格/库存等)。updated_fields 可选。"""
+    """改 SKU(价格/库存/规格图等)。updated_fields 可选。
+
+    ⚠️ 小红书 product.updateSkuV2 必须带 itemId, 否则报「入参itemId不能为空」。
+       用 body.item_id 或在 sku 里带 itemId 传进来(二选一)。
+    """
     sku = body.get("sku")
     if not sku:
         raise HTTPException(status_code=400, detail="请求体需要 sku 字段")
     payload = {"id": sku_id, **sku}
+    if body.get("item_id") and not payload.get("itemId"):
+        payload["itemId"] = str(body["item_id"])
     if body.get("updated_fields"):
         payload["updatedFields"] = body["updated_fields"]
     result = ok_or_400(lambda: _xhs_call("product.updateSkuV2", payload))
