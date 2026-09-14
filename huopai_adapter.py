@@ -5,7 +5,10 @@
 - 商品编码 = 商家编码的「字母+数字」主干（ZSDZ388W-100 → ZSDZ388）
 - SKU 编码 = 完整商家编码（ZSDZ388W-100）
 - 规格维度 = 主钻分数 + 钻石颜色
-- 售价(分) = ceil(零售标价(分) / 0.7)，划线价不填
+- 售价(元) = ceil(零售标价(元) / 0.7)，划线价不填
+  注: 货盘「零售标价」这一列的单位是「元」不是「分」, 除以 0.7 的结果正好等于货盘自己的
+      「上架价」列(如 489300/0.7=699000, 货盘该列就是 699000)。此前误当成"分"又除了 100,
+      导致上架价比货盘价小 100 倍。
 - 库存：供定制/可定制 → 预售(不设库存)；售罄 → 0；数字 → 原样
 - 图片：uploaded_images.json 按商家编码前缀匹配，排除 .psd
 """
@@ -332,9 +335,8 @@ def parse_peiyuzuan(sheet, images):
         _, sub_series = split_series(r[19])
         if sub_series:
             product_code = f"{product_code}-{sub_series}"
-        retail = r[37]  # 零售标价
-        price_fen = ceil_div07(retail)
-        price_yuan = ((price_fen + 99) // 100) if price_fen is not None else ""  # 向上取整到整数元(去掉角分)
+        retail = r[37]  # 零售标价(单位: 元, 不是分)
+        price_yuan = ceil_div07(retail) if retail is not None else ""  # 售价(元) = 零售标价/0.7, 与货盘「上架价」列一致
         title = build_title(r[19], r[24], r[16])
         cut_wx, cut_xhs = map_cut(r[30])
         cat = s(r[17]) or s(r[16])
@@ -372,9 +374,8 @@ def parse_tianranzuan(sheet, images):
             continue
         product_code = split_product_code(shangjia)
         sku_code = clean_base(s(r[5])) or shangjia
-        retail = r[26]
-        price_fen = ceil_div07(retail)
-        price_yuan = ((price_fen + 99) // 100) if price_fen is not None else ""  # 向上取整到整数元(去掉角分)
+        retail = r[26]  # 零售价(单位: 元, 不是分)
+        price_yuan = ceil_div07(retail) if retail is not None else ""  # 售价(元) = 零售价/0.7, 与货盘「上架价」列一致
         title = build_title(r[9], r[13], r[7])
         cut_wx, cut_xhs = map_cut(r[19])
         attrs = join_attrs([

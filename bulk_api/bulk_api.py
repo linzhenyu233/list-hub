@@ -66,6 +66,15 @@ app = FastAPI(title="商品批量发布中台", version="0.1.0")
 _WECHAT_CATEGORY_CHAIN_CACHE = {}
 _XHS_VAR_CANDIDATES_CACHE = {}
 
+# 图片上传缓存:内存 LRU 层(SQLite 之上),命中直接返回,省一次磁盘查询。
+# 上限 2000 条(按单商品约 10 张图算,覆盖 200 件商品的并发上传窗口)。
+_IMAGE_CACHE_MEM = {}
+_IMAGE_CACHE_ORDER = []  # 插入顺序,用于 LRU 淘汰
+_IMAGE_CACHE_MAX = 2000
+_image_cache_hit_mem = 0  # 内存命中计数
+_image_cache_hit_db = 0   # DB 命中计数
+_image_cache_miss = 0     # 未命中计数
+
 # 小红书 SKU 规格值别名:货盘英文 SKU 编码 → 平台中文 valueName(发品时映射用)
 # 小红书「颜色分类」等规格的 valueName 是中文,货盘常用英文编码,直接发英文会显示英文
 XHS_SPEC_VALUE_ALIASES = {
@@ -117,10 +126,15 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, batch_id TEXT NOT NULL,
         product_code TEXT NOT NULL, platform TEXT NOT NULL, status TEXT NOT NULL,
         platform_product_id TEXT, platform_sku_ids TEXT, error TEXT,
-        started_at TEXT, finished_at TEXT,
+        started_at TEXT, finished_at TEXT, priority INTEGER NOT NULL DEFAULT 0,
         UNIQUE(job_id, product_code, platform)
     )""")
+    # 老库补列: priority=1 表示"分批发布的选中项", worker 优先后执行,
+    # 免得只选了 6 件却要排在几百件的大任务后面
+    if "priority" not in {row["name"] for row in conn.execute("PRAGMA table_info(publish_items)")}:
+        conn.execute("ALTER TABLE publish_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_batch_product_platform ON publish_items(batch_id, product_code, platform)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_pick ON publish_items(status, priority DESC, id)")
     conn.execute("""CREATE TABLE IF NOT EXISTS image_upload_cache (
         platform TEXT NOT NULL, source_hash TEXT NOT NULL, source_url TEXT NOT NULL,
         platform_url TEXT NOT NULL, updated_at TEXT, PRIMARY KEY(platform, source_hash)
@@ -233,6 +247,7 @@ def _local_image(source):
 
 
 def _platform_image(platform, source_url):
+    global _image_cache_hit_mem, _image_cache_hit_db, _image_cache_miss
     source_url = str(source_url or "").strip()
     if not source_url: return ""
     local_image = _local_image(source_url)
@@ -240,8 +255,22 @@ def _platform_image(platform, source_url):
         # 共享盘图片懒拷贝: 只有真正发布到平台时才读字节(扫描阶段零磁盘)
         local_image = fetch_share_image(source_url)
     source_hash = hashlib.sha256(local_image[1] if local_image else source_url.encode("utf-8")).hexdigest()
+    cache_key = (platform, source_hash)
+    # 1. 内存 LRU 层
+    if cache_key in _IMAGE_CACHE_MEM:
+        _image_cache_hit_mem += 1
+        # 移到末尾表示最近使用
+        _IMAGE_CACHE_ORDER.remove(cache_key)
+        _IMAGE_CACHE_ORDER.append(cache_key)
+        return _IMAGE_CACHE_MEM[cache_key]
+    # 2. SQLite 持久层
     conn = db(); cached = conn.execute("SELECT platform_url FROM image_upload_cache WHERE platform=? AND source_hash=?", (platform, source_hash)).fetchone(); conn.close()
-    if cached: return cached["platform_url"]
+    if cached:
+        _image_cache_hit_db += 1
+        _image_cache_mem_put(cache_key, cached["platform_url"])
+        return cached["platform_url"]
+    # 3. 未命中: 真正上传
+    _image_cache_miss += 1
     if local_image:
         payload = {"filename": os.path.basename(local_image[0]),
                    "content_base64": base64.b64encode(local_image[1]).decode("ascii")}
@@ -257,15 +286,27 @@ def _platform_image(platform, source_url):
     else: platform_url = (result or {}).get("url") or (result or {}).get("materialUrl") or (result or {}).get("fileUrl") or (result or {}).get("img_url")
     if not platform_url: raise RuntimeError(f"{platform} 图片上传未返回地址")
     conn = db(); conn.execute("INSERT OR REPLACE INTO image_upload_cache(platform,source_hash,source_url,platform_url,updated_at) VALUES(?,?,?,?,?)", (platform, source_hash, source_url, platform_url, now())); conn.commit(); conn.close()
+    _image_cache_mem_put(cache_key, platform_url)
     return platform_url
 
 
-def _upload_images_parallel(platform: str, urls: list, max_workers: int = 5) -> list:
+def _image_cache_mem_put(cache_key, platform_url):
+    """把一条缓存写入内存层,超出上限时淘汰最久未用的。"""
+    if cache_key in _IMAGE_CACHE_MEM:
+        _IMAGE_CACHE_ORDER.remove(cache_key)
+    _IMAGE_CACHE_MEM[cache_key] = platform_url
+    _IMAGE_CACHE_ORDER.append(cache_key)
+    while len(_IMAGE_CACHE_ORDER) > _IMAGE_CACHE_MAX:
+        evicted = _IMAGE_CACHE_ORDER.pop(0)
+        _IMAGE_CACHE_MEM.pop(evicted, None)
+
+
+def _upload_images_parallel(platform: str, urls: list, max_workers: int = 10) -> list:
     """并发上传图片并保序返回(替代原来的串行列表推导)。
 
     - 命中 image_upload_cache 的图片直接返回,不产生网络请求
     - 单张失败时抛出原始异常(与串行语义一致),发布项会标记 failed、可重试
-    - max_workers 默认 5(平台限流风险可控)
+    - max_workers 默认 10(平台限流风险可控,且缓存命中后实际请求远少于总数)
     """
     from concurrent.futures import ThreadPoolExecutor
     targets = [str(u or "").strip() for u in (urls or [])]
@@ -509,10 +550,11 @@ def _worker_loop(platform=None):
                 continue
             conn = db()
             conn.execute("BEGIN IMMEDIATE")
+            # priority DESC: 分批发布(只选中几件)的项插到前面先跑, 再按 id 先到先服务
             if platform:
-                item = conn.execute("SELECT * FROM publish_items WHERE status='queued' AND platform=? ORDER BY id LIMIT 1", (platform,)).fetchone()
+                item = conn.execute("SELECT * FROM publish_items WHERE status='queued' AND platform=? ORDER BY priority DESC, id LIMIT 1", (platform,)).fetchone()
             else:
-                item = conn.execute("SELECT * FROM publish_items WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+                item = conn.execute("SELECT * FROM publish_items WHERE status='queued' ORDER BY priority DESC, id LIMIT 1").fetchone()
             if not item:
                 conn.commit(); conn.close()
                 time.sleep(1)
@@ -581,6 +623,7 @@ class MappingsBody(BaseModel):
 
 class PublishBody(BaseModel):
     platforms: list[str]
+    product_codes: list[str] | None = None  # 不传=全量发布,传了=只发布指定商品(分批发布)
 
 
 class RetryBody(BaseModel):
@@ -779,8 +822,20 @@ def fetch_share_image(source):
     覆写, 因此这里必须再校验一次路径白名单, 否则可被用来读服务器任意文件并上传平台。
     """
     path = str(source)[len(SHARE_PREFIX):]
-    if not path or not _within_allowed_roots(path) or not os.path.isfile(path):
-        raise RuntimeError(f"共享盘图片不可用(不存在或不在允许的图片目录内)：{path}")
+    if not path or not _within_allowed_roots(path):
+        raise RuntimeError(f"共享盘图片路径不在允许的图片目录内：{path}")
+    # 用 os.stat 而不是 os.path.isfile: 后者把"无权限 / 网络不可达"也一并吞成 False,
+    # 让权限问题伪装成"文件不存在"(线上踩过: worker 以 SYSTEM 跑时整批报"不存在")。
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        raise RuntimeError(f"共享盘图片不存在(可能已被移动或删除)：{path}")
+    except PermissionError:
+        raise RuntimeError(f"共享盘图片无权读取(Worker 运行账户对该共享没有权限)：{path}")
+    except OSError as exc:
+        raise RuntimeError(f"共享盘不可访问：{path}（{exc}）")
+    if not os.path.isfile(path):
+        raise RuntimeError(f"共享盘路径不是图片文件：{path}")
     with open(path, "rb") as image_file:
         content = image_file.read()
     if not content:
@@ -1205,6 +1260,7 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
     sku_image = {}         # SKU 编码  -> 共享盘图片引用
     errors = []
     unmatched_skus = []
+    unmatched_products = []   # 连商品级主图都没挂上的商品编码: 发布时会被平台以"至少需要一张主图"拒
 
     def localize(path):
         # 懒拷贝: 只记共享盘路径, 真正上传平台时才读字节落盘。
@@ -1243,6 +1299,8 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
             product_main[code] = references
             if references:
                 products_matched += 1
+            elif code:
+                unmatched_products.append(code)
         if product_main[code]:
             row["main_images"] = product_main[code]
         if common_refs:
@@ -1283,6 +1341,8 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
         "skus_matched": skus_matched, "skus_total": len(rows),
         "unmatched_sku_count": len(unmatched_skus),
         "unmatched_skus": unmatched_skus[:200],
+        "unmatched_product_count": len(unmatched_products),
+        "unmatched_products": unmatched_products[:200],
         "lazy_load": True, "errors": errors[:50],
     }
 
@@ -1417,9 +1477,14 @@ def publish(batch_id: str, body: PublishBody):
     if batch["errors"]: raise HTTPException(400, "仍有校验错误，不能发布")
     platforms = [p for p in body.platforms if p in ("wechat", "xhs")]
     if not platforms: raise HTTPException(400, "至少选择一个发布平台")
+    # 按 product_codes 过滤(分批发布);不传则全量
+    products = batch["products"]
+    if body.product_codes:
+        code_set = set(body.product_codes)
+        products = [p for p in products if p["product_code"] in code_set]
+        if not products: raise HTTPException(400, "所选商品均不存在")
     # Idempotency guard: do not create another platform item for a combination
     # that already has a publish record in this batch.
-    products = batch["products"]
     check_conn = db()
     check_conn.execute("BEGIN IMMEDIATE")
     prior = []
@@ -1436,17 +1501,21 @@ def publish(batch_id: str, body: PublishBody):
         reusable = next((row for row in reversed(prior) if row["status"] in ("queued", "running")), prior[-1])
         check_conn.close()
         status = reusable["status"]
-        message = {"success": "该批次所选商品已发布，未重复创建", "failed": "该批次已有失败项，请使用重试失败项", "partial": "该批次存在部分成功项，请勿重复创建"}.get(status, "该批次已有发布任务，未重复创建")
+        message = {"success": "所选商品已发布，未重复创建", "failed": "所选商品已有失败项，请使用重试失败项", "partial": "所选商品存在部分成功项，请勿重复创建"}.get(status, "所选商品已有发布任务，未重复创建")
         return {"ok": True, "job_id": reusable["job_id"], "batch_id": batch_id, "platforms": platforms, "existing": True, "created_count": 0, "skipped_count": len(prior), "message": message}
     # Keep the write transaction open through job/item insertion.
     conn = check_conn
     job_id = uuid.uuid4().hex
-    products = batch["products"]
-    conn.execute("INSERT INTO publish_jobs(id,batch_id,platforms_json,status,total,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (job_id, batch_id, json.dumps(platforms), "queued", len(pending) if pending else len(products) * len(platforms), now(), now()))
+    total = len(pending) if pending else len(products) * len(platforms)
+    # 分批发布(带了 product_codes) = 运营明确只要发这几件, 标记优先, 插到队列前面走
+    partial = bool(body.product_codes)
+    priority = 1 if partial else 0
+    conn.execute("INSERT INTO publish_jobs(id,batch_id,platforms_json,status,total,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (job_id, batch_id, json.dumps(platforms), "queued", total, now(), now()))
     for product_code, platform in (pending or [(product["product_code"], platform) for product in products for platform in platforms]):
-        conn.execute("INSERT INTO publish_items(job_id,batch_id,product_code,platform,status) VALUES(?,?,?,?,?)", (job_id, batch_id, product_code, platform, "queued"))
+        conn.execute("INSERT INTO publish_items(job_id,batch_id,product_code,platform,status,priority) VALUES(?,?,?,?,?,?)", (job_id, batch_id, product_code, platform, "queued", priority))
     conn.execute("UPDATE batches SET status=? WHERE id=?", ("发布任务已创建", batch_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id)
-    return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "message": "发布任务已入队，后台将持续执行"}
+    message = f"已创建发布任务({len(products)} 件商品 × {len(platforms)} 平台)" if partial else "发布任务已入队，后台将持续执行"
+    return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "message": message}
 
 
 @app.get("/jobs/{job_id}")
@@ -1456,6 +1525,35 @@ def job(job_id: str):
     items = [dict(r) for r in conn.execute("SELECT * FROM publish_items WHERE job_id=? ORDER BY id", (job_id,)).fetchall()]
     conn.close()
     return {"ok": True, "result": {"job_id": job_id, "batch_id": j["batch_id"], "status": j["status"], "total": j["total"], "processed": j["processed"], "success": j["success"], "failed": j["failed"], "items": items}}
+
+
+@app.get("/image-cache/stats")
+def image_cache_stats():
+    """图片上传缓存统计:DB 条目数、内存命中、DB 命中、未命中次数。"""
+    conn = db()
+    total = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache").fetchone()["c"]
+    wechat_count = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE platform='wechat'").fetchone()["c"]
+    xhs_count = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE platform='xhs'").fetchone()["c"]
+    conn.close()
+    total_lookups = _image_cache_hit_mem + _image_cache_hit_db + _image_cache_miss
+    hit_rate = round((_image_cache_hit_mem + _image_cache_hit_db) / total_lookups * 100, 1) if total_lookups else 0
+    return {"ok": True, "result": {
+        "db_total": total, "db_wechat": wechat_count, "db_xhs": xhs_count,
+        "mem_size": len(_IMAGE_CACHE_MEM), "mem_max": _IMAGE_CACHE_MAX,
+        "hit_mem": _image_cache_hit_mem, "hit_db": _image_cache_hit_db,
+        "miss": _image_cache_miss, "total_lookups": total_lookups, "hit_rate_pct": hit_rate,
+    }}
+
+
+@app.delete("/image-cache")
+def clear_image_cache():
+    """清空图片上传缓存(内存 + SQLite)。用于平台素材被删、强制重传等场景。"""
+    global _image_cache_hit_mem, _image_cache_hit_db, _image_cache_miss
+    _IMAGE_CACHE_MEM.clear()
+    _IMAGE_CACHE_ORDER.clear()
+    _image_cache_hit_mem = _image_cache_hit_db = _image_cache_miss = 0
+    conn = db(); conn.execute("DELETE FROM image_upload_cache"); conn.commit(); conn.close()
+    return {"ok": True, "message": "图片上传缓存已清空"}
 
 
 # ==================================================================
