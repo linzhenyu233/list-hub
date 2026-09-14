@@ -24,7 +24,9 @@ if __name__ == "__main__":
         raise SystemExit("批量发布 Worker 已经在运行，本次不重复启动")
     recover_interrupted_items()
     workers = []
-    worker_count = max(1, int(os.environ.get("BULK_WORKERS_PER_PLATFORM", "2")))
+    # 默认每平台 3 线程(原为 2),提升 300~800 商品批量发布的吞吐;
+    # 仍可用环境变量 BULK_WORKERS_PER_PLATFORM 覆盖,便于按平台限流回调
+    worker_count = max(1, int(os.environ.get("BULK_WORKERS_PER_PLATFORM", "3")))
     for platform in ("wechat", "xhs"):
         for index in range(worker_count):
             worker = threading.Thread(target=_worker_loop, args=(platform,),

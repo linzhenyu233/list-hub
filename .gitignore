@@ -24,8 +24,9 @@ dist/
 *.crt
 
 # ---- 运行时数据 ----
-# 批量中台的 SQLite 目录库
+# 批量中台的 SQLite 目录库(含 WAL 模式产生的 -wal / -shm 旁挂文件)
 *.sqlite3
+*.sqlite3-*
 *.sqlite
 *.db
 # upload_images.py 的输出文件
@@ -54,6 +55,9 @@ htmlcov/
 
 # ---- 日志 ----
 *.log
+# 服务重定向输出(bulk_api/_svc.err、_worker.out 等)
+*.err
+*.out
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

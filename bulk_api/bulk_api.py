@@ -37,8 +37,57 @@ BULK_API_HOST = os.environ.get("BULK_API_HOST", "0.0.0.0")
 BULK_API_PORT = int(os.environ.get("BULK_API_PORT", "8020"))
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
+# 图片根目录默认值(网络共享, 服务端可直读):图片直读扫描的默认根目录
+DEFAULT_IMAGE_ROOT = r"\\192.168.10.250\电子商务部\网销部共享\SHINING HOUSE培育钻"
+# 允许按引用读取图片的根目录白名单:
+# 防止有人构造 disk:/local: 引用(或直接传 root 参数)去读服务器上的任意文件
+ALLOWED_IMAGE_ROOTS = [DEFAULT_IMAGE_ROOT, IMAGE_DIR]
+
+
+def _within_allowed_roots(path):
+    """判断绝对路径是否落在 ALLOWED_IMAGE_ROOTS 内。
+
+    用 commonpath 而不是 startswith:后者会让 '...\\images_evil\\x.jpg' 命中
+    白名单根 '...\\images' 的前缀,导致越权读取。
+    """
+    target = os.path.abspath(str(path or ""))
+    for root in ALLOWED_IMAGE_ROOTS:
+        root_abs = os.path.abspath(root)
+        try:
+            if os.path.commonpath((root_abs, target)) == root_abs:
+                return True
+        except ValueError:
+            # 不同盘符 / 本地盘与 UNC 混用时 commonpath 会报错,视为不在白名单内
+            continue
+    return False
+
+
 app = FastAPI(title="商品批量发布中台", version="0.1.0")
 _WECHAT_CATEGORY_CHAIN_CACHE = {}
+_XHS_VAR_CANDIDATES_CACHE = {}
+
+# 小红书 SKU 规格值别名:货盘英文 SKU 编码 → 平台中文 valueName(发品时映射用)
+# 小红书「颜色分类」等规格的 valueName 是中文,货盘常用英文编码,直接发英文会显示英文
+XHS_SPEC_VALUE_ALIASES = {
+    '粉红色': ['SHINING PINK', '粉色', '粉红', 'PINK', 'Rose'],
+    '浅蓝色': ['ICE BLUE', '浅蓝', 'LIGHT BLUE'],
+    '香槟金色': ['CHAMPAGNE GOLD', '香槟金', 'CHAMPAGNE'],
+    '玫瑰金色': ['ROSE GOLD', '玫瑰金'],
+    '黄金色': ['YELLOW GOLD', '黄金', 'GOLD'],
+    '18K金色': ['18K GOLD', '18K金'],
+    '白色': ['WHITE'],
+    '黑色': ['BLACK'],
+    '无色': ['COLORLESS', '透明'],
+    '玫红色': ['ROSE RED', '玫红'],
+    '红色': ['RED'],
+    '绿色': ['GREEN'],
+    '黄色': ['YELLOW'],
+    '蓝色': ['BLUE'],
+    '紫色': ['PURPLE', 'VIOLET'],
+    '灰色': ['GRAY', 'GREY'],
+    '银色': ['SILVER'],
+    # 其它颜色/规格值按需补充
+}
 
 
 def db():
@@ -126,9 +175,13 @@ def _wechat_payload(product, mapping):
     skus = []
     for sku in product.get("skus", []):
         attrs_sku = [{"attr_key": s.get("name", ""), "attr_value": s.get("value", "")} for s in sku.get("specs", []) if s.get("name") and s.get("value")]
-        skus.append({"out_sku_id": sku.get("sku_code"), "sale_price": round(float(sku.get("price") or 0) * 100),
-                     "market_price": round(float(sku.get("original_price") or sku.get("price") or 0) * 100),
-                     "stock_num": int(float(sku.get("stock") or 0)), "sku_attrs": attrs_sku})
+        item_sku = {"out_sku_id": sku.get("sku_code"), "sale_price": round(float(sku.get("price") or 0) * 100),
+                    "market_price": round(float(sku.get("original_price") or sku.get("price") or 0) * 100),
+                    "stock_num": int(float(sku.get("stock") or 0)), "sku_attrs": attrs_sku}
+        # SKU 缩略图: 没匹配到图就不传, 避免空串被判非法
+        if sku.get("uploaded_sku_image"):
+            item_sku["thumb_img"] = sku["uploaded_sku_image"]
+        skus.append(item_sku)
     item["skus"] = skus
     return item
 
@@ -183,6 +236,9 @@ def _platform_image(platform, source_url):
     source_url = str(source_url or "").strip()
     if not source_url: return ""
     local_image = _local_image(source_url)
+    if not local_image and is_share_image(source_url):
+        # 共享盘图片懒拷贝: 只有真正发布到平台时才读字节(扫描阶段零磁盘)
+        local_image = fetch_share_image(source_url)
     source_hash = hashlib.sha256(local_image[1] if local_image else source_url.encode("utf-8")).hexdigest()
     conn = db(); cached = conn.execute("SELECT platform_url FROM image_upload_cache WHERE platform=? AND source_hash=?", (platform, source_hash)).fetchone(); conn.close()
     if cached: return cached["platform_url"]
@@ -204,11 +260,138 @@ def _platform_image(platform, source_url):
     return platform_url
 
 
+def _upload_images_parallel(platform: str, urls: list, max_workers: int = 5) -> list:
+    """并发上传图片并保序返回(替代原来的串行列表推导)。
+
+    - 命中 image_upload_cache 的图片直接返回,不产生网络请求
+    - 单张失败时抛出原始异常(与串行语义一致),发布项会标记 failed、可重试
+    - max_workers 默认 5(平台限流风险可控)
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    targets = [str(u or "").strip() for u in (urls or [])]
+    targets = [u for u in targets if u]
+    if not targets:
+        return []
+    if len(targets) == 1:
+        return [_platform_image(platform, targets[0])]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(targets))) as pool:
+        # map 保序;任一任务抛异常会在迭代到该位置时重新抛出
+        return list(pool.map(lambda u: _platform_image(platform, u), targets))
+
+
+def _upload_image_uncached(platform, source_url):
+    """绕开 image_upload_cache 直接上传, 拿一个全新的平台素材地址。
+
+    背景(实测): 小红书同一张图重复上传会返回**不同的**素材 URL, 而同一商品内多个 SKU
+    共用同一个素材地址时, 小红书后台的「规格图」列显示为空; 图各不相同的商品则正常显示。
+    所以只有"撞图"的 SKU 需要走这里补传一次, 没撞图的继续走缓存, 不做无谓重复上传。
+    """
+    local_image = _local_image(source_url)
+    if not local_image and is_share_image(source_url):
+        local_image = fetch_share_image(source_url)
+    if not local_image:
+        raise RuntimeError(f"无法读取图片: {str(source_url)[:120]}")
+    payload = {"filename": os.path.basename(local_image[0]),
+               "content_base64": base64.b64encode(local_image[1]).decode("ascii")}
+    endpoint = "/images/upload-file" if platform == "wechat" else "/materials/upload-file"
+    base = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
+    response = _json_post(f"{base}{endpoint}", payload)
+    if response.get("ok") is False:
+        raise RuntimeError(str(response.get("detail") or response)[:300])
+    result = response.get("result")
+    if isinstance(result, str):
+        return result
+    return ((result or {}).get("url") or (result or {}).get("materialUrl")
+            or (result or {}).get("fileUrl") or (result or {}).get("img_url") or "")
+
+
+def _upload_sku_images(platform, skus):
+    """并发上传各 SKU 的规格图, 保序返回并保留空位。
+
+    ⚠️ 不能直接用 _upload_images_parallel: 它会过滤空值导致返回列表变短,
+       与 skus 按下标 zip 会串图(把 A 的图挂到 B 上)。
+    ⚠️ 同一商品内多个 SKU 共用同一张图 → 同一个素材地址 → 小红书后台规格图列显示为空。
+       所以发现撞图时, 给后面的 SKU 重新上传一次, 保证每个 SKU 地址唯一。
+       (货盘图库每种颜色常只存一套图, 同色不同分数必然撞图, 这里就是处理这种情况。)
+    """
+    references = [str(sku.get("sku_image") or "").strip() for sku in skus]
+    pending = [r for r in references if r]
+    if not pending:
+        return ["" for _ in references]
+    queue = list(_upload_images_parallel(platform, pending))
+    urls = [queue.pop(0) if r else "" for r in references]
+    seen = {}
+    for index, url in enumerate(urls):
+        if not url:
+            continue
+        if url in seen:
+            try:
+                urls[index] = _upload_image_uncached(platform, references[index])
+            except Exception as exc:
+                print(f"[sku_image] 撞图重新上传失败, 保留原地址: {exc}")
+        else:
+            seen[url] = index
+    return urls
+
+
 def _prepare_platform_images(product, platform):
     prepared = dict(product)
-    prepared["main_images"] = [_platform_image(platform, u) for u in product.get("main_images", []) if str(u or "").strip()]
-    prepared["detail_images"] = [_platform_image(platform, u) for u in product.get("detail_images", []) if str(u or "").strip()]
+    prepared["main_images"] = _upload_images_parallel(platform, product.get("main_images", []))
+    prepared["detail_images"] = _upload_images_parallel(platform, product.get("detail_images", []))
+    # SKU 规格图: 微信 → skus[].thumb_img, 小红书 → sku_list[].specImage
+    skus = [dict(sku) for sku in product.get("skus", [])]
+    for sku, url in zip(skus, _upload_sku_images(platform, skus)):
+        if url:
+            sku["uploaded_sku_image"] = url
+    # 小红书开了「主规格图」后要求每个规格值都有图(否则报「启用规格大图需上传所有规格图」)。
+    # 图库缺图的 SKU(如某颜色没拍图)用商品主图兜底, 保证每个颜色值都有图。
+    fallback = (prepared.get("main_images") or [""])[0]
+    if platform == "xhs" and fallback:
+        for sku in skus:
+            if not sku.get("uploaded_sku_image"):
+                sku["uploaded_sku_image"] = fallback
+    prepared["skus"] = skus
     return prepared
+
+
+def _get_xhs_var_candidates(category_id, var_id):
+    """拉小红书某个规格维度(如「颜色分类」)的候选值,带缓存(12h)。
+    用于 SKU 规格值映射:货盘英文编码 → 平台中文 valueName + valueId。"""
+    key = (str(category_id), str(var_id))
+    hit = _XHS_VAR_CANDIDATES_CACHE.get(key)
+    if hit and time.time() - hit["ts"] < 12 * 3600:
+        return hit["data"]
+    try:
+        url = (f"{XHS_API_BASE}/attribute-values"
+               f"?category_id={urllib.parse.quote(str(category_id))}"
+               f"&attribute_id={urllib.parse.quote(str(var_id))}")
+        data = _http_get_json(url, timeout=60)
+        result = data.get("result") or {}
+        cands = result.get("attributeValueV3s") or result.get("values") or []
+        _XHS_VAR_CANDIDATES_CACHE[key] = {"ts": time.time(), "data": cands}
+        return cands
+    except Exception:
+        return []
+
+
+def _resolve_xhs_spec_value(source_value, var_id, category_id):
+    """把货盘 SKU 规格值(可能英文)映射成小红书平台的中文 valueName + valueId。
+    顺序:① 精确匹配候选值 ② 模糊匹配 ③ 别名表(英文→中文) ④ 原值兜底(不带 valueId)。"""
+    sv = str(source_value).strip()
+    cands = _get_xhs_var_candidates(category_id, var_id) or []
+    hit = next((c for c in cands if c.get("valueName") == sv), None)
+    if not hit:
+        hit = next((c for c in cands if sv in (c.get("valueName") or '') or (c.get("valueName") or '') in sv), None)
+    if hit:
+        return hit.get("valueName", sv), hit.get("valueId", '')
+    # 别名兜底:货盘英文 SKU 编码 → 平台中文 valueName
+    for cn, aliases in XHS_SPEC_VALUE_ALIASES.items():
+        if sv in aliases:
+            vhit = next((c for c in cands if c.get("valueName") == cn), None)
+            if vhit:
+                return cn, vhit.get("valueId", '')
+            return cn, ''
+    return sv, ''
 
 
 def _xhs_payload(product, mapping, group_config=None):
@@ -245,6 +428,12 @@ def _xhs_payload(product, mapping, group_config=None):
     candidates = xhs_config.get("candidates") or {}
     mapped_var_ids = [str(v.get("id")) for v in var_defs if spec_map.get(str(v.get("id"))) or spec_map.get(v.get("id"))]
     item["variantIds"] = mapped_var_ids
+    # 「规格大图」开关:平台要求开启该开关的商品必须至少有一个主规格项(variantIds 非空),
+    # 否则 createItemV2 直接报 -5000500「当前商品未包含主规格项,无法开启规格大图功能」。
+    # 因此只在确实映射到规格维度时才带;没有维度(如 spec_map 为空)就不带,商品照常发布(只是没有规格图列)。
+    # 注:该字段只能在创建时带,审核中的商品 updateItemV2 改不动它。
+    if mapped_var_ids:
+        item["enableMainSpecImage"] = True
     sku_list = []
     for sku in product.get("skus", []):
         variants = []
@@ -254,18 +443,26 @@ def _xhs_payload(product, mapping, group_config=None):
             source_name = spec_map.get(var_id) or spec_map.get(var_def.get("id"))
             source_value = specs_by_name.get(source_name)
             if not source_name or not source_value: continue
-            # 不用系统候选下拉,直接填货盘文本值(尺寸/颜色),避免因候选不匹配报错
-            variant = {"id": var_def.get("id"), "name": var_def.get("name"), "value": str(source_value)}
+            # SKU 规格值:货盘英文编码 → 平台中文 valueName + valueId(小红书后台才能显示中文)
+            value_name, value_id = _resolve_xhs_spec_value(source_value, var_id, category_id)
+            variant = {"id": var_def.get("id"), "name": var_def.get("name"), "value": value_name}
+            if value_id:
+                variant["valueId"] = value_id
             variants.append(variant)
-        sku_list.append({"ipq": 1, "originalPrice": round(float(sku.get("original_price") or sku.get("price") or 0) * 100),
-                         "price": round(float(sku.get("price") or 0) * 100), "stock": int(float(sku.get("stock") or 0)),
-                         "logisticsPlanId": str(mapping.get("xhs_logistics_plan_id") or ""), "variants": variants,
-                         "deliveryTime": {"time": "24", "type": "RELATIVE_TIME_NEW"}, "erpCode": sku.get("sku_code")})
+        item_sku = {"ipq": 1, "originalPrice": round(float(sku.get("original_price") or sku.get("price") or 0) * 100),
+                    "price": round(float(sku.get("price") or 0) * 100), "stock": int(float(sku.get("stock") or 0)),
+                    "logisticsPlanId": str(mapping.get("xhs_logistics_plan_id") or ""), "variants": variants,
+                    "deliveryTime": {"time": "24", "type": "RELATIVE_TIME_NEW"}, "erpCode": sku.get("sku_code")}
+        # SKU 规格图: 没匹配到图就不传
+        if sku.get("uploaded_sku_image"):
+            item_sku["specImage"] = sku["uploaded_sku_image"]
+        sku_list.append(item_sku)
     return {"item": item, "sku_list": sku_list}
 
 
 def _run_publish_item(row):
-    batch = batch_or_404(row["batch_id"])
+    # 用缓存版:避免每个发布项都重新 json.loads 全量 rows + mappings(800 商品时单次近百毫秒)
+    batch = get_batch_cached(row["batch_id"])
     product = next((p for p in batch["products"] if p.get("product_code") == row["product_code"]), None)
     if not product: raise RuntimeError("商品不存在")
     mapping = batch["mappings"].get("products", {}).get(row["product_code"], {})
@@ -352,8 +549,30 @@ class ImportBody(BaseModel):
     common_detail_files: list[dict] | None = None
 
 
+class HuopaiImportBody(BaseModel):
+    """货盘直读导入:读服务器本地货盘表,后台转换后入库(不走文件上传)。
+
+    路径收敛: 只接受「货盘目录(HUOPAI_DIR,默认取 HUOPAI_PATH 所在目录)」内的 .xlsx,
+    目录由服务端配置决定,不接受客户端指定任意目录。
+    """
+    path: str | None = None        # 货盘目录内的 .xlsx 路径;不传则用默认货盘表
+
+
+class ImageScanBody(BaseModel):
+    """图片直读:扫描图片根目录, 把商品图/SKU 图挂到批次上(不走浏览器上传, 几百个商品也没压力)。"""
+    root: str | None = None            # 必须是服务端白名单内的图片根目录;不传用默认路径
+    months: list[str] | None = None    # 只扫指定月份目录(如 ["7-9月份"]);None = 全部
+    dry_run: bool = False              # True=只匹配不拷贝(先看命中率)
+
+
 class ItemsBody(BaseModel):
     items: list[dict]
+
+
+class SkuImageBody(BaseModel):
+    """补规格图: 运营在批次表里给缺图的 SKU 单张上传(JSON+Base64, 与本项目其它上传接口一致)。"""
+    content_base64: str
+    filename: str | None = None
 
 
 class MappingsBody(BaseModel):
@@ -540,6 +759,43 @@ def normalize_row(row, line):
     }
 
 
+# 「图片还在共享盘/本地磁盘上」的引用前缀: 扫描阶段只记路径, 真正上传平台时才读字节落盘(懒拷贝)
+SHARE_PREFIX = "disk:"
+
+
+def is_share_image(source):
+    """是否是共享盘图片引用(懒加载), 形如 'disk:\\\\192.168.10.250\\...\\a.jpg'。"""
+    return str(source or "").startswith(SHARE_PREFIX)
+
+
+def fetch_share_image(source):
+    """读共享盘上的图片并落盘缓存, 返回 (本地路径, 内容)。
+
+    只在真正发布时调用: 扫描 233 个商品只记路径(秒级、零磁盘),
+    发到哪个商品才读哪个商品的图, 不发布的商品完全不占磁盘。
+    落盘按内容 sha256 命名, 同一张图(通用详情图/同款多 SKU 共用图)只存一份。
+
+    安全: disk: 引用会存进批次数据, 而批次数据可由客户端通过 PUT /import/{id}/items
+    覆写, 因此这里必须再校验一次路径白名单, 否则可被用来读服务器任意文件并上传平台。
+    """
+    path = str(source)[len(SHARE_PREFIX):]
+    if not path or not _within_allowed_roots(path) or not os.path.isfile(path):
+        raise RuntimeError(f"共享盘图片不可用(不存在或不在允许的图片目录内)：{path}")
+    with open(path, "rb") as image_file:
+        content = image_file.read()
+    if not content:
+        raise RuntimeError(f"共享盘图片内容为空：{path}")
+    digest = hashlib.sha256(content).hexdigest()
+    extension = os.path.splitext(path)[1].lower() or ".jpg"
+    target_dir = os.path.join(IMAGE_DIR, "_share")
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, f"{digest}{extension}")
+    if not os.path.exists(target):
+        with open(target, "wb") as image_file:
+            image_file.write(content)
+    return target, content
+
+
 def _store_folder_images(files, batch_id, rows, common_detail_files=None):
     """Save browser-selected folder files and resolve Excel image filenames."""
     batch_dir = os.path.join(IMAGE_DIR, batch_id)
@@ -678,6 +934,8 @@ def group_products(rows):
             "specs": [{"name": sp.get("name", ""), "value": sp.get("value", "")} for sp in row_specs],
             "original_price": row.get("original_price", ""),
             "price": row.get("price", ""), "stock": row.get("stock", ""),
+            # SKU 规格图(图片直读扫描写入, 固定为该 SKU 的「主图2」)
+            "sku_image": row.get("sku_image", ""),
         })
     products = list(grouped.values())
     for product in products:
@@ -782,10 +1040,343 @@ def import_batch(body: ImportBody):
     return {"ok": True, "batch_id": batch_id, "total": len(rows), "product_count": len(products), "valid": len(rows) - errors, "errors": errors, "product_errors": product_errors}
 
 
+def _huopai_module():
+    """货盘转换模块(局部导入:只有货盘相关接口需要 openpyxl 与转换规则)。"""
+    try:
+        import huopai_adapter as module
+    except Exception as exc:
+        raise HTTPException(500, f"货盘转换模块不可用：{exc}")
+    return module
+
+
+def _huopai_dir():
+    """货盘表目录白名单根: HUOPAI_DIR 优先, 否则取默认货盘表所在目录。"""
+    directory = os.environ.get("HUOPAI_DIR") or os.path.dirname(_huopai_module().HUOPAI_PATH)
+    return os.path.abspath(directory)
+
+
+def _resolve_huopai_file(path):
+    """把请求里的货盘表路径收敛到白名单目录内的 .xlsx。
+
+    防止 /import-huopai 被用来读取(并解析)服务器上任意文件: 之前 path 完全来自请求体,
+    传 C:\\Windows\\... 也会被当成 Excel 打开。现在只允许货盘目录内的 .xlsx。
+    """
+    candidate = os.path.abspath(str(path or ""))
+    root = _huopai_dir()
+    if os.path.splitext(candidate)[1].lower() != ".xlsx":
+        raise HTTPException(400, "货盘表只支持 .xlsx 文件")
+    try:
+        inside = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        raise HTTPException(400, f"货盘表路径不在允许的货盘目录内：{root}")
+    if not os.path.isfile(candidate):
+        raise HTTPException(400, f"货盘表不存在：{candidate}")
+    return candidate
+
+
+@app.get("/huopai-files")
+def list_huopai_files():
+    """【货盘文件列表】列出货盘目录下可导入的 .xlsx,供前端下拉选择。
+
+    目录由服务端配置(HUOPAI_DIR / HUOPAI_PATH)决定,接口不接受客户端传目录;
+    因此运营侧的货盘表只要放进该目录即可,不再需要把绝对路径写进前端。
+    """
+    directory = _huopai_dir()
+    if not os.path.isdir(directory):
+        raise HTTPException(400, f"货盘目录不可访问：{directory}(请配置 HUOPAI_DIR / HUOPAI_PATH)")
+    with os.scandir(directory) as scanner:
+        entries = sorted(scanner, key=lambda entry: entry.name)
+    files = []
+    for entry in entries:
+        if not entry.is_file() or os.path.splitext(entry.name)[1].lower() != ".xlsx":
+            continue
+        stat = entry.stat()
+        files.append({"name": entry.name, "path": entry.path, "size": stat.st_size,
+                      "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()})
+    default_path = os.path.abspath(_huopai_module().HUOPAI_PATH)
+    return {"ok": True, "dir": directory,
+            "default": default_path if os.path.isfile(default_path) else "",
+            "files": files}
+
+
+@app.post("/import-huopai")
+def import_huopai(body: HuopaiImportBody | None = None):
+    """【直读货盘】从服务器本地货盘目录读货盘表,后台跑「货盘→标准模板」转换后入库。
+    与大平台一致:数据源直连,不经过浏览器上传,规避 64MB 大文件 Base64 传输。
+    安全: 只允许读取货盘目录白名单内的 .xlsx(见 _resolve_huopai_file)。
+    转换规则与 huopai_adapter.py 完全一致(编码/价格/库存/属性/图片/系列拆分)。"""
+    import openpyxl  # 局部导入:仅本接口需要
+    H = _huopai_module()
+    path = _resolve_huopai_file((body.path if body and body.path else None) or H.HUOPAI_PATH)
+    # ① 转换:货盘 → 标准列 dict(复用 huopai_adapter 的业务规则)
+    try:
+        images = H.load_images()
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            raw_rows = []
+            if "培育钻" in wb.sheetnames:
+                raw_rows.extend(H.parse_peiyuzuan(wb["培育钻"], images))
+            if "天然钻" in wb.sheetnames:
+                raw_rows.extend(H.parse_tianranzuan(wb["天然钻"], images))
+        finally:
+            wb.close()
+        H.enrich_carat(raw_rows)
+        H.enrich_split_tone(raw_rows)
+        H.enrich_split_chain(raw_rows)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"货盘转换失败：{exc}")
+    if not raw_rows:
+        raise HTTPException(400, "货盘表没解析到商品行(检查 sheet 名是否含「培育钻」「天然钻」)")
+    # ② 复用标准导入的归一化 + 批次入库
+    batch_id = uuid.uuid4().hex
+    rows = [normalize_row(r, i) for i, r in enumerate(raw_rows, 2)
+            if any(str(v or "").strip() for v in r.values())]
+    if len(rows) > 5000:
+        raise HTTPException(400, "单批最多导入5000行SKU")
+    errors = sum(bool(row["errors"]) for row in rows)
+    filename = os.path.basename(path)
+    conn = db()
+    conn.execute("INSERT INTO batches(id,filename,status,total,valid,errors,created_at,rows_json) VALUES(?,?,?,?,?,?,?,?)",
+                 (batch_id, filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), json.dumps(rows, ensure_ascii=False)))
+    conn.commit(); conn.close()
+    products = group_products(rows)
+    return {"ok": True, "batch_id": batch_id, "filename": filename, "total": len(rows),
+            "product_count": len(products), "valid": len(rows) - errors, "errors": errors,
+            "product_errors": sum(bool(product["errors"]) for product in products)}
+
+
+@app.get("/image-roots")
+def list_image_roots():
+    """【图片根目录】返回服务端允许扫描的图片根目录白名单,供前端下拉选择。
+
+    之前 root 完全来自请求体,传入任意目录即可枚举该目录下的商品文件夹与图片;
+    现在只暴露白名单(ALLOWED_IMAGE_ROOTS),扫描接口也只接受白名单内的 root。
+    """
+    return {"ok": True, "default": os.path.abspath(DEFAULT_IMAGE_ROOT),
+            "roots": [{"path": os.path.abspath(root), "available": os.path.isdir(root)}
+                      for root in ALLOWED_IMAGE_ROOTS]}
+
+
+@app.post("/batches/{batch_id}/images/scan")
+def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
+    """【直读图片】扫描图片根目录, 按编码把商品图/SKU 图挂到批次上。
+
+    解决两个实际问题:
+      ① 多 SKU 商品的图分散在子文件夹(文件夹名就是 SKU 编码), 浏览器一次只能选一个文件夹,
+         结果只读到本色那几张图, 其他规格的图全漏;
+      ② 一次要发几百个商品, 走浏览器 Base64 上传要几 GB, 根本不现实。
+    服务端直接读网络共享, 233 个商品 4589 张图约 4 秒扫完。
+
+    匹配规则见 image_scanner.py:
+      - 商品主图   = 商品文件夹根下的本色图(按 主图1 -> 主图2 -> 白底 -> PNG 排序)
+      - SKU 图     = 该 SKU 的「主图2」(运营指定), 落到 row["sku_image"]
+      - 通用详情图 = 通用通栏目录, 追加到每个商品的详情图
+    扫描阶段只记录共享盘路径(懒拷贝), 不占磁盘; 真正发布到某个商品时,
+    才读它的图片字节落盘缓存(内容 sha256 去重), 再上传平台拿素材 URL。
+
+    传 dry_run=true 可只匹配不写库, 先看命中率。
+    """
+    try:
+        import image_scanner
+    except Exception as exc:
+        raise HTTPException(500, f"图片扫描模块不可用：{exc}")
+
+    batch = batch_or_404(batch_id)
+    rows = batch["items"]
+    root = (body.root if body and body.root else None) or DEFAULT_IMAGE_ROOT
+    months = body.months if body else None
+    dry_run = bool(body.dry_run) if body else False
+    # 路径收敛: root 只能取白名单内的图片根目录(见 GET /image-roots),
+    # 否则该接口可被用来枚举服务器任意文件夹的商品图。
+    if not _within_allowed_roots(root) or not os.path.isdir(root):
+        raise HTTPException(400, f"图片根目录不可访问或不在允许的图片目录内：{root}"
+                                 f"(允许：{'、'.join(ALLOWED_IMAGE_ROOTS)})")
+
+    try:
+        scan = image_scanner.scan_image_root(root, months=months)
+    except Exception as exc:
+        raise HTTPException(500, f"扫描图片失败：{exc}")
+
+    product_main = {}      # 商品编码 -> [共享盘图片引用]    (多 SKU 行共用, 只解析一次)
+    sku_image = {}         # SKU 编码  -> 共享盘图片引用
+    errors = []
+    unmatched_skus = []
+
+    def localize(path):
+        # 懒拷贝: 只记共享盘路径, 真正上传平台时才读字节落盘。
+        # 扫描 233 个商品秒级完成、不占磁盘; 只发一部分商品就只读一部分图。
+        return f"{SHARE_PREFIX}{path}"
+
+    common_refs = []
+    for path in scan["common_images"]:
+        try:
+            common_refs.append(localize(path))
+        except Exception as exc:
+            errors.append(f"通用详情图 {os.path.basename(path)}: {exc}")
+
+    products_matched = 0
+    skus_matched = 0
+    for row in rows:
+        code = str(row.get("product_code") or "")
+        if code not in product_main:
+            base = code.split("-", 1)[0]
+            # ① 精确 → ② 去系列标签(如 ZSTZ106XL-星悦 → ZSTZ106XL)
+            paths = scan["root_images"].get(code) or scan["root_images"].get(base)
+            if not paths:
+                # ③ 图库文件夹名可能带中文后缀(如 HZL253福运钻 vs 商品编码 HZL253-如愿),
+                #    取最长前缀兜底; 仍匹配不到 = 图库里确实没有这个款
+                best_key = ""
+                for key in scan["root_images"]:
+                    if key and (key.startswith(base) or base.startswith(key)) and len(key) > len(best_key):
+                        best_key = key
+                paths = scan["root_images"].get(best_key) if best_key else None
+            references = []
+            for path in (paths or [])[:5]:      # 平台主图最多 5 张
+                try:
+                    references.append(localize(path))
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(path)}: {exc}")
+            product_main[code] = references
+            if references:
+                products_matched += 1
+        if product_main[code]:
+            row["main_images"] = product_main[code]
+        if common_refs:
+            row["detail_images"] = list(dict.fromkeys((row.get("detail_images") or []) + common_refs))
+
+        sku_code = str(row.get("sku_code") or "")
+        if sku_code not in sku_image:
+            hit = image_scanner.match_sku_code(sku_code, scan["sku_images"])
+            main2 = ((scan["sku_images"].get(hit) or {}).get("main2") if hit else None)
+            if main2:
+                try:
+                    sku_image[sku_code] = localize(main2)
+                except Exception as exc:
+                    sku_image[sku_code] = ""
+                    errors.append(f"SKU图 {os.path.basename(main2)}: {exc}")
+            else:
+                sku_image[sku_code] = ""
+        if sku_image[sku_code]:
+            row["sku_image"] = sku_image[sku_code]
+            skus_matched += 1
+        else:
+            unmatched_skus.append(sku_code or f"line_{row.get('line')}")
+
+    if not dry_run:
+        conn = db()
+        conn.execute("UPDATE batches SET rows_json=? WHERE id=?",
+                     (json.dumps(rows, ensure_ascii=False), batch_id))
+        conn.commit()
+        conn.close()
+
+    return {
+        "ok": True, "batch_id": batch_id, "dry_run": dry_run,
+        "root": root, "months": months,
+        "folders": scan["folders"], "scanned_images": scan["scanned"],
+        "common_detail_images": len(scan["common_images"]),
+        "products_matched": products_matched,
+        "products_total": len({r.get("product_code") for r in rows}),
+        "skus_matched": skus_matched, "skus_total": len(rows),
+        "unmatched_sku_count": len(unmatched_skus),
+        "unmatched_skus": unmatched_skus[:200],
+        "lazy_load": True, "errors": errors[:50],
+    }
+
+
+@app.post("/batches/{batch_id}/sku-image")
+def upload_sku_image(batch_id: str, body: SkuImageBody):
+    """给批次里某个 SKU 补规格图(浏览器上传单张图)。
+
+    落盘到 IMAGE_DIR/{批次id}/{sha256}.{ext}, 返回 local:// 引用;
+    前端拿到引用后写回该行 sku_image, 再 PUT /import/{id}/items 持久化。
+    引用格式必须与 _local_image 的校验一致, 否则预览/上传素材会失败。
+    """
+    batch_or_404(batch_id)
+    try:
+        content = base64.b64decode(body.content_base64 or "")
+    except Exception as exc:
+        raise HTTPException(400, f"图片内容解析失败：{exc}")
+    if not content:
+        raise HTTPException(400, "图片内容为空")
+    extension = os.path.splitext(body.filename or "")[1].lower().lstrip(".")
+    if extension not in {"jpg", "jpeg", "png", "webp", "gif", "bmp"}:
+        extension = "jpg"
+    digest = hashlib.sha256(content).hexdigest()
+    batch_dir = os.path.join(IMAGE_DIR, batch_id)
+    os.makedirs(batch_dir, exist_ok=True)
+    path = os.path.join(batch_dir, f"{digest}.{extension}")
+    if not os.path.exists(path):
+        with open(path, "wb") as image_file:
+            image_file.write(content)
+    return {"ok": True, "result": {"ref": f"local://{batch_id}/{digest}.{extension}"}}
+
+
+@app.get("/images/preview")
+def preview_image(ref: str):
+    """预览批次里的图片(供浏览器显示纯文本路径无法渲染的图)。
+
+    支持两种引用:
+      - local://{批次id}/{hash}.{ext}   浏览器上传或懒拷贝落盘后的本地图
+      - disk:{共享盘绝对路径}            图片直读扫描写入的引用
+    出于安全只允许读取 ALLOWED_IMAGE_ROOTS 下的文件, 否则参数可读任意文件。
+    """
+    source = str(ref or "").strip()
+    if source.startswith("local://"):
+        found = _local_image(source)
+        if not found:
+            raise HTTPException(404, "图片不存在")
+        content = found[1]
+    elif is_share_image(source):
+        path = os.path.abspath(source[len(SHARE_PREFIX):])
+        # 用 commonpath 判断而非 startswith: 否则 '...\images_evil\x.jpg' 会命中 '...\images'
+        if not _within_allowed_roots(path) or not os.path.isfile(path):
+            raise HTTPException(404, "图片不存在或不在允许的图片目录内")
+        with open(path, "rb") as image_file:
+            content = image_file.read()
+    else:
+        raise HTTPException(400, "不支持的图片引用")
+    if not content:
+        raise HTTPException(404, "图片内容为空")
+    media = "image/png" if source.lower().endswith(".png") else "image/jpeg"
+    return StreamingResponse(io.BytesIO(content), media_type=media)
+
+
 def batch_or_404(batch_id):
     conn = db(); row = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone(); conn.close()
     if not row: raise HTTPException(404, "批次不存在")
     data = dict(row); data["items"] = json.loads(data.pop("rows_json")); data["products"] = group_products(data["items"]); data["mappings"] = json.loads(data.pop("mappings_json")); return data
+
+
+# ------------------------------------------------------------------
+# 批次解析缓存:worker 每发一个商品都要拿批次的 rows/mappings,
+# 全量 json.loads + group_products 在 800 商品时单次近百毫秒,
+# 2N 次(商品×平台)调用就是 O(N²)。这里按 batch_id 缓存解析结果,
+# 写接口(items/mappings/status)主动失效,避免 worker 用到旧数据。
+# ------------------------------------------------------------------
+_BATCH_CACHE: dict = {}
+_BATCH_CACHE_TTL = 60.0
+
+
+def _invalidate_batch_cache(batch_id: str = None) -> None:
+    """写接口改完 batches 后调用;batch_id 为空则全清。"""
+    if batch_id:
+        _BATCH_CACHE.pop(batch_id, None)
+    else:
+        _BATCH_CACHE.clear()
+
+
+def get_batch_cached(batch_id: str) -> dict:
+    """命中且未过期则复用解析结果,否则回源 batch_or_404 并写缓存。"""
+    hit = _BATCH_CACHE.get(batch_id)
+    if hit and (time.time() - hit["ts"]) < _BATCH_CACHE_TTL:
+        return hit["data"]
+    data = batch_or_404(batch_id)
+    _BATCH_CACHE[batch_id] = {"ts": time.time(), "data": data}
+    return data
 
 
 @app.get("/import/{batch_id}")
@@ -798,13 +1389,14 @@ def update_items(batch_id: str, body: ItemsBody):
     batch = batch_or_404(batch_id); rows = body.items
     errors = sum(bool(row.get("errors")) for row in rows)
     conn = db(); conn.execute("UPDATE batches SET rows_json=?,status=?,valid=?,errors=? WHERE id=?", (json.dumps(rows, ensure_ascii=False), "待校验" if errors else "待发布", len(rows)-errors, errors, batch_id)); conn.commit(); conn.close()
+    _invalidate_batch_cache(batch_id)
     products = group_products(rows)
     return {"ok": True, "result": {"total": len(rows), "product_count": len(products), "valid": len(rows)-errors, "errors": errors, "product_errors": sum(bool(product["errors"]) for product in products)}}
 
 
 @app.put("/import/{batch_id}/mappings")
 def update_mappings(batch_id: str, body: MappingsBody):
-    batch_or_404(batch_id); conn = db(); conn.execute("UPDATE batches SET mappings_json=? WHERE id=?", (json.dumps(body.mappings, ensure_ascii=False), batch_id)); conn.commit(); conn.close(); return {"ok": True, "result": body.mappings}
+    batch_or_404(batch_id); conn = db(); conn.execute("UPDATE batches SET mappings_json=? WHERE id=?", (json.dumps(body.mappings, ensure_ascii=False), batch_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id); return {"ok": True, "result": body.mappings}
 
 
 @app.post("/import/{batch_id}/validate")
@@ -853,7 +1445,7 @@ def publish(batch_id: str, body: PublishBody):
     conn.execute("INSERT INTO publish_jobs(id,batch_id,platforms_json,status,total,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (job_id, batch_id, json.dumps(platforms), "queued", len(pending) if pending else len(products) * len(platforms), now(), now()))
     for product_code, platform in (pending or [(product["product_code"], platform) for product in products for platform in platforms]):
         conn.execute("INSERT INTO publish_items(job_id,batch_id,product_code,platform,status) VALUES(?,?,?,?,?)", (job_id, batch_id, product_code, platform, "queued"))
-    conn.execute("UPDATE batches SET status=? WHERE id=?", ("发布任务已创建", batch_id)); conn.commit(); conn.close()
+    conn.execute("UPDATE batches SET status=? WHERE id=?", ("发布任务已创建", batch_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id)
     return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "message": "发布任务已入队，后台将持续执行"}
 
 

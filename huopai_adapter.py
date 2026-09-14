@@ -12,12 +12,22 @@
 import json
 import os
 import re
+
 import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+from runtime_config import load_project_env
+
+load_project_env()
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-HUOPAI_PATH = r"C:\Users\Administrator\Desktop\共享-线上渠道货盘表（附库存）最新.xlsx"
+# 货盘表默认位置:可用 HUOPAI_PATH 环境变量覆盖。
+# /import-huopai 只允许读取该文件所在目录(或 HUOPAI_DIR)内的 .xlsx。
+HUOPAI_PATH = os.environ.get(
+    "HUOPAI_PATH",
+    r"C:\Users\Administrator\Desktop\共享-线上渠道货盘表（附库存）最新.xlsx",
+)
 UPLOADED_JSON = os.path.join(BASE_DIR, "uploaded_images.json")
 OUTPUT_PATH = os.path.join(BASE_DIR, "货盘转换预览.xlsx")
 
@@ -36,6 +46,25 @@ def split_product_code(shangjia):
     if base and base[-1] in "WYRS":
         base = base[:-1]
     return base
+
+
+# 商家编码末尾字母 = 戒托颜色：R=红色 W=白色 Y=黄色 S=银色
+SETTING_COLOR = {"R": "红色", "W": "白色", "Y": "黄色", "S": "银色"}
+
+
+def extract_setting_color(shangjia):
+    """从商家编码提取「戒托颜色」。支持两种编码格式：
+      ① 颜色字母在第一段末尾：ZSTZ106JR-15 → 红色;ZSTZ105SLW-A-10 → 白色
+      ② 颜色字母是独立一段：APYE0139-W-30-D1 → 白色
+    同款不同戒托色在原表里除编码字母外字段完全相同,必须靠它作为规格值区分 SKU,
+    否则多个 SKU 规格值重复,平台 SKU 选择器只能显示一个。"""
+    parts = s(shangjia).split("-")
+    base = parts[0] if parts else ""
+    if base and base[-1] in SETTING_COLOR:
+        return SETTING_COLOR[base[-1]]
+    if len(parts) > 1 and parts[1] and parts[1][-1] in SETTING_COLOR:
+        return SETTING_COLOR[parts[1][-1]]
+    return ""
 
 
 def clean_base(code):
@@ -161,7 +190,52 @@ def enrich_split_tone(rows):
                 tone = parse_tone_from_attrs(r["商品属性"])
                 if tone:
                     r["商品编码"] = f"{code}-{tone}"
-            print(f"  按色调拆分: {code!r} -> {sorted(tones)}")
+                    print(f"  按色调拆分: {code!r} -> {sorted(tones)}")
+
+
+def extract_chain_tag(sku_code):
+    """手链 SKU 编码 → 链型/绳色标签。规则(与运营确认):
+      - 末段 -R / -B  = 绳色(红绳 / 黑绳)
+      - 中间段 -A / -B = 链型(半链 / 全绳);无该段 = 全链
+      - 末段 -LR/-LB/-SR/-SB = 尺寸 + 绳色(取绳色)
+    例：ZSTZ105SLW-A-10→半链;GLLP6912W-R→红绳;ZSSL396W-LB→黑绳。"""
+    parts = s(sku_code).split("-")
+    rest = parts[1:]
+    for idx, seg in enumerate(rest):
+        is_last = (idx == len(rest) - 1)
+        if seg in ("A", "B"):
+            if is_last:
+                return {"B": "黑绳"}.get(seg, "")
+            return {"A": "半链", "B": "全绳"}.get(seg, "")
+        if seg == "R":
+            return "红绳"
+        if len(seg) == 2 and seg[0] in ("L", "S") and seg[1] in ("R", "B"):
+            return {"R": "红绳", "B": "黑绳"}.get(seg[1], "")
+    return ""
+
+
+def enrich_split_chain(rows):
+    """手链按链型/绳色拆分商品。
+    小红书只支持 2 个规格维度(主钻分数 + 戒托颜色),链型(全链/半链/全绳)、
+    绳色(红绳/黑绳)放不进规格,只能拆成不同商品;标题末尾补标签(自然语言,不加连字符),
+    商品编码加 -标签 便于系统内区分。"""
+    by_code = {}
+    for row in rows:
+        by_code.setdefault(row["商品编码"], []).append(row)
+    for code, grp in by_code.items():
+        tags = {extract_chain_tag(r.get("SKU编码", "")) for r in grp}
+        tags.discard("")
+        if not tags:
+            continue
+        for r in grp:
+            tag = extract_chain_tag(r.get("SKU编码", ""))
+            if not tag:
+                continue
+            r["商品编码"] = f"{code}-{tag}"
+            for key in ("标题", "微信标题", "小红书标题"):
+                if r.get(key):
+                    r[key] = f"{r[key]} {tag}"
+        print(f"  按链型/绳色拆分: {code!r} -> {sorted(tags)}")
 
 
 def enrich_carat(rows):
@@ -260,7 +334,7 @@ def parse_peiyuzuan(sheet, images):
             product_code = f"{product_code}-{sub_series}"
         retail = r[37]  # 零售标价
         price_fen = ceil_div07(retail)
-        price_yuan = (price_fen / 100) if price_fen is not None else ""
+        price_yuan = ((price_fen + 99) // 100) if price_fen is not None else ""  # 向上取整到整数元(去掉角分)
         title = build_title(r[19], r[24], r[16])
         cut_wx, cut_xhs = map_cut(r[30])
         cat = s(r[17]) or s(r[16])
@@ -276,11 +350,13 @@ def parse_peiyuzuan(sheet, images):
             attr_pairs.append(("赠链材质", "银925链"))
         attrs = join_attrs(attr_pairs)
         main_ct = parse_main_ct(r[25])
-        color = s(r[28])
+        # 规格维度2 = 戒托颜色(从商家编码末尾字母 R/W/Y 提取);
+        # 原「钻石颜色」(r[28])同款全部是"无色",多个 SKU 规格值重复无法区分
+        setting_color = extract_setting_color(shangjia)
         imgs = match_images(shangjia, images)
         result.append(make_row(
             product_code, shangjia, title, s(r[17]) or s(r[16]), attrs, s(r[22]),
-            imgs, "主钻分数", main_ct, "钻石颜色", color, price_yuan, parse_stock(r[11]),
+            imgs, "主钻分数", main_ct, "戒托颜色", setting_color, price_yuan, parse_stock(r[11]),
         ))
     return result
 
@@ -298,7 +374,7 @@ def parse_tianranzuan(sheet, images):
         sku_code = clean_base(s(r[5])) or shangjia
         retail = r[26]
         price_fen = ceil_div07(retail)
-        price_yuan = (price_fen / 100) if price_fen is not None else ""
+        price_yuan = ((price_fen + 99) // 100) if price_fen is not None else ""  # 向上取整到整数元(去掉角分)
         title = build_title(r[9], r[13], r[7])
         cut_wx, cut_xhs = map_cut(r[19])
         attrs = join_attrs([
@@ -309,11 +385,12 @@ def parse_tianranzuan(sheet, images):
             ("主体材质", "天然钻石"),
         ])
         main_ct = parse_main_ct(r[14])
-        color = s(r[17])
+        # 规格维度2 = 戒托颜色(从商家编码末尾字母提取)
+        setting_color = extract_setting_color(shangjia)
         imgs = match_images(shangjia, images)
         result.append(make_row(
             product_code, sku_code, title, s(r[7]), attrs, s(r[11]),
-            imgs, "主钻分数", main_ct, "钻石颜色", color, price_yuan, "1",
+            imgs, "主钻分数", main_ct, "戒托颜色", setting_color, price_yuan, "1",
         ))
     return result
 
@@ -337,6 +414,7 @@ def main():
 
     enrich_carat(rows)
     enrich_split_tone(rows)
+    enrich_split_chain(rows)
 
     out = Workbook()
     ws = out.active
