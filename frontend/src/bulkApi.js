@@ -19,6 +19,8 @@ export const bulkApi = {
   // 货盘表只允许从服务端配置的货盘目录读取, 这里列出该目录下的 .xlsx 供下拉选择
   huopaiFiles: () => http.get('/huopai-files'),
   getBatch: (id) => http.get(`/import/${id}`),
+  // 该批次每个商品已有哪些发布记录(用于 step3 标记"已发布/发布失败/未发布", 避免重复勾选)
+  publishStatus: (id) => http.get(`/import/${id}/publish-status`),
   updateItems: (id, items) => http.put(`/import/${id}/items`, { items }),
   updateMappings: (id, mappings) => http.put(`/import/${id}/mappings`, { mappings }),
   validate: (id) => http.post(`/import/${id}/validate`),

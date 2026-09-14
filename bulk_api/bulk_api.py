@@ -1518,6 +1518,27 @@ def publish(batch_id: str, body: PublishBody):
     return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "message": message}
 
 
+@app.get("/import/{batch_id}/publish-status")
+def batch_publish_status(batch_id: str):
+    """【发布状态】按 商品×平台 汇总该批次已有的发布记录。
+
+    用途: step3 分批发布时, 运营需要一眼看出哪些商品"已经发过了" ——
+    平台对重复标题会直接拒绝(error_code=-5000500 标题不能与现有商品标题重复),
+    重复勾选等于白跑一轮, 而且页面选完之后没有任何变化, 很容易再选到同一批。
+    返回: {商品编码: {平台: {状态: 条数}}}, 例 {"ZNJ1725-安宁": {"xhs": {"success": 1}}}
+    """
+    batch_or_404(batch_id)
+    conn = db()
+    rows = conn.execute("SELECT product_code, platform, status, COUNT(*) n FROM publish_items "
+                        "WHERE batch_id=? GROUP BY product_code, platform, status", (batch_id,)).fetchall()
+    conn.close()
+    result = {}
+    for row in rows:
+        platform_counts = result.setdefault(row["product_code"], {}).setdefault(row["platform"], {})
+        platform_counts[row["status"]] = row["n"]
+    return {"ok": True, "result": result}
+
+
 @app.get("/jobs/{job_id}")
 def job(job_id: str):
     conn = db(); j = conn.execute("SELECT * FROM publish_jobs WHERE id=?", (job_id,)).fetchone()
