@@ -11,7 +11,11 @@
       导致上架价比货盘价小 100 倍。
 - 库存：供定制/可定制 → 预售(不设库存)；售罄 → 0；数字 → 原样
 - 图片：uploaded_images.json 按商家编码前缀匹配，排除 .psd
+- 标题：所有拆分跑完后按商品编码生成微信/小红书两套标题（见 enrich_titles）
+  标题里不放款号/货号、也不放克拉；同系列同形状的不同设计款在货盘里没有区分字段，
+  标题必然重复（平台会拒），处理方案见 enrich_titles 上方的「待办」
 """
+import collections
 import json
 import os
 import re
@@ -29,7 +33,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # /import-huopai 只允许读取该文件所在目录(或 HUOPAI_DIR)内的 .xlsx。
 HUOPAI_PATH = os.environ.get(
     "HUOPAI_PATH",
-    r"C:\Users\Administrator\Desktop\共享-线上渠道货盘表（附库存）最新.xlsx",
+    r"C:\Users\zssj\Desktop\共享-线上渠道货盘表（附库存）最新.xlsx",
 )
 UPLOADED_JSON = os.path.join(BASE_DIR, "uploaded_images.json")
 OUTPUT_PATH = os.path.join(BASE_DIR, "货盘转换预览.xlsx")
@@ -170,14 +174,20 @@ def append_attr(attr_str, key, val):
     return f"{attr_str};{key}={v}" if attr_str else f"{key}={v}"
 
 
-def parse_tone_from_attrs(attr_str):
-    """从商品属性字符串取色调：'色调=粉钻;形状=...' → '粉钻'"""
+def parse_attrs(attr_str):
+    """商品属性字符串 → dict：'色调=粉钻;形状=公主方' → {'色调': '粉钻', '形状': '公主方'}"""
+    attrs = {}
     for pair in str(attr_str or "").replace("；", ";").split(";"):
         if "=" in pair:
-            k, v = pair.split("=", 1)
-            if k.strip() == "色调":
-                return v.strip()
-    return ""
+            key, value = pair.split("=", 1)
+            if key.strip():
+                attrs[key.strip()] = value.strip()
+    return attrs
+
+
+def parse_tone_from_attrs(attr_str):
+    """从商品属性字符串取色调：'色调=粉钻;形状=...' → '粉钻'"""
+    return parse_attrs(attr_str).get("色调", "")
 
 
 def enrich_split_tone(rows):
@@ -220,8 +230,8 @@ def extract_chain_tag(sku_code):
 def enrich_split_chain(rows):
     """手链按链型/绳色拆分商品。
     小红书只支持 2 个规格维度(主钻分数 + 戒托颜色),链型(全链/半链/全绳)、
-    绳色(红绳/黑绳)放不进规格,只能拆成不同商品;标题末尾补标签(自然语言,不加连字符),
-    商品编码加 -标签 便于系统内区分。"""
+    绳色(红绳/黑绳)放不进规格,只能拆成不同商品;商品编码加 -标签 便于系统内区分,
+    标签(自然语言,不加连字符)记在 _款标签 上,由 enrich_titles 补到标题末尾。"""
     by_code = {}
     for row in rows:
         by_code.setdefault(row["商品编码"], []).append(row)
@@ -235,9 +245,7 @@ def enrich_split_chain(rows):
             if not tag:
                 continue
             r["商品编码"] = f"{code}-{tag}"
-            for key in ("标题", "微信标题", "小红书标题"):
-                if r.get(key):
-                    r[key] = f"{r[key]} {tag}"
+            r.setdefault("_款标签", []).append(tag)
         print(f"  按链型/绳色拆分: {code!r} -> {sorted(tags)}")
 
 
@@ -253,6 +261,180 @@ def enrich_carat(rows):
         fen = max_fen.get(row["商品编码"])
         carat = fen_to_carat(fen) if fen is not None else "1.00克拉"
         row["商品属性"] = append_attr(row["商品属性"], "主钻克拉数", carat)
+
+
+# ==================================================================
+# 标题生成（替代原先逐行拼「系列+色调+类目」的做法）
+# ------------------------------------------------------------------
+# 结构照搬两个平台**已上架**商品的写法（2026-09 拉线上标题逐条核对）：
+#   微信  : [培育]SHINING HOUSE/钻石世家 {系列}{材质}镶嵌{色调}{形状}{品名}{克拉}{附证书}
+#   小红书: 【培育】SHINING HOUSE{子系列}{材质}镶嵌{克拉}{色调}{形状}{品名}
+# 差异都是线上实测出来的：
+#   - 培育标记：微信用半角 [培育]、小红书用全角 【培育】；天然钻两款都不加
+#   - 品牌写法：微信用「SHINING HOUSE/钻石世家」，小红书只写「SHINING HOUSE」
+#   - 品名：微信规范要求用通用名（项链/戒指/耳环），取内部类目括号里的细类；
+#           小红书线上 151 条在售都沿用内部词（颈饰/手饰/耳饰/单坠），保持一致
+#   - 长度：微信线上最长 ~57 字、小红书 ~35 字（代码里「名称 8-30 字」那条注释与线上不符）
+# 卖点词（轻奢/通勤/百搭）是运营手写的，没有数据依据，不自动生成；
+# 唯一自动加的尾缀是「附XX证书」，来源是商品属性「鉴定证书」。
+# ==================================================================
+WECHAT_BRAND = "SHINING HOUSE/钻石世家"
+XHS_BRAND = "SHINING HOUSE"
+# 微信：官方《添加商品》文档 title 最多 60 字符，且「中文/字母/数字各算 1 个字符」
+# （线上 57 字的中文标题能过，也印证了中文按 1 算）。取 58 留 2 个余量。
+WECHAT_TITLE_MAX = 58
+# 小红书：平台报错原文「标题长度需要在[8]-[30]个字或[16]-[60]个字符」——
+#   「字」每个字符算 1；「字符」中文/全角算 2、字母数字算 1；满足任一区间即可。
+# 这里按最严的那档卡「≤30 个字」（≤30 字时加权必然 ≤60 字符，两个口径都满足），
+# 中文英文混排也不会踩线（线上实测最长 42 字/51 字符的那种是后台手工建的，接口更严）。
+XHS_TITLE_MAX = 30
+
+# 内部类目括号里的细类 → 微信规范品名
+_NOUN_BY_INNER = {
+    "项链": "项链", "手链": "手链", "手镯": "手镯", "吊坠": "吊坠", "脚链": "脚链",
+    "戒指": "戒指", "女戒": "戒指", "男戒": "戒指", "对戒": "戒指",
+    "耳钉": "耳钉", "耳环": "耳环",
+}
+# 括号里只是数量说明（对/单只）时，回头用括号前的内部词兜底成通用名
+_NOUN_BY_OUTER = {"颈饰": "项链", "手饰": "手链", "耳饰": "耳环", "单坠": "吊坠", "戒指": "戒指"}
+
+
+def resolve_nouns(category):
+    """内部类目 → (微信规范品名, 小红书沿用品名)。
+    '粉钻培育钻-颈饰(项链)' → ('项链', '颈饰')
+    '粉钻培育钻-手饰(女戒)' → ('戒指', '手饰')
+    '粉钻培育钻-耳饰(单只)' → ('耳环（单只）', '耳饰')
+    """
+    text = s(category)
+    match = re.search(r"[（(]([^）)]*)[）)]", text)
+    inner = match.group(1).strip() if match else ""
+    outer = re.sub(r"[（(][^）)]*[）)]", "", text).rsplit("-", 1)[-1].strip()
+    noun = _NOUN_BY_INNER.get(inner, "")
+    if not noun and inner in ("对", "一对", "对装"):
+        noun = "耳环（一对）"
+    if not noun and ("单只" in inner or "一只" in inner):
+        noun = "耳环（单只）"
+    if not noun:
+        noun = _NOUN_BY_OUTER.get(outer, "") or outer
+    return noun, (outer or inner)
+
+
+def fit_title(pieces, names, limit, drop_order=(), suffix=""):
+    """拼标题；超长时按 drop_order 依次丢掉可选片段，返回 (标题, 被丢掉的片段名)。
+
+    两个平台都用「字数」衡量（微信 60 字符、小红书 30 字，中文/字母/数字各算 1）。
+    suffix（拆分标签，如"半链/全绳"）无条件保留，实在放不下时只截正文。
+    """
+    parts = list(pieces)
+    dropped = []
+    for index in drop_order:
+        if len("".join(parts)) + len(suffix) <= limit:
+            break
+        if parts[index]:
+            dropped.append(names[index])
+        parts[index] = ""
+    body = "".join(parts)
+    if len(body) + len(suffix) > limit:
+        body = body[:max(0, limit - len(suffix))]
+    return body + suffix, dropped
+
+
+# ==================================================================
+# 待办：标题重名的兜底手段（运营说先不改，先把方案和数据记在这儿）
+# ------------------------------------------------------------------
+# 现状：同「系列+色调+形状+品名」的不同设计款，货盘里没有能写进标题的区分字段
+# （实测最多 30 个款共用一组字段，其中若干连镶嵌方式/副钻分数/证书都一样，
+#  只有"重量"不同，而重量不能写进标题），所以这些款标题必然重复，平台会拒。
+# 实测"把某些字段放进标题"能压掉多少重复（250 个商品里会失败的数量）：
+#     现在的字段          微信 151 / 小红书 162
+#     +克拉               微信  88 / 小红书  95
+#     +净度+克拉           微信  67 / 小红书  73
+#     +净度+镶嵌方式+克拉    微信  54 / 小红书  58
+# 三个可选做法（都还没做）：
+#   ① 标题里加回「克拉 + 钻石净度 + 镶嵌方式」：全自动，失败从 151 降到 54；
+#   ② 加「款式名」人工区分：填在转换预览的第二张表里（不用动货盘表结构），
+#      之前实现过一版（load_styles + enrich_titles(rows, styles) + 预览第二张表），
+#      因为不想人工填先删了，需要时按 git 历史重加；
+#   ③ 先发，只修被平台拒掉的那些：发布进度里能看到失败清单，
+#      在「审核编辑」抽屉里直接改微信/小红书标题再重试。
+# ==================================================================
+def enrich_titles(rows):
+    """按商品编码生成 标题/微信标题/小红书标题（必须在 enrich_carat、enrich_split_* 之后调用）。
+
+    为什么不逐行拼标题：
+      1) 平台标题是 SPU 级，同一商品各 SKU 行必须完全一致；
+      2) 必须等商品拆完再生成，否则拆出来的几个商品标题又会互相撞；
+      3) 标题里只能放商品级信息（款内各 SKU 不同的净度/分数不能进标题）。
+    """
+    by_code = {}
+    for row in rows:
+        by_code.setdefault(row["商品编码"], []).append(row)
+    items = []
+    for code, group in by_code.items():
+        first = group[0]
+        attrs = parse_attrs(first.get("商品属性", ""))
+        # 只取主系列（不带子系列，如 '永恒之环-FLY·自在' → '永恒之环'）：运营要求标题里不加小系列
+        series_raw = s(first.get("_系列原文")) or s(code).split("-")[0]
+        series = split_series(series_raw)[0] or series_raw
+        # 形状/色调里货盘常写成 '圆形+水滴形'『白钻+粉钻』，标题里不用 + 号
+        tone = attrs.get("色调", "").replace("+", "")
+        shape = attrs.get("形状", "").replace("+", "")
+        metal = f"{attrs['镶嵌']}镶嵌" if attrs.get("镶嵌") else ""
+        wechat_noun, xhs_noun = resolve_nouns(first.get("内部类目", ""))
+        tags = " ".join(first.get("_款标签") or [])
+        is_lab_grown = "合成" in str(attrs.get("主体材质", ""))
+        # 证书名货盘写成 'IGI+NGTC'，标题里也统一不用 + 号
+        cert = re.sub(r"[（(][^）)]*[）)]", "", str(attrs.get("鉴定证书", ""))).replace("+", "、").strip()
+        # 标题是给买家看的，不放款号/货号（运营要求）。
+        # 同系列同形状的不同设计款在货盘里没有能写进标题的区分字段，标题会重复——
+        # 这里照实生成并标记出来，不编造（可选处理方案见上面「待办」）。
+        suffix = f" {tags}" if tags else ""
+        # 微信：官方框架「品牌 + 基本属性 + 商品品名 + 规格参数」
+        # 品牌和系列拆成两段：否则长度不够时会把「品牌+系列」整块丢掉，标题只剩"耳环一对"
+        # 可丢顺序：证书 → 形状 → 材质 → 色调 → 系列 → 品牌 → 培育标记（品名永不丢）
+        wx_pieces = [
+            "[培育]" if is_lab_grown else "", WECHAT_BRAND, series,
+            metal, tone, shape, wechat_noun, f"附{cert}证书" if cert else "",
+        ]
+        wx_names = ["培育标记", "品牌", "系列", "材质", "色调", "形状", "品名", "证书"]
+        # 小红书：照线上写法（不带子系列）；可丢顺序：材质 → 色调 → 形状 → 品牌（品名永不丢）
+        xhs_pieces = [
+            f"{'【培育】' if is_lab_grown else ''}{XHS_BRAND}", metal, tone, shape, xhs_noun,
+        ]
+        xhs_names = ["品牌", "材质", "色调", "形状", "品名"]
+        wx_title, wx_dropped = fit_title(wx_pieces, wx_names, WECHAT_TITLE_MAX, (7, 5, 3, 4, 2, 1, 0), suffix)
+        # 小红书按「字数」卡 30（见 XHS_TITLE_MAX 的说明），和微信用同一套算法
+        xhs_title, xhs_dropped = fit_title(xhs_pieces, xhs_names, XHS_TITLE_MAX, (1, 2, 3, 0), suffix)
+        items.append({
+            "group": group, "wx": wx_title, "xhs": xhs_title,
+            # 证书尾缀是被挤掉的第一个字段（本来就可有可无），不进备注，免得备注全是噪音
+            "notes": [n for n in (
+                f"微信丢弃{'/'.join(d for d in wx_dropped if d != '证书')}"
+                if any(d != "证书" for d in wx_dropped) else "",
+                f"小红书丢弃{'/'.join(xhs_dropped)}" if xhs_dropped else "",
+            ) if n],
+        })
+    # 查重：两个平台都按标题判重，重复的那些发不出去，先在预览里标出来
+    for key, label in (("wx", "微信"), ("xhs", "小红书")):
+        counts = collections.Counter(item[key] for item in items)
+        for item in items:
+            shared = counts[item[key]]
+            if shared > 1:
+                item["notes"].append(f"{label}标题与另 {shared - 1} 个款重复")
+
+    compressed = duplicated = 0
+    for item in items:
+        if any("丢弃" in note for note in item["notes"]):
+            compressed += 1
+        if any("重复" in note for note in item["notes"]):
+            duplicated += 1
+        for row in item["group"]:
+            row["标题"] = item["wx"]
+            row["微信标题"] = item["wx"]
+            row["小红书标题"] = item["xhs"]
+            row["标题备注"] = "；".join(item["notes"])
+    print(f"  标题生成: {len(items)} 个商品, {duplicated} 个标题重名(平台会拒), "
+          f"{compressed} 个因长度丢了字段")
 
 
 def parse_stock(val):
@@ -300,18 +482,12 @@ def join_attrs(pairs):
     return ";".join(f"{k}={v}" for k, v in pairs if k and s(v))
 
 
-def build_title(series, tone, category):
-    """标题 = 主系列 + 子系列 + 色调 + 类目（子系列保留，使同系列商品标题一致、不同系列可区分）"""
-    main, sub = split_series(series)
-    series_cn = main or s(series)
-    category_cn = s(category).split("(")[0].strip() or s(category)
-    return " ".join(p for p in [series_cn, sub, tone, category_cn] if p)
-
-
-def make_row(product_code, sku_code, title, category, attrs, weight, imgs,
+def make_row(product_code, sku_code, category, attrs, weight, imgs,
              spec1_name, spec1_val, spec2_name, spec2_val, price_yuan, stock):
+    # 标题三列这里留空: 标题是 SPU 级、且要用款级聚合值(款内最大克拉), 统一由 enrich_titles
+    # 在所有拆分完成后按商品编码生成。逐行拼会在 enrich_split_* 拆完商品后重新撞车。
     return {
-        "商品编码": product_code, "标题": title, "微信标题": title, "小红书标题": title,
+        "商品编码": product_code, "标题": "", "微信标题": "", "小红书标题": "",
         "内部类目": category, "品牌": "", "描述": "", "商品属性": attrs, "重量": weight,
         "主图": ",".join(imgs), "详情图": "", "SKU编码": sku_code,
         "规格1名称": spec1_name, "规格1值": spec1_val,
@@ -337,7 +513,6 @@ def parse_peiyuzuan(sheet, images):
             product_code = f"{product_code}-{sub_series}"
         retail = r[37]  # 零售标价(单位: 元, 不是分)
         price_yuan = ceil_div07(retail) if retail is not None else ""  # 售价(元) = 零售标价/0.7, 与货盘「上架价」列一致
-        title = build_title(r[19], r[24], r[16])
         cut_wx, cut_xhs = map_cut(r[30])
         cat = s(r[17]) or s(r[16])
         attr_pairs = [
@@ -356,10 +531,14 @@ def parse_peiyuzuan(sheet, images):
         # 原「钻石颜色」(r[28])同款全部是"无色",多个 SKU 规格值重复无法区分
         setting_color = extract_setting_color(shangjia)
         imgs = match_images(shangjia, images)
-        result.append(make_row(
-            product_code, shangjia, title, s(r[17]) or s(r[16]), attrs, s(r[22]),
+        row = make_row(
+            product_code, shangjia, s(r[17]) or s(r[16]), attrs, s(r[22]),
             imgs, "主钻分数", main_ct, "戒托颜色", setting_color, price_yuan, parse_stock(r[11]),
-        ))
+        )
+        # 原始「系列」字段(如 'Shining系列-EASE·真我')供标题生成用:
+        # 标准列里没有它, 而 split_series 只留 '·' 后的中文, 会把 'EASE' 丢掉
+        row["_系列原文"] = s(r[19])
+        result.append(row)
     return result
 
 
@@ -376,7 +555,6 @@ def parse_tianranzuan(sheet, images):
         sku_code = clean_base(s(r[5])) or shangjia
         retail = r[26]  # 零售价(单位: 元, 不是分)
         price_yuan = ceil_div07(retail) if retail is not None else ""  # 售价(元) = 零售价/0.7, 与货盘「上架价」列一致
-        title = build_title(r[9], r[13], r[7])
         cut_wx, cut_xhs = map_cut(r[19])
         attrs = join_attrs([
             ("色调", r[13]), ("形状", XHS_SHAPE_MAP.get(s(r[16]), s(r[16]))), ("钻石颜色", r[17]),
@@ -389,11 +567,32 @@ def parse_tianranzuan(sheet, images):
         # 规格维度2 = 戒托颜色(从商家编码末尾字母提取)
         setting_color = extract_setting_color(shangjia)
         imgs = match_images(shangjia, images)
-        result.append(make_row(
-            product_code, sku_code, title, s(r[7]), attrs, s(r[11]),
+        row = make_row(
+            product_code, sku_code, s(r[7]), attrs, s(r[11]),
             imgs, "主钻分数", main_ct, "戒托颜色", setting_color, price_yuan, "1",
-        ))
+        )
+        row["_系列原文"] = s(r[9])
+        result.append(row)
     return result
+
+
+def write_preview(rows, path=OUTPUT_PATH):
+    """把转换结果写成「货盘转换预览.xlsx」，给运营发布前过一遍。
+
+    「标题备注」是预览专用列：标注标题重复（这些发不出去）、以及因长度丢了哪些字段。
+    它不在标准模板 HEADERS 里，导入时按表头名取值、多出来的列会被忽略。
+    """
+    out = Workbook()
+    ws = out.active
+    ws.title = "货盘转换预览"
+    headers = HEADERS + ["标题备注"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append([row.get(header, "") for header in headers])
+    ws.freeze_panes = "A2"
+    out.save(path)
 
 
 def main():
@@ -416,17 +615,10 @@ def main():
     enrich_carat(rows)
     enrich_split_tone(rows)
     enrich_split_chain(rows)
+    # 标题必须在所有拆分之后生成（拆出来的商品编码变了，标题才能跟着区分开）
+    enrich_titles(rows)
 
-    out = Workbook()
-    ws = out.active
-    ws.title = "货盘转换预览"
-    ws.append(HEADERS)
-    for c in ws[1]:
-        c.font = Font(bold=True)
-    for row in rows:
-        ws.append([row.get(h, "") for h in HEADERS])
-    ws.freeze_panes = "A2"
-    out.save(OUTPUT_PATH)
+    write_preview(rows)
 
     product_codes = set(r["商品编码"] for r in rows if r["商品编码"])
     no_img = sum(1 for r in rows if not r["主图"])

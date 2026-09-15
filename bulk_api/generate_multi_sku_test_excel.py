@@ -56,6 +56,7 @@ def load_rows():
     rows = ha.parse_peiyuzuan(workbook["培育钻"], images)
     ha.enrich_split_chain(rows)
     ha.enrich_carat(rows)
+    ha.enrich_titles(rows)   # 标题统一在最后按商品编码生成
     return rows
 
 

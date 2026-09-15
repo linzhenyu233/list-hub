@@ -135,6 +135,8 @@ def db():
         conn.execute("ALTER TABLE publish_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_batch_product_platform ON publish_items(batch_id, product_code, platform)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_pick ON publish_items(status, priority DESC, id)")
+    # step3「发布状态」按商品全局汇总(跨批次), 需要按 product_code 检索
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_product ON publish_items(product_code, platform, status)")
     conn.execute("""CREATE TABLE IF NOT EXISTS image_upload_cache (
         platform TEXT NOT NULL, source_hash TEXT NOT NULL, source_url TEXT NOT NULL,
         platform_url TEXT NOT NULL, updated_at TEXT, PRIMARY KEY(platform, source_hash)
@@ -160,6 +162,42 @@ def _json_post(url, payload, timeout=180):
     return data
 
 
+def fit_wechat_title(title):
+    """微信标题上限 60 个字符（官方文档：中文/字母/数字各算 1 个字符）。"""
+    return str(title or "")[:60]
+
+
+def fit_xhs_title(title):
+    """小红书标题压到合法长度。
+
+    平台报错原文：标题长度需要在[8]-[30]个字或[16]-[60]个字符
+      「字」= 每个字符算 1；「字符」= 中文/全角算 2、字母数字算 1；满足任一区间即可。
+      取「≤30 个字」这一档最稳（≤30 字时加权必然 ≤60 字符）。
+    """
+    text = str(title or "")
+    if len(text) > 30:
+        return text[:30]
+    if len(text) < 8:
+        return (text + " 培育钻石")[:30]
+    return text
+
+
+def platform_title(product, mapping, platform):
+    """取要发给平台的标题，并做长度兜底。
+
+    优先顺序：本平台标题列（运营在审核抽屉里改过的）→ 商品行里本平台的标题 → 通用标题。
+    踩过的坑：只写 mapping.get("xhs_title") or product.get("title")，映射里没有小红书标题时
+    就回落到「标题」= 微信那版（带品牌/系列，54 字/75 字符），触发 -5000500 标题长度错误，
+    实测一个批次 250 个商品全因此失败。
+    """
+    column = "wechat_title" if platform == "wechat" else "xhs_title"
+    raw = mapping.get(column) or product.get(column) or product.get("title", "")
+    fixed = fit_wechat_title(raw) if platform == "wechat" else fit_xhs_title(raw)
+    if fixed != str(raw or ""):
+        print(f"[{platform}] 标题长度不合规，已裁剪为 {fixed!r}（原 {str(raw)!r}）")
+    return fixed
+
+
 def _wechat_payload(product, mapping):
     chain = _latest_wechat_chain(mapping.get("wechat_category_chain") or [])
     if not chain:
@@ -172,7 +210,7 @@ def _wechat_payload(product, mapping):
     if not product.get("main_images"):
         raise RuntimeError("微信商品至少需要一张主图")
     item = {
-        "title": mapping.get("wechat_title") or product.get("title", ""),
+        "title": platform_title(product, mapping, "wechat"),
         "out_product_id": product.get("product_code"),
         "head_imgs": product.get("main_images") or [],
         "cats_v2": [{"cat_id": n.get("cat_id") or n.get("id")} for n in chain],
@@ -447,7 +485,7 @@ def _xhs_payload(product, mapping, group_config=None):
         raise RuntimeError("未选择小红书物流方案")
     if not product.get("main_images"):
         raise RuntimeError("小红书商品至少需要一张主图")
-    item = {"name": mapping.get("xhs_title") or product.get("title", ""),
+    item = {"name": platform_title(product, mapping, "xhs"),
             "brandId": str(mapping.get("xhs_brand_id") or ""), "categoryId": str(category_id),
             "attributes": [], "shippingTemplateId": str(mapping.get("xhs_shipping_template_id") or ""),
             "shippingGrossWeight": int(float(product.get("weight") or 500)),
@@ -1180,6 +1218,8 @@ def import_huopai(body: HuopaiImportBody | None = None):
         H.enrich_carat(raw_rows)
         H.enrich_split_tone(raw_rows)
         H.enrich_split_chain(raw_rows)
+        # 标题按商品编码生成, 必须在所有拆分之后(拆出来的商品标题要靠它区分开)
+        H.enrich_titles(raw_rows)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1492,7 +1532,9 @@ def publish(batch_id: str, body: PublishBody):
     for product in products:
         for platform in platforms:
             row = check_conn.execute("SELECT * FROM publish_items WHERE batch_id=? AND product_code=? AND platform=? ORDER BY id DESC LIMIT 1", (batch_id, product["product_code"], platform)).fetchone()
-            if row:
+            # deleted=核对后确认平台商品已被删除, cancelled=人工停掉: 都不算"发过", 必须放行重新发,
+            # 否则运营在平台后台删完商品后, 这一批永远卡在"已有发布任务，未重复创建"。
+            if row and row["status"] not in ("deleted", "cancelled"):
                 prior.append(row)
             else:
                 pending.append((product["product_code"], platform))
@@ -1518,25 +1560,167 @@ def publish(batch_id: str, body: PublishBody):
     return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "message": message}
 
 
-@app.get("/import/{batch_id}/publish-status")
-def batch_publish_status(batch_id: str):
-    """【发布状态】按 商品×平台 汇总该批次已有的发布记录。
+@app.get("/publish-status")
+def publish_status():
+    """【发布状态】按商品编码汇总**所有批次**的发布记录。
 
-    用途: step3 分批发布时, 运营需要一眼看出哪些商品"已经发过了" ——
-    平台对重复标题会直接拒绝(error_code=-5000500 标题不能与现有商品标题重复),
-    重复勾选等于白跑一轮, 而且页面选完之后没有任何变化, 很容易再选到同一批。
-    返回: {商品编码: {平台: {状态: 条数}}}, 例 {"ZNJ1725-安宁": {"xhs": {"success": 1}}}
+    为什么按商品、而不是按批次:
+      运营的常见做法是"重新导入一次货盘表再发", 而每次导入都会生成一个新批次。
+      如果按 batch_id 统计, 重新导入后"已经发过"的记录全部消失, 又会显示成 250 件
+      未发布, 于是再重复发一遍 —— 平台对重复标题直接拒绝(-5000500 标题不能与现有商品标题重复)。
+      商品编码跨批次稳定, 所以这里全局汇总, 换批次也不会丢。
+
+    只统计"有意义的终态": success/partial 表示确实发出去过; queued/running 表示正在发;
+    failed 表示发过但失败; cancelled 是被手动停掉的, 不算发过(前端按 none 处理);
+    deleted 是核对后发现平台商品已被删除的, 同样按 none 处理(可以重新发)。
+
+    返回: {商品编码: {"platforms": {平台: {状态: 条数}}, "last_success_at": ISO时间}}
     """
-    batch_or_404(batch_id)
     conn = db()
-    rows = conn.execute("SELECT product_code, platform, status, COUNT(*) n FROM publish_items "
-                        "WHERE batch_id=? GROUP BY product_code, platform, status", (batch_id,)).fetchall()
+    rows = conn.execute("SELECT product_code, platform, status, COUNT(*) n, MAX(finished_at) last_at "
+                        "FROM publish_items GROUP BY product_code, platform, status").fetchall()
     conn.close()
     result = {}
     for row in rows:
-        platform_counts = result.setdefault(row["product_code"], {}).setdefault(row["platform"], {})
-        platform_counts[row["status"]] = row["n"]
+        entry = result.setdefault(row["product_code"], {"platforms": {}, "last_success_at": None})
+        entry["platforms"].setdefault(row["platform"], {})[row["status"]] = row["n"]
+        if row["status"] == "success" and row["last_at"]:
+            if not entry["last_success_at"] or row["last_at"] > entry["last_success_at"]:
+                entry["last_success_at"] = row["last_at"]
     return {"ok": True, "result": result}
+
+
+# ==================================================================
+# 核对发布状态: 本地"已发布"记录 vs 平台真实商品
+# ==================================================================
+ITEM_EXISTS = "exists"    # 平台还有该商品
+ITEM_GONE = "gone"        # 平台明确表示不存在/已删除
+ITEM_UNKNOWN = "unknown"  # 查不动(网络/鉴权/其它), 不能据此改状态
+
+# "商品不存在"的判定特征(已对官方文档):
+#   微信 获取商品: errcode 10020052 = 商品不存在; product.status=6 = 回收站(后台删除后落到这里)
+#   小红书 删除后没有单独的"不存在"错误码, 只能按错误文案兜底 → 拿不准就判 unknown 保留原状
+# 注意别用过于宽泛的词(如裸的"不存在"): 微信的"运费模板不存在""类目不存在"等也会命中,
+# 会把在售商品误判成已删除, 所以微信只认自己的错误码和明确提到商品的文案。
+_WECHAT_GONE_MARKERS = ("10020052", "商品不存在", "商品已删除", "商品在回收站")
+_XHS_GONE_MARKERS = ("不存在", "not exist", "not_exist", "not found", "已删除")
+
+
+def _http_error_detail(exc):
+    """取 HTTPError 响应体里的 detail —— 两个平台服务都用 FastAPI, 真实错误码在 detail 里。"""
+    try:
+        raw = exc.read().decode("utf-8")
+        return str(json.loads(raw).get("detail") or raw)[:500]
+    except Exception:
+        return str(exc)[:500]
+
+
+def platform_item_state(platform, product_id):
+    """核对该商品在平台上还在不在, 返回 (state, 说明)。
+
+    只有平台**明确**说商品不存在/已删除时才返回 gone; 网络超时、连接失败、鉴权过期
+    一律返回 unknown 并保留原状态 —— 否则一次网络抖动就会把在售商品标成"未发布",
+    诱导运营重复发布(平台会以「标题重复」拒绝), 反而更麻烦。
+    """
+    target = urllib.parse.quote(str(product_id))
+    if platform == "wechat":
+        url = f"{WECHAT_API_BASE}/products/{target}"
+    elif platform == "xhs":
+        url = f"{XHS_API_BASE}/items/{target}"
+    else:
+        return ITEM_UNKNOWN, f"不支持的平台：{platform}"
+    try:
+        data = _http_get_json(url, timeout=30)
+    except urllib.error.HTTPError as exc:
+        detail = _http_error_detail(exc)
+        markers = _WECHAT_GONE_MARKERS if platform == "wechat" else _XHS_GONE_MARKERS
+        if any(marker in detail for marker in markers):
+            return ITEM_GONE, detail
+        return ITEM_UNKNOWN, detail
+    except Exception as exc:
+        return ITEM_UNKNOWN, f"查询失败：{exc}"
+    if platform == "wechat":
+        product = (data.get("result") or {}).get("product") or {}
+        if not product.get("product_id"):
+            return ITEM_GONE, "平台未返回商品数据"
+        if str(product.get("status")) == "6":
+            return ITEM_GONE, "商品在平台回收站（后台已删除）"
+        return ITEM_EXISTS, ""
+    # 小红书: getItemInfo 正常返回的字段结构不稳, 只认"接口报错"这一种删除信号,
+    # 200 就认为商品还在(宁可漏判, 也不要把在售商品误标成未发布)
+    return ITEM_EXISTS, ""
+
+
+class VerifyPublishStatusBody(BaseModel):
+    product_codes: list[str] | None = None  # 不传=核对全部有成功记录的商品
+    mode: str = "verify"                    # verify=按平台核对; reset=人工确认已删除, 直接改回未发布
+
+
+@app.post("/publish-status/verify")
+def verify_publish_status(body: VerifyPublishStatusBody):
+    """【核对发布状态】把本地"已发布"记录拿去平台核一遍, 已删掉的改回"未发布"。
+
+    为什么需要: 运营会在平台后台把商品删掉, 但本地 publish_items 还留着 success,
+    step3 就一直显示"已发布" —— 既看着不对, 又会撞上发布接口的幂等保护(同一批次
+    同商品已有记录就不再创建), 导致删完后想重发却发不出去。
+
+    处理方式: 平台确认不存在的记录状态改成 deleted(前端按"未发布"处理, 且幂等保护放行);
+    查不动的保持原状(unknown), 并在返回里提示, 由运营用 mode=reset 人工兜底。
+    """
+    conn = db()
+    sql = ("SELECT id, product_code, platform, platform_product_id, finished_at FROM publish_items "
+           "WHERE status IN ('success','partial') AND COALESCE(platform_product_id,'')<>''")
+    params = []
+    if body.product_codes:
+        codes = list({str(code) for code in body.product_codes})
+        sql += f" AND product_code IN ({','.join('?' for _ in codes)})"
+        params = codes
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    # 同一商品+平台可能有多条历史成功记录: 只拿最新那条的 platform_product_id 去平台核对
+    latest = {}
+    for row in rows:
+        key = (row["product_code"], row["platform"])
+        if key not in latest or str(row["finished_at"] or "") > str(latest[key]["finished_at"] or ""):
+            latest[key] = row
+    targets = list(latest.values())
+    if not targets:
+        return {"ok": True, "result": {"checked": 0, "deleted": 0, "exists": 0, "unknown": 0, "products": [], "unknown_items": []}}
+    states = {}
+    if body.mode == "reset":
+        # 人工兜底: 运营自己确认这些商品在后台删了, 不再请求平台(也用于小红书查不出的情况)
+        for row in targets:
+            states[(row["product_code"], row["platform"])] = (ITEM_GONE, "人工标记为已在平台删除")
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=min(6, len(targets))) as pool:
+            futures = {pool.submit(platform_item_state, row["platform"], row["platform_product_id"]): row for row in targets}
+            for future in as_completed(futures):
+                row = futures[future]
+                try:
+                    states[(row["product_code"], row["platform"])] = future.result()
+                except Exception as exc:
+                    states[(row["product_code"], row["platform"])] = (ITEM_UNKNOWN, str(exc)[:200])
+    deleted_products, unknown_items, exists_count = set(), [], 0
+    conn = db()
+    for row in targets:
+        state, note = states.get((row["product_code"], row["platform"]), (ITEM_UNKNOWN, ""))
+        if state == ITEM_GONE:
+            # 该商品+平台的所有成功记录一起改: 汇总接口按状态计数, 漏改一条就还是"已发布"
+            conn.execute("UPDATE publish_items SET status='deleted', error=? "
+                         "WHERE product_code=? AND platform=? AND status IN ('success','partial')",
+                         (f"平台已删除（{now()} 核对）：{note}"[:500], row["product_code"], row["platform"]))
+            deleted_products.add(row["product_code"])
+        elif state == ITEM_EXISTS:
+            exists_count += 1
+        else:
+            unknown_items.append({"product_code": row["product_code"], "platform": row["platform"], "reason": note})
+    conn.commit()
+    conn.close()
+    return {"ok": True, "result": {
+        "checked": len(targets), "deleted": len(deleted_products), "exists": exists_count,
+        "unknown": len(unknown_items), "products": sorted(deleted_products), "unknown_items": unknown_items[:50],
+    }}
 
 
 @app.get("/jobs/{job_id}")

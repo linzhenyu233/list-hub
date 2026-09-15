@@ -19,8 +19,12 @@ export const bulkApi = {
   // 货盘表只允许从服务端配置的货盘目录读取, 这里列出该目录下的 .xlsx 供下拉选择
   huopaiFiles: () => http.get('/huopai-files'),
   getBatch: (id) => http.get(`/import/${id}`),
-  // 该批次每个商品已有哪些发布记录(用于 step3 标记"已发布/发布失败/未发布", 避免重复勾选)
-  publishStatus: (id) => http.get(`/import/${id}/publish-status`),
+  // 每个商品已有哪些发布记录(跨批次, 按商品编码汇总): step3 标记"已发布/失败/未发布", 避免重复勾选。
+  // 注意是按商品而不是按批次 —— 重新导入货盘会生成新批次, 按批次统计会把历史记录丢掉。
+  publishStatus: () => http.get('/publish-status'),
+  // 核对发布状态: 把本地"已发布"记录拿去平台核一遍, 后台删掉的商品改回"未发布"以便重发。
+  // mode=reset 表示人工确认已删除, 不请求平台(小红书查不出来时的兜底)。逐条查平台, 给足超时。
+  verifyPublishStatus: (body) => http.post('/publish-status/verify', body, { timeout: 600000 }),
   updateItems: (id, items) => http.put(`/import/${id}/items`, { items }),
   updateMappings: (id, mappings) => http.put(`/import/${id}/mappings`, { mappings }),
   validate: (id) => http.post(`/import/${id}/validate`),
