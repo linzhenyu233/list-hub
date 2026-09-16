@@ -21,14 +21,47 @@ import time
 import sys
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
+import shop_registry
 
 load_project_env()
+
+
+# ---- 店铺上下文（请求级） ------------------------------------------------
+# 路由层通过 _current_shop(request) 拿到当前店铺；未传 X-Shop-Id 则回退默认店。
+# 操作人通过 X-Operator 头获取，空则取默认。
+
+SHOP_HEADER = "x-shop-id"
+OPERATOR_HEADER = "x-operator"
+
+
+def _current_shop_id(request: Request) -> str:
+    """从请求头取 shop_id，空则回退默认店。不抛 404（由业务代码校验）。"""
+    sid = request.headers.get(SHOP_HEADER) or ""
+    sid = sid.strip()
+    if not sid:
+        return shop_registry.default_shop()["shop_id"]
+    return sid
+
+
+def _current_operator(request: Request) -> str:
+    """从请求头取操作人，空则取默认。"""
+    op = request.headers.get(OPERATOR_HEADER) or ""
+    op = op.strip()
+    return op or shop_registry.default_operator()
+
+
+def _verify_shop(shop_id: str) -> dict:
+    """校验店铺存在且启用，返回店铺配置。不存在/停用抛 HTTPException(400)。"""
+    try:
+        return shop_registry.resolve(shop_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.environ.get("BULK_DB_FILE", os.path.join(BASE_DIR, "bulk_catalog.sqlite3"))
@@ -44,14 +77,16 @@ DEFAULT_IMAGE_ROOT = r"\\192.168.10.250\电子商务部\网销部共享\SHINING 
 ALLOWED_IMAGE_ROOTS = [DEFAULT_IMAGE_ROOT, IMAGE_DIR]
 
 
-def _within_allowed_roots(path):
-    """判断绝对路径是否落在 ALLOWED_IMAGE_ROOTS 内。
+def _within_allowed_roots(path, roots=None):
+    """判断绝对路径是否落在白名单根目录内。默认用全局 ALLOWED_IMAGE_ROOTS。
 
     用 commonpath 而不是 startswith:后者会让 '...\\images_evil\\x.jpg' 命中
     白名单根 '...\\images' 的前缀,导致越权读取。
     """
+    if roots is None:
+        roots = ALLOWED_IMAGE_ROOTS
     target = os.path.abspath(str(path or ""))
-    for root in ALLOWED_IMAGE_ROOTS:
+    for root in roots:
         root_abs = os.path.abspath(root)
         try:
             if os.path.commonpath((root_abs, target)) == root_abs:
@@ -106,48 +141,256 @@ def db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("""CREATE TABLE IF NOT EXISTS batches (
-        id TEXT PRIMARY KEY, filename TEXT, status TEXT, total INTEGER DEFAULT 0,
-        valid INTEGER DEFAULT 0, errors INTEGER DEFAULT 0, created_at TEXT,
-        rows_json TEXT NOT NULL, mappings_json TEXT NOT NULL DEFAULT '{}'
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS category_aliases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        internal_category TEXT UNIQUE NOT NULL,
-        wechat_json TEXT, xhs_json TEXT, updated_at TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS publish_jobs (
-        id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, platforms_json TEXT NOT NULL,
-        status TEXT NOT NULL, total INTEGER DEFAULT 0, processed INTEGER DEFAULT 0,
-        success INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, created_at TEXT,
-        updated_at TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS publish_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, batch_id TEXT NOT NULL,
-        product_code TEXT NOT NULL, platform TEXT NOT NULL, status TEXT NOT NULL,
-        platform_product_id TEXT, platform_sku_ids TEXT, error TEXT,
-        started_at TEXT, finished_at TEXT, priority INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(job_id, product_code, platform)
-    )""")
-    # 老库补列: priority=1 表示"分批发布的选中项", worker 优先后执行,
-    # 免得只选了 6 件却要排在几百件的大任务后面
-    if "priority" not in {row["name"] for row in conn.execute("PRAGMA table_info(publish_items)")}:
-        conn.execute("ALTER TABLE publish_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_batch_product_platform ON publish_items(batch_id, product_code, platform)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_pick ON publish_items(status, priority DESC, id)")
-    # step3「发布状态」按商品全局汇总(跨批次), 需要按 product_code 检索
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_product ON publish_items(product_code, platform, status)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS image_upload_cache (
-        platform TEXT NOT NULL, source_hash TEXT NOT NULL, source_url TEXT NOT NULL,
-        platform_url TEXT NOT NULL, updated_at TEXT, PRIMARY KEY(platform, source_hash)
-    )""")
+
+    # 顺序很重要：先建表（新库直接是新结构）→ 补列 → 重建带单店约束的老表
+    # → 迁移历史数据归属 → 最后建索引。
+    # 如果索引先建，老库还没有 shop_id 列，CREATE INDEX 会直接报 no such column。
+    _create_tables(conn)
+    _migrate_add_shop_id(conn)
+    _rebuild_multishop_tables(conn)
+    _reassign_legacy_shop(conn)
+    _create_indexes(conn)
+
     conn.commit()
     return conn
 
 
-def _json_post(url, payload, timeout=180):
+def _create_tables(conn):
+    """建表（仅 CREATE TABLE IF NOT EXISTS，不含索引）。"""
+    conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS batches (
+        id TEXT PRIMARY KEY, shop_id TEXT NOT NULL, filename TEXT, status TEXT,
+        total INTEGER DEFAULT 0, valid INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
+        created_at TEXT, operator TEXT,
+        rows_json TEXT NOT NULL, mappings_json TEXT NOT NULL DEFAULT '{}'
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS category_aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id TEXT NOT NULL,
+        internal_category TEXT NOT NULL,
+        wechat_json TEXT, xhs_json TEXT, updated_at TEXT,
+        UNIQUE(shop_id, internal_category)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS publish_jobs (
+        id TEXT PRIMARY KEY, shop_id TEXT NOT NULL, batch_id TEXT NOT NULL,
+        platforms_json TEXT NOT NULL, status TEXT NOT NULL, total INTEGER DEFAULT 0,
+        processed INTEGER DEFAULT 0, success INTEGER DEFAULT 0, failed INTEGER DEFAULT 0,
+        operator TEXT, created_at TEXT, updated_at TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS publish_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, batch_id TEXT NOT NULL,
+        shop_id TEXT NOT NULL, product_code TEXT NOT NULL, platform TEXT NOT NULL,
+        status TEXT NOT NULL, platform_product_id TEXT, platform_sku_ids TEXT, error TEXT,
+        started_at TEXT, finished_at TEXT, priority INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(job_id, product_code, platform)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS image_upload_cache (
+        shop_id TEXT NOT NULL, platform TEXT NOT NULL, source_hash TEXT NOT NULL,
+        source_url TEXT NOT NULL, platform_url TEXT NOT NULL, updated_at TEXT,
+        PRIMARY KEY(shop_id, platform, source_hash)
+    )""")
+
+
+def _create_indexes(conn):
+    """建索引。必须在补列 + 重建表之后调用（老库此时才有 shop_id 列、表约束才是新的）。"""
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_shop ON batches(shop_id, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_category_aliases_shop ON category_aliases(shop_id, updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_jobs_shop ON publish_jobs(shop_id, created_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_batch_product_platform ON publish_items(batch_id, product_code, platform)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_pick ON publish_items(shop_id, platform, status, priority DESC, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_product ON publish_items(shop_id, product_code, platform, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_image_cache_shop ON image_upload_cache(shop_id, platform, updated_at DESC)")
+    # 唯一索引（老库靠这两条兜底保证含 shop_id 的唯一性；新库表定义里已内置同名约束）
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_category_aliases_shop_internal "
+        "ON category_aliases(shop_id, internal_category)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_image_cache_shop_platform_hash "
+        "ON image_upload_cache(shop_id, platform, source_hash)"
+    )
+
+
+def _migrate_add_shop_id(conn):
+    """把老库升级到多店铺版本（幂等）。
+
+    本函数只负责「补列 + 回填」；表级唯一约束的重建在 _rebuild_multishop_tables。
+
+    迁移内容：
+      1. priority 列（更早版本遗留）—— 必须在建索引前补齐。
+      2. 5 张表的 shop_id / operator 列，历史数据回填默认 shop_id。
+
+    默认 shop_id 从 shop_registry.default_shop() 取：
+      - 已有 shops.json → 取其默认店铺的 shop_id（推荐：先建好 shops.json 再首次启动）
+      - 无 shops.json    → 回退 "default"
+    """
+    # --- 1. 更早版本遗留的 priority 列（独立于 shop_id，先补） ---
+    if "priority" not in {row["name"] for row in conn.execute("PRAGMA table_info(publish_items)")}:
+        conn.execute("ALTER TABLE publish_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+
+    # --- 2. shop_id 相关列 ---
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+    if "shop_id" in cols:
+        return  # 已是新版
+
+    try:
+        default_sid = shop_registry.default_shop()["shop_id"]
+    except ValueError:
+        default_sid = "default"
+
+    print(f"[db-migrate] 检测到老库，历史数据回填 shop_id = {default_sid}")
+
+    _safe_add_column(conn, "batches", "shop_id TEXT NOT NULL DEFAULT '" + default_sid + "'")
+    _safe_add_column(conn, "batches", "operator TEXT")
+    _safe_add_column(conn, "category_aliases", "shop_id TEXT NOT NULL DEFAULT '" + default_sid + "'")
+    _safe_add_column(conn, "publish_jobs", "shop_id TEXT NOT NULL DEFAULT '" + default_sid + "'")
+    _safe_add_column(conn, "publish_jobs", "operator TEXT")
+    _safe_add_column(conn, "publish_items", "shop_id TEXT NOT NULL DEFAULT '" + default_sid + "'")
+    _safe_add_column(conn, "image_upload_cache", "shop_id TEXT NOT NULL DEFAULT '" + default_sid + "'")
+
+    # 记住这次回填用了哪个 shop_id，供 _reassign_legacy_shop 在配置补齐后自动改名
+    _meta_set(conn, "legacy_shop_id", default_sid)
+
+    print("[db-migrate] 补列完成（唯一约束由 _rebuild_multishop_tables 处理）")
+
+
+def _table_sql(conn, table):
+    """取建表 DDL，表不存在返回 None。"""
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row["sql"] if row and row["sql"] else None
+
+
+def _rebuild_multishop_tables(conn):
+    """重建仍带「单店时代唯一约束」的表。
+
+    单店版本的这两张表有全局唯一约束，ALTER TABLE 加 shop_id 列改不掉它们，
+    会直接破坏多店铺语义，必须整表重建（SQLite 不支持 DROP CONSTRAINT）：
+
+      - category_aliases: 旧 UNIQUE(internal_category)
+          → 不重建：B 店保存与 A 店同名的内部类目会报
+            "UNIQUE constraint failed: category_aliases.internal_category"
+            （因为 ON CONFLICT(shop_id, internal_category) 匹配不上旧约束）
+          → 新：UNIQUE(shop_id, internal_category)
+
+      - image_upload_cache: 旧 PRIMARY KEY(platform, source_hash)
+          → 不重建：B 店上传同一张图会 REPLACE 掉 A 店的缓存行，
+            之后 B 店会拿到 A 店素材空间里的 URL（跨店串素材，发错店铺）
+          → 新：PRIMARY KEY(shop_id, platform, source_hash)
+
+    幂等：按 DDL 文本判断，已是新结构则跳过；新库由 _create_tables 直接建成新结构。
+    """
+    # --- category_aliases ---
+    sql = _table_sql(conn, "category_aliases")
+    if sql:
+        normalized = "".join(sql.split()).lower()
+        if "unique(shop_id,internal_category)" not in normalized:
+            count = conn.execute("SELECT COUNT(*) FROM category_aliases").fetchone()[0]
+            print(f"[db-migrate] 重建 category_aliases（{count} 行）以移除单店唯一约束")
+            conn.execute("ALTER TABLE category_aliases RENAME TO category_aliases_legacy")
+            conn.execute("""CREATE TABLE category_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id TEXT NOT NULL,
+                internal_category TEXT NOT NULL,
+                wechat_json TEXT, xhs_json TEXT, updated_at TEXT,
+                UNIQUE(shop_id, internal_category)
+            )""")
+            conn.execute("""INSERT INTO category_aliases(id,shop_id,internal_category,wechat_json,xhs_json,updated_at)
+                SELECT id,shop_id,internal_category,wechat_json,xhs_json,updated_at
+                FROM category_aliases_legacy""")
+            conn.execute("DROP TABLE category_aliases_legacy")
+
+    # --- image_upload_cache ---
+    sql = _table_sql(conn, "image_upload_cache")
+    if sql:
+        normalized = "".join(sql.split()).lower()
+        if "primarykey(shop_id,platform,source_hash)" not in normalized:
+            count = conn.execute("SELECT COUNT(*) FROM image_upload_cache").fetchone()[0]
+            print(f"[db-migrate] 重建 image_upload_cache（{count} 行）以移除跨店主键冲突")
+            conn.execute("ALTER TABLE image_upload_cache RENAME TO image_upload_cache_legacy")
+            conn.execute("""CREATE TABLE image_upload_cache (
+                shop_id TEXT NOT NULL, platform TEXT NOT NULL, source_hash TEXT NOT NULL,
+                source_url TEXT NOT NULL, platform_url TEXT NOT NULL, updated_at TEXT,
+                PRIMARY KEY(shop_id, platform, source_hash)
+            )""")
+            conn.execute("""INSERT OR REPLACE INTO image_upload_cache(shop_id,platform,source_hash,source_url,platform_url,updated_at)
+                SELECT shop_id,platform,source_hash,source_url,platform_url,updated_at
+                FROM image_upload_cache_legacy""")
+            conn.execute("DROP TABLE image_upload_cache_legacy")
+
+
+def _safe_add_column(conn, table, col_def):
+    """执行 ALTER TABLE ADD COLUMN，忽略已存在的列错误。"""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e).lower():
+            return
+        raise
+
+
+def _meta_get(conn, key, default=None):
+    try:
+        row = conn.execute("SELECT value FROM _meta WHERE key=?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return default
+    return row["value"] if row else default
+
+
+def _meta_set(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO _meta(key,value) VALUES(?,?)", (key, value))
+
+
+def _reassign_legacy_shop(conn):
+    """老库回填用的 shop_id 后来在 shops.json 里改了名时，自动把历史数据迁到新默认店。
+
+    场景：运营先启动了新版本（此时还没有 shops.json，历史数据回填成 "default"），
+    之后才按模板创建 shops.json（默认店叫 diamond_01）。若不处理，276 个批次会变成孤儿。
+
+    只在安全条件下自动迁移：
+      - 老 shop_id 已不再出现在 shops.json 里；
+      - 目标（默认店）名下一行数据都没有（避免两个店的数据混在一起）。
+    不满足条件时只打印警告，由人工确认，绝不擅自合并数据。
+    """
+    legacy = _meta_get(conn, "legacy_shop_id")
+    if not legacy:
+        return
+    try:
+        target = shop_registry.default_shop()["shop_id"]
+    except ValueError:
+        return
+    if legacy == target:
+        return
+    if shop_registry.get_shop(legacy):
+        return  # 老店仍在配置里，说明命名没变，不动
+
+    tables = ("batches", "category_aliases", "publish_jobs", "publish_items", "image_upload_cache")
+    occupied = conn.execute("SELECT COUNT(*) FROM batches WHERE shop_id=?", (target,)).fetchone()[0]
+    if occupied:
+        print(f"[db-migrate] WARN: 历史数据在 '{legacy}' 下，但默认店 '{target}' 已有数据，"
+              f"未自动迁移。请人工确认后用 SQL 手动改名（5 张表的 shop_id 列）。")
+        return
+
+    moved = 0
+    for table in tables:
+        cur = conn.execute(f"UPDATE {table} SET shop_id=? WHERE shop_id=?", (target, legacy))
+        moved += cur.rowcount or 0
+    _meta_set(conn, "legacy_shop_id", target)
+    print(f"[db-migrate] 历史数据已从 '{legacy}' 迁移到默认店 '{target}'（共 {moved} 行）")
+
+
+def _json_post(url, payload, timeout=180, shop_id=None, extra_headers=None):
+    headers = {"Content-Type": "application/json"}
+    if shop_id:
+        headers[SHOP_HEADER] = shop_id
+    if extra_headers:
+        headers.update(extra_headers)
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -284,8 +527,15 @@ def _local_image(source):
     return path, content
 
 
-def _platform_image(platform, source_url):
+def _platform_image(platform, source_url, shop_id=None):
     global _image_cache_hit_mem, _image_cache_hit_db, _image_cache_miss
+    # shop_id 缺失时回退默认店：新库 image_upload_cache.shop_id 是 NOT NULL，
+    # 不兜底的话写入会直接失败。正常调用方(worker)始终显式传入。
+    if not shop_id:
+        try:
+            shop_id = shop_registry.default_shop()["shop_id"]
+        except ValueError:
+            shop_id = "default"  # 极端情况：完全没有可用店铺时也要能写入
     source_url = str(source_url or "").strip()
     if not source_url: return ""
     local_image = _local_image(source_url)
@@ -293,7 +543,7 @@ def _platform_image(platform, source_url):
         # 共享盘图片懒拷贝: 只有真正发布到平台时才读字节(扫描阶段零磁盘)
         local_image = fetch_share_image(source_url)
     source_hash = hashlib.sha256(local_image[1] if local_image else source_url.encode("utf-8")).hexdigest()
-    cache_key = (platform, source_hash)
+    cache_key = (shop_id or "", platform, source_hash)
     # 1. 内存 LRU 层
     if cache_key in _IMAGE_CACHE_MEM:
         _image_cache_hit_mem += 1
@@ -302,7 +552,9 @@ def _platform_image(platform, source_url):
         _IMAGE_CACHE_ORDER.append(cache_key)
         return _IMAGE_CACHE_MEM[cache_key]
     # 2. SQLite 持久层
-    conn = db(); cached = conn.execute("SELECT platform_url FROM image_upload_cache WHERE platform=? AND source_hash=?", (platform, source_hash)).fetchone(); conn.close()
+    conn = db()
+    cached = conn.execute("SELECT platform_url FROM image_upload_cache WHERE shop_id=? AND platform=? AND source_hash=?", (shop_id, platform, source_hash)).fetchone()
+    conn.close()
     if cached:
         _image_cache_hit_db += 1
         _image_cache_mem_put(cache_key, cached["platform_url"])
@@ -313,17 +565,21 @@ def _platform_image(platform, source_url):
         payload = {"filename": os.path.basename(local_image[0]),
                    "content_base64": base64.b64encode(local_image[1]).decode("ascii")}
         endpoint = "/images/upload-file" if platform == "wechat" else "/materials/upload-file"
-        response = _json_post(f"{WECHAT_API_BASE if platform == 'wechat' else XHS_API_BASE}{endpoint}", payload)
+        base = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
+        response = _json_post(f"{base}{endpoint}", payload, shop_id=shop_id)
     elif platform == "wechat":
-        response = _json_post(f"{WECHAT_API_BASE}/images/upload", {"img_url": source_url})
+        response = _json_post(f"{WECHAT_API_BASE}/images/upload", {"img_url": source_url}, shop_id=shop_id)
     else:
-        response = _json_post(f"{XHS_API_BASE}/materials/upload", {"url": source_url})
+        response = _json_post(f"{XHS_API_BASE}/materials/upload", {"url": source_url}, shop_id=shop_id)
     if response.get("ok") is False: raise RuntimeError(str(response.get("detail") or response)[:500])
     result = response.get("result")
     if isinstance(result, str): platform_url = result
     else: platform_url = (result or {}).get("url") or (result or {}).get("materialUrl") or (result or {}).get("fileUrl") or (result or {}).get("img_url")
     if not platform_url: raise RuntimeError(f"{platform} 图片上传未返回地址")
-    conn = db(); conn.execute("INSERT OR REPLACE INTO image_upload_cache(platform,source_hash,source_url,platform_url,updated_at) VALUES(?,?,?,?,?)", (platform, source_hash, source_url, platform_url, now())); conn.commit(); conn.close()
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO image_upload_cache(shop_id,platform,source_hash,source_url,platform_url,updated_at) VALUES(?,?,?,?,?,?)",
+                 (shop_id, platform, source_hash, source_url, platform_url, now()))
+    conn.commit(); conn.close()
     _image_cache_mem_put(cache_key, platform_url)
     return platform_url
 
@@ -339,7 +595,7 @@ def _image_cache_mem_put(cache_key, platform_url):
         _IMAGE_CACHE_MEM.pop(evicted, None)
 
 
-def _upload_images_parallel(platform: str, urls: list, max_workers: int = 10) -> list:
+def _upload_images_parallel(platform: str, urls: list, max_workers: int = 10, shop_id=None) -> list:
     """并发上传图片并保序返回(替代原来的串行列表推导)。
 
     - 命中 image_upload_cache 的图片直接返回,不产生网络请求
@@ -352,13 +608,13 @@ def _upload_images_parallel(platform: str, urls: list, max_workers: int = 10) ->
     if not targets:
         return []
     if len(targets) == 1:
-        return [_platform_image(platform, targets[0])]
+        return [_platform_image(platform, targets[0], shop_id=shop_id)]
     with ThreadPoolExecutor(max_workers=min(max_workers, len(targets))) as pool:
         # map 保序;任一任务抛异常会在迭代到该位置时重新抛出
-        return list(pool.map(lambda u: _platform_image(platform, u), targets))
+        return list(pool.map(lambda u: _platform_image(platform, u, shop_id=shop_id), targets))
 
 
-def _upload_image_uncached(platform, source_url):
+def _upload_image_uncached(platform, source_url, shop_id=None):
     """绕开 image_upload_cache 直接上传, 拿一个全新的平台素材地址。
 
     背景(实测): 小红书同一张图重复上传会返回**不同的**素材 URL, 而同一商品内多个 SKU
@@ -374,7 +630,7 @@ def _upload_image_uncached(platform, source_url):
                "content_base64": base64.b64encode(local_image[1]).decode("ascii")}
     endpoint = "/images/upload-file" if platform == "wechat" else "/materials/upload-file"
     base = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
-    response = _json_post(f"{base}{endpoint}", payload)
+    response = _json_post(f"{base}{endpoint}", payload, shop_id=shop_id)
     if response.get("ok") is False:
         raise RuntimeError(str(response.get("detail") or response)[:300])
     result = response.get("result")
@@ -384,7 +640,7 @@ def _upload_image_uncached(platform, source_url):
             or (result or {}).get("fileUrl") or (result or {}).get("img_url") or "")
 
 
-def _upload_sku_images(platform, skus):
+def _upload_sku_images(platform, skus, shop_id=None):
     """并发上传各 SKU 的规格图, 保序返回并保留空位。
 
     ⚠️ 不能直接用 _upload_images_parallel: 它会过滤空值导致返回列表变短,
@@ -397,7 +653,7 @@ def _upload_sku_images(platform, skus):
     pending = [r for r in references if r]
     if not pending:
         return ["" for _ in references]
-    queue = list(_upload_images_parallel(platform, pending))
+    queue = list(_upload_images_parallel(platform, pending, shop_id=shop_id))
     urls = [queue.pop(0) if r else "" for r in references]
     seen = {}
     for index, url in enumerate(urls):
@@ -405,7 +661,7 @@ def _upload_sku_images(platform, skus):
             continue
         if url in seen:
             try:
-                urls[index] = _upload_image_uncached(platform, references[index])
+                urls[index] = _upload_image_uncached(platform, references[index], shop_id=shop_id)
             except Exception as exc:
                 print(f"[sku_image] 撞图重新上传失败, 保留原地址: {exc}")
         else:
@@ -413,13 +669,13 @@ def _upload_sku_images(platform, skus):
     return urls
 
 
-def _prepare_platform_images(product, platform):
+def _prepare_platform_images(product, platform, shop_id=None):
     prepared = dict(product)
-    prepared["main_images"] = _upload_images_parallel(platform, product.get("main_images", []))
-    prepared["detail_images"] = _upload_images_parallel(platform, product.get("detail_images", []))
+    prepared["main_images"] = _upload_images_parallel(platform, product.get("main_images", []), shop_id=shop_id)
+    prepared["detail_images"] = _upload_images_parallel(platform, product.get("detail_images", []), shop_id=shop_id)
     # SKU 规格图: 微信 → skus[].thumb_img, 小红书 → sku_list[].specImage
     skus = [dict(sku) for sku in product.get("skus", [])]
-    for sku, url in zip(skus, _upload_sku_images(platform, skus)):
+    for sku, url in zip(skus, _upload_sku_images(platform, skus, shop_id=shop_id)):
         if url:
             sku["uploaded_sku_image"] = url
     # 小红书开了「主规格图」后要求每个规格值都有图(否则报「启用规格大图需上传所有规格图」)。
@@ -540,6 +796,7 @@ def _xhs_payload(product, mapping, group_config=None):
 
 
 def _run_publish_item(row):
+    shop_id = row["shop_id"]
     # 用缓存版:避免每个发布项都重新 json.loads 全量 rows + mappings(800 商品时单次近百毫秒)
     batch = get_batch_cached(row["batch_id"])
     product = next((p for p in batch["products"] if p.get("product_code") == row["product_code"]), None)
@@ -547,14 +804,14 @@ def _run_publish_item(row):
     mapping = batch["mappings"].get("products", {}).get(row["product_code"], {})
     group_config = batch["mappings"].get("attr_groups", {}).get(product.get("internal_category"), {})
     if row["platform"] == "wechat":
-        product = _prepare_platform_images(product, "wechat")
-        result = _json_post(f"{WECHAT_API_BASE}/products", _wechat_payload(product, mapping))
+        product = _prepare_platform_images(product, "wechat", shop_id=shop_id)
+        result = _json_post(f"{WECHAT_API_BASE}/products", _wechat_payload(product, mapping), shop_id=shop_id)
         if result.get("ok") is False: raise RuntimeError(str(result.get("detail") or result)[:500])
         value = result.get("result")
         return {"product_id": value} if not isinstance(value, dict) else value
     if row["platform"] == "xhs":
-        product = _prepare_platform_images(product, "xhs")
-        result = _json_post(f"{XHS_API_BASE}/items/and-sku", _xhs_payload(product, mapping, group_config))
+        product = _prepare_platform_images(product, "xhs", shop_id=shop_id)
+        result = _json_post(f"{XHS_API_BASE}/items/and-sku", _xhs_payload(product, mapping, group_config), shop_id=shop_id)
         value = result.get("result") or {}
         if value.get("itemId") and (result.get("partial") or value.get("skuErrors")):
             value["partial_error"] = json.dumps(value.get("skuErrors") or [], ensure_ascii=False)
@@ -564,49 +821,90 @@ def _run_publish_item(row):
     raise RuntimeError(f"不支持的平台: {row['platform']}")
 
 
-def recover_interrupted_items():
+def recover_interrupted_items(shop_id=None):
+    """启动时把中断在 running 状态的项改回 queued。
+
+    多店铺版：可选按 shop_id 恢复；不传则恢复所有店的中断项。
+    """
     conn = db()
-    conn.execute("UPDATE publish_items SET status='queued' WHERE status='running'")
+    if shop_id:
+        conn.execute("UPDATE publish_items SET status='queued' WHERE status='running' AND shop_id=?", (shop_id,))
+    else:
+        conn.execute("UPDATE publish_items SET status='queued' WHERE status='running'")
     conn.commit(); conn.close()
 
 
-def _platform_ready(platform):
+def _platform_ready(platform, shop_id=None):
     base_url = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
     try:
-        with urllib.request.urlopen(f"{base_url}/health", timeout=3) as response:
+        url = f"{base_url}/health"
+        if shop_id:
+            req = urllib.request.Request(url, headers={SHOP_HEADER: shop_id})
+        else:
+            req = url
+        with urllib.request.urlopen(req, timeout=3) as response:
             return response.status == 200
     except Exception:
         return False
 
 
-def _worker_loop(platform=None):
+def _worker_loop(platform=None, shop_id=None):
+    """发布 worker 主循环。
+
+    多店铺模式：
+      - shop_id 非空：只处理该店铺的任务（按平台过滤，platform=None 则全平台）。
+      - shop_id 为空：兼容旧行为，取默认店铺。
+    """
+    if not shop_id:
+        try:
+            shop_id = shop_registry.default_shop()["shop_id"]
+        except ValueError:
+            shop_id = "default"
     while True:
         conn = None
         try:
-            if platform and not _platform_ready(platform):
+            if platform and not _platform_ready(platform, shop_id=shop_id):
                 time.sleep(5)
                 continue
             conn = db()
             conn.execute("BEGIN IMMEDIATE")
             # priority DESC: 分批发布(只选中几件)的项插到前面先跑, 再按 id 先到先服务
             if platform:
-                item = conn.execute("SELECT * FROM publish_items WHERE status='queued' AND platform=? ORDER BY priority DESC, id LIMIT 1", (platform,)).fetchone()
+                item = conn.execute(
+                    "SELECT * FROM publish_items WHERE shop_id=? AND status='queued' AND platform=? "
+                    "ORDER BY priority DESC, id LIMIT 1",
+                    (shop_id, platform)
+                ).fetchone()
             else:
-                item = conn.execute("SELECT * FROM publish_items WHERE status='queued' ORDER BY priority DESC, id LIMIT 1").fetchone()
+                item = conn.execute(
+                    "SELECT * FROM publish_items WHERE shop_id=? AND status='queued' "
+                    "ORDER BY priority DESC, id LIMIT 1",
+                    (shop_id,)
+                ).fetchone()
             if not item:
                 conn.commit(); conn.close()
                 time.sleep(1)
                 continue
-            conn.execute("UPDATE publish_items SET status='running', started_at=? WHERE id=?", (now(), item["id"])); conn.commit(); conn.close()
+            conn.execute("UPDATE publish_items SET status='running', started_at=? WHERE id=? AND shop_id=?",
+                         (now(), item["id"], shop_id)); conn.commit(); conn.close()
             try:
                 result = _run_publish_item(item)
                 product_id = result.get("product_id") or result.get("itemId") or result.get("id")
                 sku_ids = result.get("skuIds") or []
                 status = "partial" if result.get("partial_error") else "success"
-                conn = db(); conn.execute("UPDATE publish_items SET status=?, platform_product_id=?, platform_sku_ids=?, error=?, finished_at=? WHERE id=?", (status, str(product_id or ""), json.dumps(sku_ids), result.get("partial_error"), now(), item["id"])); conn.commit(); conn.close()
+                conn = db(); conn.execute(
+                    "UPDATE publish_items SET status=?, platform_product_id=?, platform_sku_ids=?, error=?, finished_at=? "
+                    "WHERE id=? AND shop_id=?",
+                    (status, str(product_id or ""), json.dumps(sku_ids), result.get("partial_error"),
+                     now(), item["id"], shop_id)); conn.commit(); conn.close()
             except Exception as exc:
-                conn = db(); conn.execute("UPDATE publish_items SET status='failed', error=?, finished_at=? WHERE id=?", (str(exc)[:1000], now(), item["id"])); conn.commit(); conn.close()
-            conn = db(); conn.execute("""UPDATE publish_jobs SET processed=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('success','failed','partial')), success=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status='success'), failed=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('failed','partial')), status=CASE WHEN (SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('queued','running'))=0 THEN CASE WHEN (SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('failed','partial'))>0 THEN 'completed_with_errors' ELSE 'completed' END ELSE 'running' END, updated_at=? WHERE id=?""", (item["job_id"], item["job_id"], item["job_id"], item["job_id"], item["job_id"], now(), item["job_id"])); conn.commit(); conn.close()
+                conn = db(); conn.execute(
+                    "UPDATE publish_items SET status='failed', error=?, finished_at=? WHERE id=? AND shop_id=?",
+                    (str(exc)[:1000], now(), item["id"], shop_id)); conn.commit(); conn.close()
+            conn = db(); conn.execute("""UPDATE publish_jobs SET processed=(SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status IN ('success','failed','partial')), success=(SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status='success'), failed=(SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status IN ('failed','partial')), status=CASE WHEN (SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status IN ('queued','running'))=0 THEN CASE WHEN (SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status IN ('failed','partial'))>0 THEN 'completed_with_errors' ELSE 'completed' END ELSE 'running' END, updated_at=? WHERE id=? AND shop_id=?""",
+                (shop_id, item["job_id"], shop_id, item["job_id"], shop_id, item["job_id"],
+                 shop_id, item["job_id"], shop_id, item["job_id"], now(), item["job_id"], shop_id))
+            conn.commit(); conn.close()
         except Exception:
             # 异常时必须回滚并关闭连接,否则 BEGIN IMMEDIATE 持有的写锁会一直不释放,锁死整个库
             if conn is not None:
@@ -1080,6 +1378,12 @@ def health():
     return {"status": "ok", "service": "bulk-catalog-api"}
 
 
+@app.get("/shops")
+def list_shops():
+    """返回脱敏后的店铺列表，供前端店铺选择器使用。"""
+    return {"ok": True, "result": shop_registry.redacted_list(only_enabled=True)}
+
+
 @app.get("/template")
 def template():
     headers = ["商品编码", "标题", "微信标题", "小红书标题", "内部类目", "品牌", "描述", "商品属性", "重量", "主图", "详情图", "SKU编码", "规格1名称", "规格1值", "规格2名称", "规格2值", "规格3名称", "规格3值", "原价（元）", "售价（元）", "库存"]
@@ -1102,7 +1406,10 @@ def template():
 
 
 @app.post("/import")
-def import_batch(body: ImportBody):
+def import_batch(body: ImportBody, request: Request):
+    shop_id = _current_shop_id(request)
+    _verify_shop(shop_id)
+    operator = _current_operator(request)
     try:
         raw = base64.b64decode(body.content_base64)
     except Exception:
@@ -1126,7 +1433,8 @@ def import_batch(body: ImportBody):
         _store_folder_images(body.folder_files, batch_id, rows, body.common_detail_files)
     errors = sum(bool(row["errors"]) for row in rows)
     conn = db()
-    conn.execute("INSERT INTO batches(id,filename,status,total,valid,errors,created_at,rows_json) VALUES(?,?,?,?,?,?,?,?)", (batch_id, body.filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), json.dumps(rows, ensure_ascii=False)))
+    conn.execute("INSERT INTO batches(id,shop_id,filename,status,total,valid,errors,created_at,operator,rows_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (batch_id, shop_id, body.filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), operator, json.dumps(rows, ensure_ascii=False)))
     conn.commit(); conn.close()
     products = group_products(rows)
     product_errors = sum(bool(product["errors"]) for product in products)
@@ -1195,11 +1503,14 @@ def list_huopai_files():
 
 
 @app.post("/import-huopai")
-def import_huopai(body: HuopaiImportBody | None = None):
+def import_huopai(body: HuopaiImportBody | None = None, request: Request = None):
     """【直读货盘】从服务器本地货盘目录读货盘表,后台跑「货盘→标准模板」转换后入库。
     与大平台一致:数据源直连,不经过浏览器上传,规避 64MB 大文件 Base64 传输。
     安全: 只允许读取货盘目录白名单内的 .xlsx(见 _resolve_huopai_file)。
     转换规则与 huopai_adapter.py 完全一致(编码/价格/库存/属性/图片/系列拆分)。"""
+    shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
+    _verify_shop(shop_id)
+    operator = _current_operator(request) if request else shop_registry.default_operator()
     import openpyxl  # 局部导入:仅本接口需要
     H = _huopai_module()
     path = _resolve_huopai_file((body.path if body and body.path else None) or H.HUOPAI_PATH)
@@ -1235,8 +1546,8 @@ def import_huopai(body: HuopaiImportBody | None = None):
     errors = sum(bool(row["errors"]) for row in rows)
     filename = os.path.basename(path)
     conn = db()
-    conn.execute("INSERT INTO batches(id,filename,status,total,valid,errors,created_at,rows_json) VALUES(?,?,?,?,?,?,?,?)",
-                 (batch_id, filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), json.dumps(rows, ensure_ascii=False)))
+    conn.execute("INSERT INTO batches(id,shop_id,filename,status,total,valid,errors,created_at,operator,rows_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (batch_id, shop_id, filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), operator, json.dumps(rows, ensure_ascii=False)))
     conn.commit(); conn.close()
     products = group_products(rows)
     return {"ok": True, "batch_id": batch_id, "filename": filename, "total": len(rows),
@@ -1245,20 +1556,26 @@ def import_huopai(body: HuopaiImportBody | None = None):
 
 
 @app.get("/image-roots")
-def list_image_roots():
-    """【图片根目录】返回服务端允许扫描的图片根目录白名单,供前端下拉选择。
+def list_image_roots(request: Request = None):
+    """【图片根目录】返回当前店铺允许扫描的图片根目录,供前端下拉选择。
 
-    之前 root 完全来自请求体,传入任意目录即可枚举该目录下的商品文件夹与图片;
-    现在只暴露白名单(ALLOWED_IMAGE_ROOTS),扫描接口也只接受白名单内的 root。
+    优先返回店铺配置的 image_root；全局 ALLOWED_IMAGE_ROOTS 兜底。
     """
-    return {"ok": True, "default": os.path.abspath(DEFAULT_IMAGE_ROOT),
+    shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
+    shop_root = shop_registry.image_root_for(shop_id)
+    roots = list(dict.fromkeys(
+        ([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)
+    ))
+    default = shop_root or DEFAULT_IMAGE_ROOT
+    return {"ok": True, "default": os.path.abspath(default),
             "roots": [{"path": os.path.abspath(root), "available": os.path.isdir(root)}
-                      for root in ALLOWED_IMAGE_ROOTS]}
+                      for root in roots]}
 
 
 @app.post("/batches/{batch_id}/images/scan")
-def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
+def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request: Request = None):
     """【直读图片】扫描图片根目录, 按编码把商品图/SKU 图挂到批次上。
+    多店铺: 图片根目录从当前店铺的 image_root 取。
 
     解决两个实际问题:
       ① 多 SKU 商品的图分散在子文件夹(文件夹名就是 SKU 编码), 浏览器一次只能选一个文件夹,
@@ -1275,21 +1592,27 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
 
     传 dry_run=true 可只匹配不写库, 先看命中率。
     """
+    shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
+    _verify_shop(shop_id)
     try:
         import image_scanner
     except Exception as exc:
         raise HTTPException(500, f"图片扫描模块不可用：{exc}")
 
-    batch = batch_or_404(batch_id)
+    batch = batch_or_404(batch_id, shop_id)
     rows = batch["items"]
-    root = (body.root if body and body.root else None) or DEFAULT_IMAGE_ROOT
+    shop_image_root = shop_registry.image_root_for(shop_id)
+    root = (body.root if body and body.root else None) or shop_image_root or DEFAULT_IMAGE_ROOT
     months = body.months if body else None
     dry_run = bool(body.dry_run) if body else False
     # 路径收敛: root 只能取白名单内的图片根目录(见 GET /image-roots),
     # 否则该接口可被用来枚举服务器任意文件夹的商品图。
-    if not _within_allowed_roots(root) or not os.path.isdir(root):
+    allowed_roots = list(dict.fromkeys(
+        [shop_image_root] if shop_image_root else []
+    )) + ALLOWED_IMAGE_ROOTS  # 兜底保留原白名单
+    if not _within_allowed_roots(root, allowed_roots) or not os.path.isdir(root):
         raise HTTPException(400, f"图片根目录不可访问或不在允许的图片目录内：{root}"
-                                 f"(允许：{'、'.join(ALLOWED_IMAGE_ROOTS)})")
+                                 f"(允许：{'、'.join(allowed_roots)})")
 
     try:
         scan = image_scanner.scan_image_root(root, months=months)
@@ -1366,8 +1689,8 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
 
     if not dry_run:
         conn = db()
-        conn.execute("UPDATE batches SET rows_json=? WHERE id=?",
-                     (json.dumps(rows, ensure_ascii=False), batch_id))
+        conn.execute("UPDATE batches SET rows_json=? WHERE id=? AND shop_id=?",
+                     (json.dumps(rows, ensure_ascii=False), batch_id, shop_id))
         conn.commit()
         conn.close()
 
@@ -1388,14 +1711,15 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None):
 
 
 @app.post("/batches/{batch_id}/sku-image")
-def upload_sku_image(batch_id: str, body: SkuImageBody):
+def upload_sku_image(batch_id: str, body: SkuImageBody, request: Request):
     """给批次里某个 SKU 补规格图(浏览器上传单张图)。
 
     落盘到 IMAGE_DIR/{批次id}/{sha256}.{ext}, 返回 local:// 引用;
     前端拿到引用后写回该行 sku_image, 再 PUT /import/{id}/items 持久化。
     引用格式必须与 _local_image 的校验一致, 否则预览/上传素材会失败。
     """
-    batch_or_404(batch_id)
+    shop_id = _current_shop_id(request)
+    batch_or_404(batch_id, shop_id)
     try:
         content = base64.b64decode(body.content_base64 or "")
     except Exception as exc:
@@ -1416,14 +1740,19 @@ def upload_sku_image(batch_id: str, body: SkuImageBody):
 
 
 @app.get("/images/preview")
-def preview_image(ref: str):
+def preview_image(ref: str, request: Request = None):
     """预览批次里的图片(供浏览器显示纯文本路径无法渲染的图)。
 
     支持两种引用:
       - local://{批次id}/{hash}.{ext}   浏览器上传或懒拷贝落盘后的本地图
       - disk:{共享盘绝对路径}            图片直读扫描写入的引用
-    出于安全只允许读取 ALLOWED_IMAGE_ROOTS 下的文件, 否则参数可读任意文件。
+    出于安全只允许读取白名单(店铺 image_root + ALLOWED_IMAGE_ROOTS)下的文件, 否则参数可读任意文件。
     """
+    shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
+    shop_root = shop_registry.image_root_for(shop_id)
+    allowed_roots = list(dict.fromkeys(
+        ([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)
+    ))
     source = str(ref or "").strip()
     if source.startswith("local://"):
         found = _local_image(source)
@@ -1433,7 +1762,7 @@ def preview_image(ref: str):
     elif is_share_image(source):
         path = os.path.abspath(source[len(SHARE_PREFIX):])
         # 用 commonpath 判断而非 startswith: 否则 '...\images_evil\x.jpg' 会命中 '...\images'
-        if not _within_allowed_roots(path) or not os.path.isfile(path):
+        if not _within_allowed_roots(path, allowed_roots) or not os.path.isfile(path):
             raise HTTPException(404, "图片不存在或不在允许的图片目录内")
         with open(path, "rb") as image_file:
             content = image_file.read()
@@ -1445,8 +1774,14 @@ def preview_image(ref: str):
     return StreamingResponse(io.BytesIO(content), media_type=media)
 
 
-def batch_or_404(batch_id):
-    conn = db(); row = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone(); conn.close()
+def batch_or_404(batch_id, shop_id=None):
+    """按 ID 取批次。若传了 shop_id，则校验归属；未传则不校验（兼容旧调用）。"""
+    conn = db()
+    if shop_id:
+        row = conn.execute("SELECT * FROM batches WHERE id=? AND shop_id=?", (batch_id, shop_id)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+    conn.close()
     if not row: raise HTTPException(404, "批次不存在")
     data = dict(row); data["items"] = json.loads(data.pop("rows_json")); data["products"] = group_products(data["items"]); data["mappings"] = json.loads(data.pop("mappings_json")); return data
 
@@ -1480,43 +1815,55 @@ def get_batch_cached(batch_id: str) -> dict:
 
 
 @app.get("/import/{batch_id}")
-def get_batch(batch_id: str):
-    return {"ok": True, "result": batch_or_404(batch_id)}
+def get_batch(batch_id: str, request: Request):
+    shop_id = _current_shop_id(request)
+    return {"ok": True, "result": batch_or_404(batch_id, shop_id)}
 
 
 @app.put("/import/{batch_id}/items")
-def update_items(batch_id: str, body: ItemsBody):
-    batch = batch_or_404(batch_id); rows = body.items
+def update_items(batch_id: str, body: ItemsBody, request: Request):
+    shop_id = _current_shop_id(request)
+    batch = batch_or_404(batch_id, shop_id); rows = body.items
     errors = sum(bool(row.get("errors")) for row in rows)
-    conn = db(); conn.execute("UPDATE batches SET rows_json=?,status=?,valid=?,errors=? WHERE id=?", (json.dumps(rows, ensure_ascii=False), "待校验" if errors else "待发布", len(rows)-errors, errors, batch_id)); conn.commit(); conn.close()
+    conn = db(); conn.execute("UPDATE batches SET rows_json=?,status=?,valid=?,errors=? WHERE id=? AND shop_id=?", (json.dumps(rows, ensure_ascii=False), "待校验" if errors else "待发布", len(rows)-errors, errors, batch_id, shop_id)); conn.commit(); conn.close()
     _invalidate_batch_cache(batch_id)
     products = group_products(rows)
     return {"ok": True, "result": {"total": len(rows), "product_count": len(products), "valid": len(rows)-errors, "errors": errors, "product_errors": sum(bool(product["errors"]) for product in products)}}
 
 
 @app.put("/import/{batch_id}/mappings")
-def update_mappings(batch_id: str, body: MappingsBody):
-    batch_or_404(batch_id); conn = db(); conn.execute("UPDATE batches SET mappings_json=? WHERE id=?", (json.dumps(body.mappings, ensure_ascii=False), batch_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id); return {"ok": True, "result": body.mappings}
+def update_mappings(batch_id: str, body: MappingsBody, request: Request):
+    shop_id = _current_shop_id(request)
+    batch_or_404(batch_id, shop_id); conn = db(); conn.execute("UPDATE batches SET mappings_json=? WHERE id=? AND shop_id=?", (json.dumps(body.mappings, ensure_ascii=False), batch_id, shop_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id); return {"ok": True, "result": body.mappings}
 
 
 @app.post("/import/{batch_id}/validate")
-def validate(batch_id: str):
-    batch = batch_or_404(batch_id); rows = batch["items"]; seen = set()
+def validate(batch_id: str, request: Request):
+    shop_id = _current_shop_id(request)
+    batch = batch_or_404(batch_id, shop_id); rows = batch["items"]; seen = set()
     for row in rows:
         errors = [e for e in row.get("errors", []) if e not in ("商品编码重复", "SKU编码重复")]
         key = row.get("product_code", "")
         sku = row.get("sku_code", "")
         if key and sku and (key, sku) in seen: errors.append("SKU编码重复")
         seen.add((key, sku)); row["errors"] = errors
-    return update_items(batch_id, ItemsBody(items=rows))
+    # 复用 update_items 落库; 必须把 request 透传过去, 否则它会拿不到店铺上下文(P1 加 shop_id 后新增的参数)
+    return update_items(batch_id, ItemsBody(items=rows), request)
 
 
 @app.post("/import/{batch_id}/publish")
-def publish(batch_id: str, body: PublishBody):
-    batch = batch_or_404(batch_id)
+def publish(batch_id: str, body: PublishBody, request: Request):
+    shop_id = _current_shop_id(request)
+    _verify_shop(shop_id)
+    operator = _current_operator(request)
+    batch = batch_or_404(batch_id, shop_id)
     if batch["errors"]: raise HTTPException(400, "仍有校验错误，不能发布")
+    # 校验所选平台在该店铺下都配置了
     platforms = [p for p in body.platforms if p in ("wechat", "xhs")]
     if not platforms: raise HTTPException(400, "至少选择一个发布平台")
+    for p in platforms:
+        if not shop_registry.has_platform(shop_id, p):
+            raise HTTPException(400, f"当前店铺未配置 {p} 平台")
     # 按 product_codes 过滤(分批发布);不传则全量
     products = batch["products"]
     if body.product_codes:
@@ -1531,7 +1878,7 @@ def publish(batch_id: str, body: PublishBody):
     pending = []
     for product in products:
         for platform in platforms:
-            row = check_conn.execute("SELECT * FROM publish_items WHERE batch_id=? AND product_code=? AND platform=? ORDER BY id DESC LIMIT 1", (batch_id, product["product_code"], platform)).fetchone()
+            row = check_conn.execute("SELECT * FROM publish_items WHERE shop_id=? AND batch_id=? AND product_code=? AND platform=? ORDER BY id DESC LIMIT 1", (shop_id, batch_id, product["product_code"], platform)).fetchone()
             # deleted=核对后确认平台商品已被删除, cancelled=人工停掉: 都不算"发过", 必须放行重新发,
             # 否则运营在平台后台删完商品后, 这一批永远卡在"已有发布任务，未重复创建"。
             if row and row["status"] not in ("deleted", "cancelled"):
@@ -1552,17 +1899,17 @@ def publish(batch_id: str, body: PublishBody):
     # 分批发布(带了 product_codes) = 运营明确只要发这几件, 标记优先, 插到队列前面走
     partial = bool(body.product_codes)
     priority = 1 if partial else 0
-    conn.execute("INSERT INTO publish_jobs(id,batch_id,platforms_json,status,total,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (job_id, batch_id, json.dumps(platforms), "queued", total, now(), now()))
+    conn.execute("INSERT INTO publish_jobs(id,shop_id,batch_id,platforms_json,status,total,operator,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, shop_id, batch_id, json.dumps(platforms), "queued", total, operator, now(), now()))
     for product_code, platform in (pending or [(product["product_code"], platform) for product in products for platform in platforms]):
-        conn.execute("INSERT INTO publish_items(job_id,batch_id,product_code,platform,status,priority) VALUES(?,?,?,?,?,?)", (job_id, batch_id, product_code, platform, "queued", priority))
-    conn.execute("UPDATE batches SET status=? WHERE id=?", ("发布任务已创建", batch_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id)
+        conn.execute("INSERT INTO publish_items(job_id,shop_id,batch_id,product_code,platform,status,priority) VALUES(?,?,?,?,?,?,?)", (job_id, shop_id, batch_id, product_code, platform, "queued", priority))
+    conn.execute("UPDATE batches SET status=? WHERE id=? AND shop_id=?", ("发布任务已创建", batch_id, shop_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id)
     message = f"已创建发布任务({len(products)} 件商品 × {len(platforms)} 平台)" if partial else "发布任务已入队，后台将持续执行"
     return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "message": message}
 
 
 @app.get("/publish-status")
-def publish_status():
-    """【发布状态】按商品编码汇总**所有批次**的发布记录。
+def publish_status(request: Request):
+    """【发布状态】按商品编码汇总**当前店铺所有批次**的发布记录。
 
     为什么按商品、而不是按批次:
       运营的常见做法是"重新导入一次货盘表再发", 而每次导入都会生成一个新批次。
@@ -1576,9 +1923,11 @@ def publish_status():
 
     返回: {商品编码: {"platforms": {平台: {状态: 条数}}, "last_success_at": ISO时间}}
     """
+    shop_id = _current_shop_id(request)
     conn = db()
     rows = conn.execute("SELECT product_code, platform, status, COUNT(*) n, MAX(finished_at) last_at "
-                        "FROM publish_items GROUP BY product_code, platform, status").fetchall()
+                        "FROM publish_items WHERE shop_id=? GROUP BY product_code, platform, status",
+                        (shop_id,)).fetchall()
     conn.close()
     result = {}
     for row in rows:
@@ -1599,11 +1948,23 @@ ITEM_UNKNOWN = "unknown"  # 查不动(网络/鉴权/其它), 不能据此改状�
 
 # "商品不存在"的判定特征(已对官方文档):
 #   微信 获取商品: errcode 10020052 = 商品不存在; product.status=6 = 回收站(后台删除后落到这里)
-#   小红书 删除后没有单独的"不存在"错误码, 只能按错误文案兜底 → 拿不准就判 unknown 保留原状
+#   小红书 2026-09-16 实测: 查已删除商品返回
+#       {"detail":"[product.getItemInfo] 调用失败: error_code=-5000500 item not exist"}
+#     即错误码 -5000500 + 文案 "item not exist"。
+#     ⚠️ 这里仍然**只按文案**匹配、不认错误码: -5000500 在微信侧是"标题重复"，
+#        疑似是跨平台的通用码；只认数字码可能把"标题重复"误判成"商品已删除"。
+#        文案 "item not exist" 已经能精确命中这个场景，更安全。
 # 注意别用过于宽泛的词(如裸的"不存在"): 微信的"运费模板不存在""类目不存在"等也会命中,
 # 会把在售商品误判成已删除, 所以微信只认自己的错误码和明确提到商品的文案。
+# ⚠️ 小红书同理, 而且更要收紧: "not found" 正是 Starlette/FastAPI 默认 404 的原文({"detail":"Not Found"}),
+#   一旦把它当删除信号, 权限/参数/路径类报错都会命中 →
+#   批量把 success 改 deleted → 前端变"未发布" → 幂等保护放行 → 运营重发 → 平台上出现重复商品。
+#   所以这里只认"明确指向商品"的文案; 拿不准一律 unknown(状态不变)。
 _WECHAT_GONE_MARKERS = ("10020052", "商品不存在", "商品已删除", "商品在回收站")
-_XHS_GONE_MARKERS = ("不存在", "not exist", "not_exist", "not found", "已删除")
+_XHS_GONE_MARKERS = (
+    "商品不存在", "商品已删除",
+    "item not exist", "item_not_exist", "item not found",
+)
 
 
 def _http_error_detail(exc):
@@ -1615,7 +1976,7 @@ def _http_error_detail(exc):
         return str(exc)[:500]
 
 
-def platform_item_state(platform, product_id):
+def platform_item_state(platform, product_id, shop_id=None):
     """核对该商品在平台上还在不在, 返回 (state, 说明)。
 
     只有平台**明确**说商品不存在/已删除时才返回 gone; 网络超时、连接失败、鉴权过期
@@ -1630,11 +1991,12 @@ def platform_item_state(platform, product_id):
     else:
         return ITEM_UNKNOWN, f"不支持的平台：{platform}"
     try:
-        data = _http_get_json(url, timeout=30)
+        data = _http_get_json(url, timeout=30, shop_id=shop_id)
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
         markers = _WECHAT_GONE_MARKERS if platform == "wechat" else _XHS_GONE_MARKERS
-        if any(marker in detail for marker in markers):
+        lowered = str(detail).lower()
+        if any(marker.lower() in lowered for marker in markers):
             return ITEM_GONE, detail
         return ITEM_UNKNOWN, detail
     except Exception as exc:
@@ -1646,8 +2008,22 @@ def platform_item_state(platform, product_id):
         if str(product.get("status")) == "6":
             return ITEM_GONE, "商品在平台回收站（后台已删除）"
         return ITEM_EXISTS, ""
-    # 小红书: getItemInfo 正常返回的字段结构不稳, 只认"接口报错"这一种删除信号,
-    # 200 就认为商品还在(宁可漏判, 也不要把在售商品误标成未发布)
+    # 小红书: 200 也要看返回体。商品被后台删掉后, 网关很可能回 200 + 空 result 而不是报错,
+    # 只看"接口有没有报错"会把已删商品一直当成"还在", 核对等于没做(小红书又是失败/删除的重灾区)。
+    # ⚠️ 该判定尚未实测: 请拿一个确实已在后台删掉的小红书 itemId 调一次 GET /items/{id},
+    #    把真实返回(是报错? 空 result? 还是别的结构)补记到本注释, 再确认这条判定可靠。
+    result = data.get("result")
+    if data.get("ok") is False:
+        # 200 但业务失败 → 不下结论(保留原状态)
+        return ITEM_UNKNOWN, f"平台返回业务失败：{str(data.get('detail') or data.get('message') or data)[:200]}"
+    if not result:
+        # 空 result: 平台确实没给商品数据 → 判定已删除(把原始返回带进 error, 便于事后复盘)
+        return ITEM_GONE, f"平台未返回商品数据：{str(data)[:200]}"
+    if not isinstance(result, dict):
+        return ITEM_UNKNOWN, f"返回结构无法识别：{str(result)[:200]}"
+    if not (result.get("itemInfo") or result.get("itemId") or result.get("item_id") or result.get("id")):
+        # 有返回但结构不认识 → 不结论(宁可漏判, 也不要把在售商品误标成未发布)
+        return ITEM_UNKNOWN, f"返回结构无法识别：{str(result)[:200]}"
     return ITEM_EXISTS, ""
 
 
@@ -1657,7 +2033,7 @@ class VerifyPublishStatusBody(BaseModel):
 
 
 @app.post("/publish-status/verify")
-def verify_publish_status(body: VerifyPublishStatusBody):
+def verify_publish_status(body: VerifyPublishStatusBody, request: Request):
     """【核对发布状态】把本地"已发布"记录拿去平台核一遍, 已删掉的改回"未发布"。
 
     为什么需要: 运营会在平台后台把商品删掉, 但本地 publish_items 还留着 success,
@@ -1667,14 +2043,15 @@ def verify_publish_status(body: VerifyPublishStatusBody):
     处理方式: 平台确认不存在的记录状态改成 deleted(前端按"未发布"处理, 且幂等保护放行);
     查不动的保持原状(unknown), 并在返回里提示, 由运营用 mode=reset 人工兜底。
     """
+    shop_id = _current_shop_id(request)
     conn = db()
     sql = ("SELECT id, product_code, platform, platform_product_id, finished_at FROM publish_items "
-           "WHERE status IN ('success','partial') AND COALESCE(platform_product_id,'')<>''")
-    params = []
+           "WHERE shop_id=? AND status IN ('success','partial') AND COALESCE(platform_product_id,'')<>''")
+    params = [shop_id]
     if body.product_codes:
         codes = list({str(code) for code in body.product_codes})
         sql += f" AND product_code IN ({','.join('?' for _ in codes)})"
-        params = codes
+        params.extend(codes)
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     # 同一商品+平台可能有多条历史成功记录: 只拿最新那条的 platform_product_id 去平台核对
@@ -1694,7 +2071,7 @@ def verify_publish_status(body: VerifyPublishStatusBody):
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=min(6, len(targets))) as pool:
-            futures = {pool.submit(platform_item_state, row["platform"], row["platform_product_id"]): row for row in targets}
+            futures = {pool.submit(platform_item_state, row["platform"], row["platform_product_id"], shop_id): row for row in targets}
             for future in as_completed(futures):
                 row = futures[future]
                 try:
@@ -1706,10 +2083,17 @@ def verify_publish_status(body: VerifyPublishStatusBody):
     for row in targets:
         state, note = states.get((row["product_code"], row["platform"]), (ITEM_UNKNOWN, ""))
         if state == ITEM_GONE:
-            # 该商品+平台的所有成功记录一起改: 汇总接口按状态计数, 漏改一条就还是"已发布"
+            # 只改「核对过的那条身份」: WHERE 必须带上 platform_product_id。
+            # 判定用的 platform_product_id 是上面 SELECT 时读到的, 而这里原本按"商品+平台"宽条件更新;
+            # 若两步之间运营正好重发成功(新 success 行落库), 这条新行会被一起改成 deleted →
+            # 刚发成功的商品显示"未发布" → 再发一次 → 平台上出现重复商品(只能人工删)。
+            # 带上 platform_product_id 后, 并发新增的记录平台 ID 必然不同, 不会被误伤;
+            # 同一身份的其它历史记录仍一起改, 保证汇总接口按状态计数时不会漏成"已发布"。
             conn.execute("UPDATE publish_items SET status='deleted', error=? "
-                         "WHERE product_code=? AND platform=? AND status IN ('success','partial')",
-                         (f"平台已删除（{now()} 核对）：{note}"[:500], row["product_code"], row["platform"]))
+                         "WHERE shop_id=? AND product_code=? AND platform=? AND platform_product_id=? "
+                         "AND status IN ('success','partial')",
+                         (f"平台已删除（{now()} 核对，平台ID={row['platform_product_id']}）：{note}"[:500],
+                          shop_id, row["product_code"], row["platform"], row["platform_product_id"]))
             deleted_products.add(row["product_code"])
         elif state == ITEM_EXISTS:
             exists_count += 1
@@ -1724,21 +2108,23 @@ def verify_publish_status(body: VerifyPublishStatusBody):
 
 
 @app.get("/jobs/{job_id}")
-def job(job_id: str):
-    conn = db(); j = conn.execute("SELECT * FROM publish_jobs WHERE id=?", (job_id,)).fetchone()
+def job(job_id: str, request: Request):
+    shop_id = _current_shop_id(request)
+    conn = db(); j = conn.execute("SELECT * FROM publish_jobs WHERE id=? AND shop_id=?", (job_id, shop_id)).fetchone()
     if not j: conn.close(); raise HTTPException(404, "发布任务不存在")
-    items = [dict(r) for r in conn.execute("SELECT * FROM publish_items WHERE job_id=? ORDER BY id", (job_id,)).fetchall()]
+    items = [dict(r) for r in conn.execute("SELECT * FROM publish_items WHERE job_id=? AND shop_id=? ORDER BY id", (job_id, shop_id)).fetchall()]
     conn.close()
     return {"ok": True, "result": {"job_id": job_id, "batch_id": j["batch_id"], "status": j["status"], "total": j["total"], "processed": j["processed"], "success": j["success"], "failed": j["failed"], "items": items}}
 
 
 @app.get("/image-cache/stats")
-def image_cache_stats():
+def image_cache_stats(request: Request):
     """图片上传缓存统计:DB 条目数、内存命中、DB 命中、未命中次数。"""
+    shop_id = _current_shop_id(request)
     conn = db()
-    total = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache").fetchone()["c"]
-    wechat_count = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE platform='wechat'").fetchone()["c"]
-    xhs_count = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE platform='xhs'").fetchone()["c"]
+    total = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE shop_id=?", (shop_id,)).fetchone()["c"]
+    wechat_count = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE shop_id=? AND platform='wechat'", (shop_id,)).fetchone()["c"]
+    xhs_count = conn.execute("SELECT COUNT(*) as c FROM image_upload_cache WHERE shop_id=? AND platform='xhs'", (shop_id,)).fetchone()["c"]
     conn.close()
     total_lookups = _image_cache_hit_mem + _image_cache_hit_db + _image_cache_miss
     hit_rate = round((_image_cache_hit_mem + _image_cache_hit_db) / total_lookups * 100, 1) if total_lookups else 0
@@ -1751,13 +2137,14 @@ def image_cache_stats():
 
 
 @app.delete("/image-cache")
-def clear_image_cache():
-    """清空图片上传缓存(内存 + SQLite)。用于平台素材被删、强制重传等场景。"""
+def clear_image_cache(request: Request):
+    """清空当前店铺的图片上传缓存(内存 + SQLite)。用于平台素材被删、强制重传等场景。"""
+    shop_id = _current_shop_id(request)
     global _image_cache_hit_mem, _image_cache_hit_db, _image_cache_miss
     _IMAGE_CACHE_MEM.clear()
     _IMAGE_CACHE_ORDER.clear()
     _image_cache_hit_mem = _image_cache_hit_db = _image_cache_miss = 0
-    conn = db(); conn.execute("DELETE FROM image_upload_cache"); conn.commit(); conn.close()
+    conn = db(); conn.execute("DELETE FROM image_upload_cache WHERE shop_id=?", (shop_id,)); conn.commit(); conn.close()
     return {"ok": True, "message": "图片上传缓存已清空"}
 
 
@@ -1766,40 +2153,42 @@ def clear_image_cache():
 # 运营人工确认一次类目组后存入此表,后续批次自动命中,不再重复选。
 # ==================================================================
 @app.post("/jobs/{job_id}/retry")
-def retry_job(job_id: str, body: RetryBody):
+def retry_job(job_id: str, body: RetryBody, request: Request):
     """仅重新排队失败项；部分成功项不自动重试，避免重复创建平台商品。"""
+    shop_id = _current_shop_id(request)
     conn = db()
-    if not conn.execute("SELECT id FROM publish_jobs WHERE id=?", (job_id,)).fetchone():
+    if not conn.execute("SELECT id FROM publish_jobs WHERE id=? AND shop_id=?", (job_id, shop_id)).fetchone():
         conn.close()
         raise HTTPException(404, "发布任务不存在")
     requested = set(body.item_ids or [])
     if requested:
         placeholders = ",".join("?" for _ in requested)
-        rows = conn.execute(f"SELECT * FROM publish_items WHERE job_id=? AND id IN ({placeholders})", [job_id, *requested]).fetchall()
+        rows = conn.execute(f"SELECT * FROM publish_items WHERE shop_id=? AND job_id=? AND id IN ({placeholders})", [shop_id, job_id, *requested]).fetchall()
         if requested - {row["id"] for row in rows}:
             conn.close()
             raise HTTPException(400, "只能重试当前任务中的商品")
     else:
-        rows = conn.execute("SELECT * FROM publish_items WHERE job_id=? AND status='failed'", (job_id,)).fetchall()
+        rows = conn.execute("SELECT * FROM publish_items WHERE shop_id=? AND job_id=? AND status='failed'", (shop_id, job_id)).fetchall()
     conn.execute("BEGIN IMMEDIATE")
     retried = skipped = 0
     for row in rows:
         if row["status"] == "failed":
-            conn.execute("UPDATE publish_items SET status='queued', error=NULL, started_at=NULL, finished_at=NULL WHERE id=?", (row["id"],))
+            conn.execute("UPDATE publish_items SET status='queued', error=NULL, started_at=NULL, finished_at=NULL WHERE id=? AND shop_id=?", (row["id"], shop_id))
             retried += 1
         elif row["status"] == "partial":
             skipped += 1
     if retried:
-        conn.execute("UPDATE publish_jobs SET status='queued', processed=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status IN ('success','partial')), success=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status='success'), failed=(SELECT COUNT(*) FROM publish_items WHERE job_id=? AND status='partial'), updated_at=? WHERE id=?", (job_id, job_id, job_id, now(), job_id))
+        conn.execute("UPDATE publish_jobs SET status='queued', processed=(SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status IN ('success','partial')), success=(SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status='success'), failed=(SELECT COUNT(*) FROM publish_items WHERE shop_id=? AND job_id=? AND status='partial'), updated_at=? WHERE id=? AND shop_id=?", (shop_id, job_id, shop_id, job_id, shop_id, job_id, now(), job_id, shop_id))
     conn.commit(); conn.close()
     message = f"已将 {retried} 个失败商品重新排队" if retried else ("部分成功项不会自动重试，以免重复创建平台商品" if skipped else "当前没有可重试的失败商品")
     return {"ok": True, "job_id": job_id, "retried": retried, "skipped": skipped, "message": message}
 
 
 @app.get("/category-aliases")
-def list_aliases():
+def list_aliases(request: Request):
+    shop_id = _current_shop_id(request)
     conn = db()
-    rows = conn.execute("SELECT * FROM category_aliases ORDER BY updated_at DESC").fetchall()
+    rows = conn.execute("SELECT * FROM category_aliases WHERE shop_id=? ORDER BY updated_at DESC", (shop_id,)).fetchall()
     conn.close()
     return {"ok": True, "result": [{
         "id": r["id"], "internal_category": r["internal_category"],
@@ -1810,12 +2199,13 @@ def list_aliases():
 
 
 @app.post("/category-aliases")
-def save_alias(body: AliasBody):
+def save_alias(body: AliasBody, request: Request):
+    shop_id = _current_shop_id(request)
     key = (body.internal_category or "").strip()
     if not key:
         raise HTTPException(400, "internal_category 不能为空")
     conn = db()
-    existing = conn.execute("SELECT wechat_json, xhs_json FROM category_aliases WHERE internal_category=?", (key,)).fetchone()
+    existing = conn.execute("SELECT wechat_json, xhs_json FROM category_aliases WHERE shop_id=? AND internal_category=?", (shop_id, key)).fetchone()
     # 合并语义:本次未传的一侧保留旧值(微信和小红书经常分两次确认)
     wechat = body.wechat if body.wechat is not None else (json.loads(existing["wechat_json"]) if existing and existing["wechat_json"] else None)
     xhs = body.xhs if body.xhs is not None else (json.loads(existing["xhs_json"]) if existing and existing["xhs_json"] else None)
@@ -1823,19 +2213,20 @@ def save_alias(body: AliasBody):
         conn.close()
         raise HTTPException(400, "wechat 和 xhs 至少提供一个")
     conn.execute(
-        """INSERT INTO category_aliases(internal_category, wechat_json, xhs_json, updated_at)
-           VALUES(?,?,?,?)
-           ON CONFLICT(internal_category) DO UPDATE SET
+        """INSERT INTO category_aliases(shop_id, internal_category, wechat_json, xhs_json, updated_at)
+           VALUES(?,?,?,?,?)
+           ON CONFLICT(shop_id, internal_category) DO UPDATE SET
              wechat_json=excluded.wechat_json, xhs_json=excluded.xhs_json, updated_at=excluded.updated_at""",
-        (key, json.dumps(wechat, ensure_ascii=False) if wechat else None,
+        (shop_id, key, json.dumps(wechat, ensure_ascii=False) if wechat else None,
          json.dumps(xhs, ensure_ascii=False) if xhs else None, now()))
     conn.commit(); conn.close()
     return {"ok": True, "result": {"internal_category": key, "wechat": wechat, "xhs": xhs}}
 
 
 @app.delete("/category-aliases/{alias_id}")
-def delete_alias(alias_id: int):
-    conn = db(); conn.execute("DELETE FROM category_aliases WHERE id=?", (alias_id,)); conn.commit(); conn.close()
+def delete_alias(alias_id: int, request: Request):
+    shop_id = _current_shop_id(request)
+    conn = db(); conn.execute("DELETE FROM category_aliases WHERE id=? AND shop_id=?", (alias_id, shop_id)); conn.commit(); conn.close()
     return {"ok": True}
 
 
@@ -1847,8 +2238,17 @@ WECHAT_API_BASE = os.environ.get("WECHAT_API_BASE", "http://localhost:8000")
 XHS_API_BASE = os.environ.get("XHS_API_BASE", "http://localhost:8010")
 
 
-def _http_get_json(url, timeout=60):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+def _http_get_json(url, timeout=60, shop_id=None, extra_headers=None):
+    headers = {}
+    if shop_id:
+        headers[SHOP_HEADER] = shop_id
+    if extra_headers:
+        headers.update(extra_headers)
+    if headers:
+        req = urllib.request.Request(url, headers=headers)
+    else:
+        req = url
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -1960,7 +2360,8 @@ def alias_template():
 
 
 @app.post("/category-aliases/import")
-def import_aliases(body: AliasImportBody):
+def import_aliases(body: AliasImportBody, request: Request):
+    shop_id = _current_shop_id(request)
     try:
         raw = base64.b64decode(body.content_base64)
     except Exception:
@@ -1998,15 +2399,15 @@ def import_aliases(body: AliasImportBody):
         conn = db()
         for internal, wechat, xhs in resolved:
             # 合并语义与单条保存一致:本次未解析出的一侧保留旧值
-            existing = conn.execute("SELECT wechat_json, xhs_json FROM category_aliases WHERE internal_category=?", (internal,)).fetchone()
+            existing = conn.execute("SELECT wechat_json, xhs_json FROM category_aliases WHERE shop_id=? AND internal_category=?", (shop_id, internal)).fetchone()
             merged_wechat = wechat or (json.loads(existing["wechat_json"]) if existing and existing["wechat_json"] else None)
             merged_xhs = xhs or (json.loads(existing["xhs_json"]) if existing and existing["xhs_json"] else None)
             conn.execute(
-                """INSERT INTO category_aliases(internal_category, wechat_json, xhs_json, updated_at)
-                   VALUES(?,?,?,?)
-                   ON CONFLICT(internal_category) DO UPDATE SET
+                """INSERT INTO category_aliases(shop_id, internal_category, wechat_json, xhs_json, updated_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(shop_id, internal_category) DO UPDATE SET
                      wechat_json=excluded.wechat_json, xhs_json=excluded.xhs_json, updated_at=excluded.updated_at""",
-                (internal, json.dumps(merged_wechat, ensure_ascii=False) if merged_wechat else None,
+                (shop_id, internal, json.dumps(merged_wechat, ensure_ascii=False) if merged_wechat else None,
                  json.dumps(merged_xhs, ensure_ascii=False) if merged_xhs else None, now()))
         conn.commit(); conn.close()
     return {"ok": True, "result": {"imported": imported, "failed": failed, "skipped": skipped, "report": report}}

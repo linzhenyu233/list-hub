@@ -1,0 +1,78 @@
+{
+  "_readme": [
+    "多店铺注册表模板 —— 复制为项目根目录的 shops.json 后按实际店铺填写。",
+    "",
+    "【为什么这个文件可以进仓库】密钥一律写成 ${环境变量名}，真值放 .env（或系统环境变量），",
+    "  启动时解析。所以 shops.json 里没有明文密钥，部署方式与改造前完全一致：你继续维护 .env 就行。",
+    "  也支持 ${VAR:-默认值}（变量缺失时用默认值）。",
+    "  引用到的变量若没配，启动会打印 WARN 并按空值处理（该店对应平台不可用）。",
+    "",
+    "【token 不写在这里】小红书 accessToken/refreshToken 按店铺分文件存：",
+    "  xhs/tokens/<shop_id>.json。首次接入用 POST /token/code（带 X-Shop-Id）授权，之后自动续期。",
+    "  这里的 access_token/refresh_token 保持空串即可。",
+    "",
+    "【一个 shop = 一个运营单元】同时含微信 + 小红书两套配置，不是单平台单店。",
+    "  运营在前端切换 shop，切换后批次/任务/图片缓存/类目映射全部按 shop 隔离；",
+    "  某个平台不需要就把那段留空（如 \"wechat\": {}）。",
+    "",
+    "【命名】shop_id 用后台店铺名的拼音全拼（如 zuanshishijia），不要用序号（shop_01 这种）；",
+    "  不要带平台词（xhs_/wx_ 前缀），因为一个 shop 同时管两个平台。只用小写字母/数字/下划线。",
+    "  一旦启用请勿再改：数据库与 token 文件都按它归档。",
+    "",
+    "【remark 建议】写上『后台店铺名 + 一个该店的已知商品ID作为归属验证锚点』。",
+    "  日后 token/数据归属存疑时，查一下锚点商品就能确认是哪家店。",
+    "",
+    "【上线节奏】新店先 enabled=false（不出现在前端选择器、Worker 也不会领它的任务），",
+    "  等 brand_id/类目/运费模板/物流方案/image_root 都补齐、并跑通一次发布后再改为 true。",
+    "",
+    "【生效方式】三个服务启动时各读取一次，改动后必须重启对应进程（均无 --reload）。"
+  ],
+  "version": 1,
+  "default_operator": "运营",
+  "shops": [
+    {
+      "shop_id": "zuanshishijia",
+      "name": "钻石世家",
+      "enabled": true,
+      "is_default": true,
+      "wechat": {
+        "appid": "${WX_APPID}",
+        "secret": "${WX_SECRET}",
+        "brand_id": "2100000000",
+        "freight_template_id": "${WX_FREIGHT_TEMPLATE_ID}",
+        "after_sale_address_id": "${WX_AFTER_SALE_ADDRESS_ID}"
+      },
+      "xhs": {
+        "app_id": "${XHS_APP_ID}",
+        "app_secret": "${XHS_APP_SECRET}",
+        "access_token": "",
+        "refresh_token": "",
+        "brand_id": "${XHS_BRAND_ID}",
+        "category_id": "${XHS_CATEGORY_ID}",
+        "shipping_template_id": "${XHS_SHIPPING_TEMPLATE_ID}",
+        "logistics_plan_id": "${XHS_LOGISTICS_PLAN_ID}"
+      },
+      "image_root": "\\\\192.168.10.250\\电子商务部\\网销部共享\\SHINING HOUSE培育钻",
+      "remark": "现有店铺。小红书后台名：钻石世家。归属验证锚点：商品 <该店一个已知商品ID>。"
+    },
+    {
+      "shop_id": "xianshangmaodedian",
+      "name": "喜安商贸的店",
+      "enabled": false,
+      "is_default": false,
+      "wechat": {},
+      "xhs": {
+        "app_id": "${XHS_APP_ID}",
+        "app_secret": "${XHS_APP_SECRET}",
+        "access_token": "",
+        "refresh_token": "",
+        "brand_id": "",
+        "category_id": "",
+        "shipping_template_id": "",
+        "logistics_plan_id": ""
+      },
+      "image_root": "",
+      "remark": "新增店铺示例。若该店用另一个开放平台应用，请另配变量（如 XHS2_APP_ID）再在这里引用。补齐参数并跑通一次发布后再把 enabled 改为 true。"
+    }
+  ]
+}

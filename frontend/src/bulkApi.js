@@ -1,6 +1,9 @@
 import axios from 'axios'
+import { applyShopHeaders, withShopQuery } from './shopContext'
 
 const http = axios.create({ baseURL: import.meta.env.VITE_BULK_API_BASE_URL || '/bulk-api', timeout: 60000 })
+// 多店铺:每个请求都带上 X-Shop-Id / X-Operator(未选店铺时后端回退默认店)
+http.interceptors.request.use((config) => applyShopHeaders(config))
 http.interceptors.response.use((response) => response.data, (error) => {
   const status = error.response?.status
   const detail = error.response?.data?.detail
@@ -13,6 +16,8 @@ http.interceptors.response.use((response) => response.data, (error) => {
 
 export const bulkApi = {
   health: () => http.get('/health'),
+  // 多店铺:可切换的店铺清单(后端已脱敏,不含密钥)。供顶栏店铺选择器使用。
+  shops: () => http.get('/shops'),
   template: () => http.get('/template', { responseType: 'blob' }),
   importBatch: (body) => http.post('/import', body, { timeout: 600000 }),
   importHuopai: (path) => http.post('/import-huopai', { path: path || null }, { timeout: 300000 }),
@@ -44,6 +49,8 @@ export const bulkApi = {
   uploadSkuImage: (id, body) => http.post(`/batches/${id}/sku-image`, body, { timeout: 120000 }),
   // 服务端允许扫描的图片根目录白名单(前端只做下拉选择, 不能自由填任意路径)
   imageRoots: () => http.get('/image-roots'),
-  // 预览服务端图片: disk:/local:// 是服务端路径, 浏览器渲染不了, 走这个接口转成可显示 URL
-  imagePreviewUrl: (ref) => `${import.meta.env.VITE_BULK_API_BASE_URL || '/bulk-api'}/images/preview?ref=${encodeURIComponent(ref || '')}`,
+  // 预览服务端图片: disk:/local:// 是服务端路径, 浏览器渲染不了, 走这个接口转成可显示 URL。
+  // ⚠️ 这是浏览器自己发的 <img> 请求, 带不了 X-Shop-Id 自定义头, 所以用 query 传店铺 ——
+  //    否则切到别的店铺后, 图片白名单还按默认店校验, 预览会 404。
+  imagePreviewUrl: (ref) => withShopQuery(`${import.meta.env.VITE_BULK_API_BASE_URL || '/bulk-api'}/images/preview?ref=${encodeURIComponent(ref || '')}`),
 }

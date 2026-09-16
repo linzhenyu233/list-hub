@@ -44,25 +44,31 @@
 """
 import base64
 import os
+import sys
 import threading
 import time
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # 复用之前写好的微信小店客户端(脚本里的类,直接拿来用)
 from wechat_store_client import WxStore
 
+# 多店铺：从项目根读店铺注册表（shops.json，缺失则回退 .env 单店）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from runtime_config import load_project_env
+import shop_registry
+
+load_project_env()
+
 # ------------------------------------------------------------------
-# 配置:凭证从环境变量读(别写死在代码里,密钥泄露=店铺钥匙被拿走)
+# 配置（host/port/cors 仍是进程级；凭证改为按店铺取，见 store_for）
 # ------------------------------------------------------------------
-APPID = os.environ.get("WX_APPID", "")
-SECRET = os.environ.get("WX_SECRET", "")
 API_HOST = os.environ.get("WX_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("WX_API_PORT", "8000"))
 CORS_ORIGINS = [item.strip() for item in os.environ.get("CORS_ORIGINS", "*").split(",") if item.strip()]
 
 # 创建 FastAPI 应用(标题/版本会在 /docs 文档页显示)
-app = FastAPI(title="微信小店自动上链接服务", version="0.1.0")
+app = FastAPI(title="微信小店自动上链接服务", version="0.2.0")
 
 # CORS:允许前端页面跨域调用(开发期全放行,上线换成前端具体域名)
 app.add_middleware(
@@ -73,48 +79,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 全局唯一的客户端实例:所有请求共用它,access_token 缓存就不会反复失效
-store = WxStore(APPID, SECRET)
+# ------------------------------------------------------------------
+# 多店铺：每个店铺一个 WxStore 实例（access_token 缓存在实例内，互不干扰）
+# ------------------------------------------------------------------
+_STORES = {}
+_STORES_LOCK = threading.RLock()
+
+
+def shop_of(request: Request) -> dict:
+    """解析当前店铺：读 X-Shop-Id 头；不传则用默认店（兼容旧调用）。"""
+    shop_id = (request.headers.get("x-shop-id") or "").strip() if request is not None else ""
+    try:
+        return shop_registry.resolve(shop_id or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def store_for(shop: dict) -> "WxStore":
+    """按店铺返回 WxStore 实例（首次构造并缓存，之后复用其 access_token）。"""
+    shop_id = shop["shop_id"]
+    with _STORES_LOCK:
+        inst = _STORES.get(shop_id)
+        if inst is None:
+            conf = shop.get("wechat") or {}
+            appid = conf.get("appid") or ""
+            if not appid:
+                raise HTTPException(status_code=400, detail=f"店铺 {shop_id} 未配置微信小店凭证")
+            inst = WxStore(appid, conf.get("secret") or "")
+            _STORES[shop_id] = inst
+        return inst
 
 # ------------------------------------------------------------------
 # 类目树缓存:微信全量类目有 15000+ 节点,每次现拉要几十秒,
 # 批量映射时前端每个商品都触发一次会把流程卡死,所以缓存 6 小时。
+# 多店铺：缓存 key 一律以 shop_id 打头，不同店铺的类目/商品数据不混。
 # ------------------------------------------------------------------
-_CAT_CACHE = {"nodes": None, "ts": 0.0}
+_CAT_CACHE = {}          # shop_id -> {"nodes": [...], "ts": float}
 _CAT_CACHE_TTL = 6 * 3600
 _CACHE = {}
 _CACHE_LOCK = threading.RLock()
 
 
-def _cached(key, ttl, loader):
+def _cached(shop_id, key, ttl, loader):
+    """按 (店铺, 业务key) 缓存。key 形如 ("product_list", status, ...)。"""
+    full_key = (shop_id,) + tuple(key)
     now = time.monotonic()
     with _CACHE_LOCK:
-        entry = _CACHE.get(key)
+        entry = _CACHE.get(full_key)
         if entry and entry["expires_at"] > now:
             return entry["value"]
     value = loader()
     with _CACHE_LOCK:
-        _CACHE[key] = {"value": value, "expires_at": time.monotonic() + ttl}
+        _CACHE[full_key] = {"value": value, "expires_at": time.monotonic() + ttl}
     return value
 
 
-def _clear_cache(*prefixes):
+def _clear_cache(shop_id, *prefixes):
+    """清掉某店铺下指定前缀的缓存（不影响其他店铺）。"""
     with _CACHE_LOCK:
         for key in list(_CACHE):
-            if key and key[0] in prefixes:
+            if key and key[0] == shop_id and len(key) > 1 and key[1] in prefixes:
                 _CACHE.pop(key, None)
 
 
-def _clear_product_cache():
-    _clear_cache("product_list", "product_detail")
+def _clear_product_cache(shop_id):
+    _clear_cache(shop_id, "product_list", "product_detail")
 
 
-def get_cached_categories():
+def get_cached_categories(store, shop_id):
+    """类目树按店铺缓存（各店类目树可能不同）。"""
+    entry = _CAT_CACHE.get(shop_id)
     now = time.time()
-    if _CAT_CACHE["nodes"] is None or now - _CAT_CACHE["ts"] > _CAT_CACHE_TTL:
-        _CAT_CACHE["nodes"] = store.get_all_categories()
-        _CAT_CACHE["ts"] = now
-    return _CAT_CACHE["nodes"]
+    if not entry or entry["nodes"] is None or now - entry["ts"] > _CAT_CACHE_TTL:
+        entry = {"nodes": store.get_all_categories(), "ts": now}
+        _CAT_CACHE[shop_id] = entry
+    return entry["nodes"]
 
 
 # ==================================================================
@@ -213,13 +252,13 @@ def health():
 # 2. 测试凭证(最轻量,先确认 AppID/Secret 能不能换到 token)
 # ==================================================================
 @app.post("/token/test")
-def test_token():
-    if not APPID.startswith("wx"):
-        raise HTTPException(status_code=400,
-                            detail="未设置 WX_APPID/WX_SECRET 环境变量,请先设置再启动服务")
+def test_token(request: Request):
+    shop = shop_of(request)
+    store = store_for(shop)
     try:
         tok = store.get_access_token(force=True)   # force=True 强制重新申请
-        return {"ok": True, "token_prefix": tok[:20] + "...", "expires_in": 7200}
+        return {"ok": True, "shop_id": shop["shop_id"],
+                "token_prefix": tok[:20] + "...", "expires_in": 7200}
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -228,10 +267,12 @@ def test_token():
 # 3. 查类目(传关键词,多个词用空格分开,如 ?keyword=钻石 戒指)
 # ==================================================================
 @app.get("/categories")
-def categories(keyword: str = Query("珠宝", description="关键词,多个词用空格分隔")):
+def categories(request: Request, keyword: str = Query("珠宝", description="关键词,多个词用空格分隔")):
+    shop = shop_of(request)
+    store = store_for(shop)
     try:
         # 类目节点获取走缓存(内聚在 WxStore.get_all_categories),首次调用才真正请求微信
-        nodes = get_cached_categories()
+        nodes = get_cached_categories(store, shop["shop_id"])
         results = []
         for kw in keyword.split():
             results.extend(search_categories(nodes, kw))
@@ -244,7 +285,9 @@ def categories(keyword: str = Query("珠宝", description="关键词,多个词�
 # 4. 上传图片(传图片URL,微信转存后返回 img_url,发品时填进 head_imgs)
 # ==================================================================
 @app.post("/images/upload")
-def upload_image(body: dict = Body(..., example={"img_url": "https://你的图床/主图1.jpg"})):
+def upload_image(request: Request, body: dict = Body(..., example={"img_url": "https://你的图床/主图1.jpg"})):
+    shop = shop_of(request)
+    store = store_for(shop)
     img_url = body.get("img_url")
     if not img_url:
         raise HTTPException(status_code=400, detail="请求体需要 img_url 字段")
@@ -252,8 +295,10 @@ def upload_image(body: dict = Body(..., example={"img_url": "https://你的图�
 
 
 @app.post("/images/upload-file")
-def upload_image_file(body: dict = Body(...)):
+def upload_image_file(request: Request, body: dict = Body(...)):
     """上传 Excel 中提取出的内嵌图片。"""
+    shop = shop_of(request)
+    store = store_for(shop)
     encoded = body.get("content_base64")
     if not encoded:
         raise HTTPException(status_code=400, detail="请求体需要 content_base64 字段")
@@ -268,27 +313,33 @@ def upload_image_file(body: dict = Body(...)):
 
 
 @app.get("/freight-templates")
-def freight_templates(page_size: int = Query(100, ge=1, le=100), page_num: int = Query(1, ge=1)):
+def freight_templates(request: Request, page_size: int = Query(100, ge=1, le=100), page_num: int = Query(1, ge=1)):
     """读取微信小店运费模板(已逐个查详情补齐模板名称)。
     返回 {"templates": [{"template_id","name","is_default",...}],
-           "template_id_list": [...], "total": n}，前端下拉框直接读 templates。"""
+          "template_id_list": [...], "total": n}，前端下拉框直接读 templates。"""
+    shop = shop_of(request)
+    store = store_for(shop)
+    shop_id = shop["shop_id"]
     return ok_or_400(
         lambda: _cached(
-            ("freight_templates", page_size, page_num), 10 * 60,
+            shop_id, ("freight_templates", page_size, page_num), 10 * 60,
             lambda: store.get_freight_templates(page_size, page_num),
         )
     )
 
 
 @app.get("/category-detail")
-def category_detail(cat_id: str = Query(..., description="叶子类目 ID")):
+def category_detail(request: Request, cat_id: str = Query(..., description="叶子类目 ID")):
     """查叶子类目的属性(product_attr_list)和规格(sale_attr_list)定义。
     前端选完类目后调用,据其渲染属性录入框和规格维度。
     每个属性含 type_v2(select_one/select_many/string/integer/...)、
     value(候选值列表)、is_required(是否必填)。"""
+    shop = shop_of(request)
+    store = store_for(shop)
+    shop_id = shop["shop_id"]
     return ok_or_400(
         lambda: _cached(
-            ("category_detail", str(cat_id)), 12 * 3600,
+            shop_id, ("category_detail", str(cat_id)), 12 * 3600,
             lambda: store.get_category_detail(cat_id),
         )
     )
@@ -299,7 +350,7 @@ def category_detail(cat_id: str = Query(..., description="叶子类目 ID")):
 #    等类目审核通过后,body 里填真实类目ID就能用)
 # ==================================================================
 @app.post("/products")
-def create_product(product: dict = Body(..., examples=[{
+def create_product(request: Request, product: dict = Body(..., examples=[{
     "title": "18K金钻石戒指",
     "short_title": "18K金钻戒",
     "out_product_id": "TEST-001",
@@ -313,8 +364,10 @@ def create_product(product: dict = Body(..., examples=[{
               "stock_num": 100, "sku_attrs": []}],
 }])):
     """发布商品,返回 product_id。注意:只是草稿,需再调 /listing 上架。"""
+    shop = shop_of(request)
+    store = store_for(shop)
     result = ok_or_400(store.add_product, product)
-    _clear_product_cache()
+    _clear_product_cache(shop["shop_id"])
     return result
 
 
@@ -322,9 +375,11 @@ def create_product(product: dict = Body(..., examples=[{
 # 6. 更新商品
 # ==================================================================
 @app.post("/products/{pid}/update")
-def update_product(pid: str, product: dict = Body(...)):
+def update_product(pid: str, request: Request, product: dict = Body(...)):
+    shop = shop_of(request)
+    store = store_for(shop)
     result = ok_or_400(store.update_product, pid, product)
-    _clear_product_cache()
+    _clear_product_cache(shop["shop_id"])
     return result
 
 
@@ -332,9 +387,11 @@ def update_product(pid: str, product: dict = Body(...)):
 # 7. 上架商品(提交审核,审核通过才开卖)
 # ==================================================================
 @app.post("/products/{pid}/listing")
-def listing_product(pid: str):
+def listing_product(pid: str, request: Request):
+    shop = shop_of(request)
+    store = store_for(shop)
     result = ok_or_400(store.listing, pid)
-    _clear_product_cache()
+    _clear_product_cache(shop["shop_id"])
     return result
 
 
@@ -342,9 +399,11 @@ def listing_product(pid: str):
 # 8. 下架商品
 # ==================================================================
 @app.post("/products/{pid}/delisting")
-def delisting_product(pid: str):
+def delisting_product(pid: str, request: Request):
+    shop = shop_of(request)
+    store = store_for(shop)
     result = ok_or_400(store.delisting, pid)
-    _clear_product_cache()
+    _clear_product_cache(shop["shop_id"])
     return result
 
 
@@ -352,9 +411,11 @@ def delisting_product(pid: str):
 # 9. 删除商品(彻底删除,不可恢复;日常建议用下架代替)
 # ==================================================================
 @app.delete("/products/{pid}")
-def delete_product(pid: str):
+def delete_product(pid: str, request: Request):
+    shop = shop_of(request)
+    store = store_for(shop)
     result = ok_or_400(store.delete_product, pid)
-    _clear_product_cache()
+    _clear_product_cache(shop["shop_id"])
     return result
 
 
@@ -362,10 +423,13 @@ def delete_product(pid: str):
 # 10. 查询商品/审核状态
 # ==================================================================
 @app.get("/products/{pid}")
-def get_product(pid: str):
+def get_product(pid: str, request: Request):
+    shop = shop_of(request)
+    store = store_for(shop)
+    shop_id = shop["shop_id"]
     return ok_or_400(
         lambda: _cached(
-            ("product_detail", str(pid)), 60,
+            shop_id, ("product_detail", str(pid)), 60,
             lambda: store.get_product(pid),
         )
     )
@@ -375,13 +439,17 @@ def get_product(pid: str):
 # 11. 查询商品列表(按状态过滤,next_key 游标翻页) —— 前端商品列表页用
 # ==================================================================
 @app.get("/products")
-def list_products(status: int = Query(None, description="0=未上架 1=已上架 2=已下架,不传查全部"),
+def list_products(request: Request,
+                  status: int = Query(None, description="0=未上架 1=已上架 2=已下架,不传查全部"),
                   page_size: int = Query(10, ge=1, le=30, description="每页条数,最大30"),
                   next_key: str = Query(None, description="上一页返回的翻页游标,第一页不传")):
     """商品列表(游标翻页)。返回 {"products": [...], "next_key": 下一页游标, "total": 总数}"""
+    shop = shop_of(request)
+    store = store_for(shop)
+    shop_id = shop["shop_id"]
     return ok_or_400(
         lambda: _cached(
-            ("product_list", status, page_size, str(next_key or "")), 30,
+            shop_id, ("product_list", status, page_size, str(next_key or "")), 30,
             lambda: store.list_products(status, page_size, next_key),
         )
     )

@@ -16,7 +16,12 @@ dist/
 .env
 .env.local
 .env.*.local
+# 多店铺注册表（含各店 appid/secret/token，严禁提交；含 .bak 等备份变体）
+shops.json*
+!shops.example.json
 **/token_store.json
+# 小红书按店铺分 token 文件（xhs/tokens/<shop_id>.json）
+xhs/tokens/
 *.pem
 *.key
 *.p12
@@ -29,9 +34,11 @@ dist/
 *.sqlite3-*
 *.sqlite
 *.db
-# upload_images.py 的输出文件
+# upload_images.py 的输出文件（单店默认名 + 按店分文件名）
 uploaded_images.json
 uploaded_images.txt
+uploaded_images_*.json
+uploaded_images_*.txt
 # 批量导入的图片缓存目录（bulk_api.py 的 IMAGE_DIR）
 images/
 **/images/

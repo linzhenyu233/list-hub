@@ -55,30 +55,43 @@
 ====================================================================
 """
 import os
+import sys
 import json
 import time
 import base64
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
-# 复用 xhs_store.py 里的凭证配置(客户端类里的常量)
-from xhs_store import XhsStore, APP_ID, APP_SECRET, ACCESS_TOKEN
+# 复用 xhs_store.py 里的客户端类(凭证改为按店铺从 shop_registry 取)
+from xhs_store import XhsStore
+
+# 多店铺：从项目根读店铺注册表（shops.json，缺失则回退 .env 单店）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from runtime_config import load_project_env
+import shop_registry
+
+load_project_env()
 
 # ------------------------------------------------------------------
-# 配置:token 持久化文件(存 accessToken/refreshToken,系统重启不丢)
+# 配置:token 持久化(每个店铺一个文件,存 accessToken/refreshToken,重启不丢)
 # ------------------------------------------------------------------
-TOKEN_FILE = os.environ.get(
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 单店时代的 token 文件位置（用于首次自动迁移，避免重新授权）
+LEGACY_TOKEN_FILE = os.environ.get(
     "XHS_TOKEN_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "token_store.json"),
+    os.path.join(_BASE_DIR, "token_store.json"),
 )
-REFRESH_TOKEN = os.environ.get("XHS_REFRESH_TOKEN", "")   # 可环境变量指定初始 refreshToken
+# 多店铺:token 目录，每店一个 <shop_id>.json
+TOKEN_DIR = os.environ.get("XHS_TOKEN_DIR", os.path.join(_BASE_DIR, "tokens"))
 API_HOST = os.environ.get("XHS_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("XHS_API_PORT", "8010"))
 CORS_ORIGINS = [item.strip() for item in os.environ.get("CORS_ORIGINS", "*").split(",") if item.strip()]
+
 
 # 创建 FastAPI 应用
 app = FastAPI(title="小红书运营后台服务", version="0.2.0")
@@ -96,15 +109,17 @@ _CACHE = {}
 _CACHE_LOCK = threading.RLock()
 
 
-def _cached(key, ttl, loader, force=False):
+def _cached(shop_id, key, ttl, loader, force=False):
+    """按 (店铺, 业务key) 缓存。key 形如 ("categories", "123")。"""
+    full_key = (shop_id,) + tuple(key)
     now = time.monotonic()
     with _CACHE_LOCK:
-        entry = _CACHE.get(key)
+        entry = _CACHE.get(full_key)
         if not force and entry and entry["expires_at"] > now:
             return entry["value"]
     value = loader()
     with _CACHE_LOCK:
-        _CACHE[key] = {"value": value, "expires_at": time.monotonic() + ttl}
+        _CACHE[full_key] = {"value": value, "expires_at": time.monotonic() + ttl}
         if len(_CACHE) > 1000:
             expired = [cache_key for cache_key, item in _CACHE.items() if item["expires_at"] <= now]
             for cache_key in expired:
@@ -112,40 +127,94 @@ def _cached(key, ttl, loader, force=False):
     return value
 
 
-def _clear_cache(*prefixes):
+def _clear_cache(shop_id, *prefixes):
+    """清掉某店铺下指定前缀的缓存（不影响其他店铺）。"""
     with _CACHE_LOCK:
         for key in list(_CACHE):
-            if key and key[0] in prefixes:
+            if key and key[0] == shop_id and len(key) > 1 and key[1] in prefixes:
                 _CACHE.pop(key, None)
 
 
-def _clear_product_cache():
-    _clear_cache("item_list", "item_detail", "item_status")
+def _clear_product_cache(shop_id):
+    _clear_cache(shop_id, "item_list", "item_detail", "item_status")
+
 
 # ==================================================================
-# Token 存储 + 自动续期
+# 多店铺：店铺解析 + 凭证
 # ==================================================================
-def _load_token() -> dict:
-    """从本地文件读 token;没有则返回空"""
-    if os.path.exists(TOKEN_FILE):
+def shop_of(request: Request) -> dict:
+    """解析当前店铺：读 X-Shop-Id 头；不传则用默认店（兼容旧调用）。"""
+    shop_id = (request.headers.get("x-shop-id") or "").strip() if request is not None else ""
+    try:
+        return shop_registry.resolve(shop_id or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def xhs_conf_of(shop: dict) -> dict:
+    """取店铺的小红书配置（app_id/app_secret/access_token/refresh_token 等）。"""
+    conf = shop.get("xhs") or {}
+    if not (conf.get("app_id") or ""):
+        raise HTTPException(status_code=400, detail=f"店铺 {shop['shop_id']} 未配置小红书凭证")
+    return conf
+
+
+def _token_file(shop_id: str) -> str:
+    """某店铺的 token 文件路径。"""
+    return os.path.join(TOKEN_DIR, f"{shop_id}.json")
+
+
+def _migrate_legacy_token():
+    """把单店时代的 token_store.json 复制给默认店铺（免重新授权）。
+
+    仅当：老文件存在、默认店的新文件不存在 时执行一次。
+    """
+    if not os.path.exists(LEGACY_TOKEN_FILE):
+        return
+    try:
+        default_sid = shop_registry.default_shop()["shop_id"]
+    except ValueError:
+        return
+    target = _token_file(default_sid)
+    if os.path.exists(target):
+        return
+    try:
+        os.makedirs(TOKEN_DIR, exist_ok=True)
+        shutil.copy2(LEGACY_TOKEN_FILE, target)
+        print(f"[xhs-token] 已将 {LEGACY_TOKEN_FILE} 复制为店铺 {default_sid} 的 token 文件")
+    except Exception as exc:
+        print(f"[xhs-token] WARN: 迁移旧 token 失败: {exc}")
+
+
+_migrate_legacy_token()
+
+# ==================================================================
+# Token 存储 + 自动续期（按店铺）
+# ==================================================================
+def _load_token(shop_id: str) -> dict:
+    """从该店铺的 token 文件读;没有则返回空"""
+    path = _token_file(shop_id)
+    if os.path.exists(path):
         try:
-            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-def _save_token(tok: dict):
-    """把 token 写回本地文件(换新 token 后必须调,否则重启丢失)"""
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+def _save_token(shop_id: str, tok: dict):
+    """把 token 写回该店铺的文件(换新 token 后必须调,否则重启丢失)"""
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    path = _token_file(shop_id)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(tok, f, ensure_ascii=False, indent=2)
 
-def _refresh_access_token():
-    tok = _load_token()
-    refresh = tok.get("refreshToken") or REFRESH_TOKEN
+def _refresh_access_token(shop_id: str, conf: dict):
+    tok = _load_token(shop_id)
+    refresh = tok.get("refreshToken") or conf.get("refresh_token")
     if not refresh:
         raise RuntimeError("没有保存 refreshToken，无法自动续期")
-    data = _xhs_call("oauth.refreshToken", {"refreshToken": refresh})
+    data = _xhs_call("oauth.refreshToken", {"refreshToken": refresh}, shop_id=shop_id)
     # 小红书 OAuth 响应用蛇形命名(access_token/refresh_token/expires_in),兼容驼峰写法
     access = data.get("accessToken") or data.get("access_token")
     if not access:
@@ -156,20 +225,20 @@ def _refresh_access_token():
         tok["refreshToken"] = rk
     exp = data.get("expiresIn") or data.get("expires_in") or 7 * 24 * 3600
     tok["expireAt"] = int(time.time()) + int(exp)
-    _save_token(tok)
+    _save_token(shop_id, tok)
     return access
 
-def _get_access_token() -> str:
-    """取当前 accessToken(文件优先,其次配置),并自动续期"""
-    tok = _load_token()
-    access = tok.get("accessToken") or ACCESS_TOKEN
-    refresh = tok.get("refreshToken") or REFRESH_TOKEN
+def _get_access_token(shop_id: str, conf: dict) -> str:
+    """取该店铺当前 accessToken(文件优先,其次店铺配置),并自动续期"""
+    tok = _load_token(shop_id)
+    access = tok.get("accessToken") or conf.get("access_token")
+    refresh = tok.get("refreshToken") or conf.get("refresh_token")
     expire_at = tok.get("expireAt", 0)
 
     # 快过期(剩<30分钟)且有 refreshToken → 自动续期
     if refresh and expire_at and time.time() > expire_at - 1800:
         try:
-            access = _refresh_access_token()
+            access = _refresh_access_token(shop_id, conf)
         except Exception:
             pass  # 续期失败不阻塞本次调用,让业务接口自己报鉴权错
     return access
@@ -178,18 +247,28 @@ def _get_access_token() -> str:
 # ==================================================================
 # 统一请求封装(签名 + 公共参数 + 完整错误信息含 error_msg)
 # ==================================================================
-def _xhs_call(method: str, payload: dict = None) -> dict:
-    """调小红书网关。成功返回 data 字段;失败抛 HTTP 400 带完整错误信息"""
+def _xhs_call(method: str, payload: dict = None, shop_id: str = None) -> dict:
+    """调小红书网关。成功返回 data 字段;失败抛 HTTP 400 带完整错误信息。
+
+    多店铺：shop_id 决定用哪家店的 appId/appSecret/accessToken。
+    未传时回退默认店铺（兼容旧调用）。
+    """
+    shop = shop_registry.resolve(shop_id or None) if not isinstance(shop_id, dict) else shop_id
+    sid = shop["shop_id"]
+    conf = xhs_conf_of(shop)
+    app_id = conf["app_id"]
+    app_secret = conf.get("app_secret") or ""
+
     access = None
     # oauth 换 token 的接口不需要 accessToken
     if method not in ("oauth.getAccessToken", "oauth.refreshToken"):
-        access = _get_access_token()
+        access = _get_access_token(sid, conf)
 
-    store = XhsStore(APP_ID, APP_SECRET, access)
+    store = XhsStore(app_id, app_secret, access)
     timestamp = str(int(time.time()))
     body = {
         "timestamp": timestamp,
-        "appId": APP_ID,
+        "appId": app_id,
         "sign": store._sign(method, timestamp),
         "version": "2.0",
         "method": method,
@@ -212,10 +291,10 @@ def _xhs_call(method: str, payload: dict = None) -> dict:
     expired = data.get("error_code") == 401 or "accessToken expired" in str(data.get("error_msg") or data.get("message") or "")
     if expired and method not in ("oauth.getAccessToken", "oauth.refreshToken"):
         try:
-            access = _refresh_access_token()
-            store = XhsStore(APP_ID, APP_SECRET, access)
+            access = _refresh_access_token(sid, conf)
+            store = XhsStore(app_id, app_secret, access)
             timestamp = str(int(time.time()))
-            retry_body = {"timestamp": timestamp, "appId": APP_ID, "sign": store._sign(method, timestamp), "version": "2.0", "method": method, **(payload or {}), "accessToken": access}
+            retry_body = {"timestamp": timestamp, "appId": app_id, "sign": store._sign(method, timestamp), "version": "2.0", "method": method, **(payload or {}), "accessToken": access}
             resp = requests.post(store.BASE, headers={"Content-Type": "application/json;charset=utf-8"}, json=retry_body, timeout=30)
             data = resp.json()
         except Exception as exc:
@@ -248,16 +327,20 @@ def health():
 
 
 @app.get("/token/info")
-def token_info():
-    """当前 token 状态:是否已配置、过期时间(前端顶部提醒运营用)"""
-    tok = _load_token()
+def token_info(request: Request):
+    """当前店铺 token 状态:是否已配置、过期时间(前端顶部提醒运营用)"""
+    shop = shop_of(request)
+    conf = xhs_conf_of(shop)
+    sid = shop["shop_id"]
+    tok = _load_token(sid)
     expire_at = tok.get("expireAt", 0)
     now = int(time.time())
     remain = max(0, expire_at - now) if expire_at else None
     return {
         "ok": True,
-        "configured": bool(tok.get("accessToken") or ACCESS_TOKEN),
-        "has_refresh_token": bool(tok.get("refreshToken") or REFRESH_TOKEN),
+        "shop_id": sid,
+        "configured": bool(tok.get("accessToken") or conf.get("access_token")),
+        "has_refresh_token": bool(tok.get("refreshToken") or conf.get("refresh_token")),
         "expire_at": expire_at,
         "remain_seconds": remain,
         "remain_days": round(remain / 86400, 2) if remain is not None else None,
@@ -265,14 +348,17 @@ def token_info():
 
 
 @app.post("/token/code")
-def token_by_code(body: dict = Body(..., example={"code": "code-xxx"})):
+def token_by_code(request: Request, body: dict = Body(..., example={"code": "code-xxx"})):
     """首次接入:用授权回调的 code 换 accessToken/refreshToken,并持久化。
     调用链:店铺主账号授权 → 浏览器地址栏拿 code → 调这里一次,以后自动续。"""
+    shop = shop_of(request)
+    xhs_conf_of(shop)
+    sid = shop["shop_id"]
     code = body.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="请求体需要 code 字段")
-    data = _xhs_call("oauth.getAccessToken", {"code": code})
-    tok = _load_token()
+    data = _xhs_call("oauth.getAccessToken", {"code": code}, shop_id=sid)
+    tok = _load_token(sid)
     # 小红书 OAuth 响应用蛇形命名,兼容驼峰写法
     ak = data.get("accessToken") or data.get("access_token")
     rk = data.get("refreshToken") or data.get("refresh_token")
@@ -282,18 +368,21 @@ def token_by_code(body: dict = Body(..., example={"code": "code-xxx"})):
     if rk:
         tok["refreshToken"] = rk
     tok["expireAt"] = int(time.time()) + int(exp)
-    _save_token(tok)
-    return {"ok": True, "result": {"accessToken": ak,
-                                   "refreshToken": rk,
-                                   "expireAt": tok["expireAt"]}}
+    _save_token(sid, tok)
+    return {"ok": True, "shop_id": sid, "result": {"accessToken": ak,
+                                                   "refreshToken": rk,
+                                                   "expireAt": tok["expireAt"]}}
 
 
 @app.post("/token/refresh")
-def token_refresh():
+def token_refresh(request: Request):
     """一键续期(accessToken 7天 / refreshToken 14天,14天内至少续一次)
     小红书官方规则:accessToken 未过期且剩余有效期 > 30分钟 时,刷新不会换发新 token"""
-    tok = _load_token()
-    refresh = tok.get("refreshToken") or REFRESH_TOKEN
+    shop = shop_of(request)
+    conf = xhs_conf_of(shop)
+    sid = shop["shop_id"]
+    tok = _load_token(sid)
+    refresh = tok.get("refreshToken") or conf.get("refresh_token")
     if not refresh:
         raise HTTPException(status_code=400, detail="没有保存 refreshToken,无法续期")
     remain = int(tok.get("expireAt", 0)) - int(time.time())
@@ -303,7 +392,7 @@ def token_refresh():
                 "result": {"expireAt": tok.get("expireAt"),
                            "remain_days": round(remain / 86400, 2),
                            "message": f"accessToken 仍有效（剩余 {round(remain / 86400, 2)} 天），按小红书规则剩余>30分钟不会换发新 token"}}
-    data = _xhs_call("oauth.refreshToken", {"refreshToken": refresh})
+    data = _xhs_call("oauth.refreshToken", {"refreshToken": refresh}, shop_id=sid)
     # 小红书 OAuth 响应用蛇形命名,兼容驼峰写法
     ak = data.get("accessToken") or data.get("access_token")
     rk = data.get("refreshToken") or data.get("refresh_token")
@@ -318,7 +407,7 @@ def token_refresh():
         tok["accessToken"] = ak
     if rk:
         tok["refreshToken"] = rk
-    _save_token(tok)
+    _save_token(sid, tok)
     return {"ok": True, "refreshed": True, "result": {"accessToken": ak,
                                                       "expireAt": tok["expireAt"]}}
 
@@ -327,13 +416,15 @@ def token_refresh():
 # 发品页:公共参数查询
 # ==================================================================
 @app.get("/categories")
-def categories(category_id: str = Query(None, description="父类目ID,不传查一级类目"),
+def categories(request: Request,
+               category_id: str = Query(None, description="父类目ID,不传查一级类目"),
                keyword: str = Query(None, description="关键词过滤(匹配类目名)")):
     """选类目。传 category_id 查子类目;不传查一级。创建商品要用叶子(isLeaf=true)。"""
+    sid = shop_of(request)["shop_id"]
     payload = {"categoryId": category_id} if category_id else {}
     data = _cached(
-        ("categories", str(category_id or "")), 12 * 3600,
-        lambda: _xhs_call("common.getCategories", payload),
+        sid, ("categories", str(category_id or "")), 12 * 3600,
+        lambda: _xhs_call("common.getCategories", payload, shop_id=sid),
     )
     cats = data.get("categoryV3s", []) if data else []
     if keyword:
@@ -342,65 +433,72 @@ def categories(category_id: str = Query(None, description="父类目ID,不传查
 
 
 @app.get("/brands")
-def brands(category_id: str = Query(..., description="末级类目ID(必填,选完类目再查)"),
+def brands(request: Request,
+           category_id: str = Query(..., description="末级类目ID(必填,选完类目再查)"),
            keyword: str = Query("", description="品牌关键词")):
     """搜索品牌(创建商品 brandId 必填,从这里查)"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("brands", str(category_id), str(keyword)), 6 * 3600,
+        sid, ("brands", str(category_id), str(keyword)), 6 * 3600,
         lambda: _xhs_call("common.brandSearch", {
-            "categoryId": category_id, "keyword": keyword, "pageNo": 1, "pageSize": 50}),
+            "categoryId": category_id, "keyword": keyword, "pageNo": 1, "pageSize": 50}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.get("/shipping-templates")
-def shipping_templates():
+def shipping_templates(request: Request):
     """运费模板列表(创建商品 shippingTemplateId 必填)"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("shipping_templates",), 10 * 60,
-        lambda: _xhs_call("common.getCarriageTemplateList", {"pageIndex": 1, "pageSize": 50}),
+        sid, ("shipping_templates",), 10 * 60,
+        lambda: _xhs_call("common.getCarriageTemplateList", {"pageIndex": 1, "pageSize": 50}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.get("/logistics-plans")
-def logistics_plans():
+def logistics_plans(request: Request):
     """物流方案列表(创建 SKU logisticsPlanId 必填,注意不是运费模板ID!)"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("logistics_plans",), 10 * 60,
-        lambda: _xhs_call("common.getLogisticsList"),
+        sid, ("logistics_plans",), 10 * 60,
+        lambda: _xhs_call("common.getLogisticsList", shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.get("/category-attributes")
-def category_attributes(category_id: str = Query(..., description="末级叶子类目ID(必填)")):
+def category_attributes(request: Request, category_id: str = Query(..., description="末级叶子类目ID(必填)")):
     """由末级类目查“商品属性”定义(common.getAttributeLists)。
     珠宝等类目发品必填:创建商品 attributes 每一项要 propertyId + valueId。
     前端据此渲染属性下拉,把运营选的“材质=18K金”翻译成平台 propertyId/valueId。
     ⚠️ 首次联调在 /docs 看真实返回:属性数组键名、每个属性候选值 valueId 结构以平台为准。"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("category_attributes", str(category_id)), 12 * 3600,
-        lambda: _xhs_call("common.getAttributeLists", {"categoryId": category_id}),
+        sid, ("category_attributes", str(category_id)), 12 * 3600,
+        lambda: _xhs_call("common.getAttributeLists", {"categoryId": category_id}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.get("/category-variations")
-def category_variations(category_id: str = Query(..., description="末级叶子类目ID(必填)")):
+def category_variations(request: Request, category_id: str = Query(..., description="末级叶子类目ID(必填)")):
     """由末级类目查“规格”定义(common.getVariations)。
     对应创建商品的 variantIds(规格维度)和每个 SKU 的 variants(规格值)。
     后台“颜色分类/重量/尺寸”这些规格维度就来自这里。
     ⚠️ 首次联调看真实返回的规格维度 id 与其规格值(valueId)结构。"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("category_variations", str(category_id)), 12 * 3600,
-        lambda: _xhs_call("common.getVariations", {"categoryId": category_id}),
+        sid, ("category_variations", str(category_id)), 12 * 3600,
+        lambda: _xhs_call("common.getVariations", {"categoryId": category_id}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.get("/attribute-values")
 def attribute_values(
+    request: Request,
     category_id: str = Query(..., description="末级叶子类目ID(必填)"),
     attribute_id: str = Query(..., description="属性或规格的 id(必填)"),
 ):
@@ -408,10 +506,11 @@ def attribute_values(
     创建商品的 attributes 要 propertyId+valueId,SKU 的 variants 要 valueId。
     attributeId 既可传属性 id(如“钻石切工”),也可传规格 id(如“颜色分类”)。
     返回 attributeValueV3s:[{valueId,valueName}]。数值型规格(如“重量/克拉”)返回空数组。"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("attribute_values", str(category_id), str(attribute_id)), 12 * 3600,
+        sid, ("attribute_values", str(category_id), str(attribute_id)), 12 * 3600,
         lambda: _xhs_call("common.getAttributeValues", {
-            "categoryId": category_id, "attributeId": attribute_id}),
+            "categoryId": category_id, "attributeId": attribute_id}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
@@ -420,8 +519,9 @@ def attribute_values(
 # 发品页:素材上传
 # ==================================================================
 @app.post("/materials/upload")
-def upload_material(body: dict = Body(..., example={"url": "https://你的图床/主图1.jpg"})):
+def upload_material(request: Request, body: dict = Body(..., example={"url": "https://你的图床/主图1.jpg"})):
     """传图:下载公网图片 → 上传小红书素材,返回素材URL(填进 images 字段)"""
+    sid = shop_of(request)["shop_id"]
     url = body.get("url")
     if not url:
         raise HTTPException(status_code=400, detail="请求体需要 url 字段")
@@ -432,13 +532,14 @@ def upload_material(body: dict = Body(..., example={"url": "https://你的图床
     b64 = base64.b64encode(img).decode("utf-8")
     name = url.split("/")[-1][:40] or "material.jpg"
     data = _xhs_call("material.uploadMaterial", {
-        "name": name, "type": "IMAGE", "materialContent": b64})
+        "name": name, "type": "IMAGE", "materialContent": b64}, shop_id=sid)
     return {"ok": True, "result": data}
 
 
 @app.post("/materials/upload-file")
-def upload_material_file(body: dict = Body(...)):
+def upload_material_file(request: Request, body: dict = Body(...)):
     """上传 Excel 中提取出的内嵌图片。"""
+    sid = shop_of(request)["shop_id"]
     encoded = body.get("content_base64")
     if not encoded:
         raise HTTPException(status_code=400, detail="请求体需要 content_base64 字段")
@@ -472,7 +573,7 @@ def upload_material_file(body: dict = Body(...)):
         pass
     name = os.path.basename(str(body.get("filename") or "material.jpg"))[:40]
     data = _xhs_call("material.uploadMaterial", {
-        "name": name, "type": "IMAGE", "materialContent": encoded})
+        "name": name, "type": "IMAGE", "materialContent": encoded}, shop_id=sid)
     return {"ok": True, "result": data}
 
 
@@ -480,7 +581,7 @@ def upload_material_file(body: dict = Body(...)):
 # 发品页:创建商品+SKU(一次搞定)
 # ==================================================================
 @app.post("/items/and-sku")
-def create_item_and_sku(body: dict = Body(..., examples=[{
+def create_item_and_sku(request: Request, body: dict = Body(..., examples=[{
     "item": {
         "name": "18K金钻石戒指",                 # 8-30字,同店不可重复
         "brandId": "品牌ID",                     # /brands 查
@@ -510,6 +611,7 @@ def create_item_and_sku(body: dict = Body(..., examples=[{
     任何格式都报错),这里改为分步:createItemV2 建商品 → createSkuV2 逐个建 SKU,
     两者都已实测可用。对前端来说效果一样:一次请求返回 itemId + skuIds。
     创建成功后商品进入"审核中",等审核通过(buyable=true)才能上架。"""
+    sid = shop_of(request)["shop_id"]
     item = body.get("item")
     sku_list = body.get("sku_list") or []
     if not item:
@@ -519,7 +621,7 @@ def create_item_and_sku(body: dict = Body(..., examples=[{
 
     # ---- 分步创建(可靠方案) ----
     # 第 1 步:创建商品
-    item_data = _xhs_call("product.createItemV2", item)
+    item_data = _xhs_call("product.createItemV2", item, shop_id=sid)
     item_id = item_data.get("id") or item_data.get("itemId")
     if not item_id:
         raise HTTPException(status_code=500, detail="创建商品成功但未返回 itemId")
@@ -528,7 +630,7 @@ def create_item_and_sku(body: dict = Body(..., examples=[{
     sku_ids, errors = [], []
     for sku in sku_list:
         try:
-            sku_data = _xhs_call("product.createSkuV2", {"itemId": item_id, **sku})
+            sku_data = _xhs_call("product.createSkuV2", {"itemId": item_id, **sku}, shop_id=sid)
             sku_id = (sku_data or {}).get("id") or (sku_data or {}).get("skuId")
             if sku_id:
                 sku_ids.append(sku_id)
@@ -538,7 +640,7 @@ def create_item_and_sku(body: dict = Body(..., examples=[{
         except HTTPException as e:
             errors.append({"sku": sku.get("erpCode") or sku.get("price"), "error": str(e.detail)})
 
-    _clear_product_cache()
+    _clear_product_cache(sid)
     return {"ok": not errors, "partial": bool(errors) and bool(sku_ids), "result": {
         "itemId": item_id,
         "skuIds": sku_ids,
@@ -552,31 +654,36 @@ def create_item_and_sku(body: dict = Body(..., examples=[{
 # 商品列表页
 # ==================================================================
 @app.get("/items")
-def list_items(page_no: int = Query(1, ge=1, description="页码,从1开始"),
+def list_items(request: Request,
+               page_no: int = Query(1, ge=1, description="页码,从1开始"),
                page_size: int = Query(20, ge=1, le=100, description="每页条数,最大100")):
     """商品列表(分页)。列表不含审核状态,要显示"审核中/已上架"再调 /items/status。"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("item_list", page_no, page_size), 30,
-        lambda: _xhs_call("product.searchItemList", {"pageNo": page_no, "pageSize": page_size}),
+        sid, ("item_list", page_no, page_size), 30,
+        lambda: _xhs_call("product.searchItemList", {"pageNo": page_no, "pageSize": page_size}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.post("/items/status")
-def items_status(body: dict = Body(..., example={"item_ids": ["itemId1", "itemId2"]})):
+def items_status(request: Request, body: dict = Body(..., example={"item_ids": ["itemId1", "itemId2"]})):
     """批量查审核状态(前端列表页每5分钟刷一次)。
     返回 [{itemId, name, skus:[{skuId, buyable}]}],buyable=true=审核通过可上架。"""
+    shop = shop_of(request)
+    sid = shop["shop_id"]
+    conf = xhs_conf_of(shop)
     item_ids = body.get("item_ids") or []
     if not item_ids:
         raise HTTPException(status_code=400, detail="请求体需要 item_ids 列表")
     item_ids = item_ids[:20]
-    _get_access_token()  # 并发查询前先完成一次 token 检查或刷新
+    _get_access_token(sid, conf)  # 并发查询前先完成一次 token 检查或刷新
 
     def fetch_status(item_id):
         try:
             data = _cached(
-                ("item_status", str(item_id)), 10,
-                lambda: _xhs_call("product.getItemInfo", {"itemId": item_id}),
+                sid, ("item_status", str(item_id)), 10,
+                lambda: _xhs_call("product.getItemInfo", {"itemId": item_id}, shop_id=sid),
             )
             skus = [{
                 "skuId": s.get("id"),
@@ -598,16 +705,17 @@ def items_status(body: dict = Body(..., example={"item_ids": ["itemId1", "itemId
 
 
 @app.post("/skus/{sku_id}/available")
-def set_sku_available(sku_id: str, body: dict = Body(..., example={"available": 1})):
+def set_sku_available(sku_id: str, request: Request, body: dict = Body(..., example={"available": 1})):
     """行内上下架。available: 1=上架(买家可见) 0=下架。
     ⚠️ 上架前必须审核通过(buyable=true),否则报 -5000300。
     小红书按 SKU 粒度上下架,商品多个 SKU 要逐个调。"""
+    sid = shop_of(request)["shop_id"]
     available = body.get("available")
     if available not in (0, 1):
         raise HTTPException(status_code=400, detail="available 必须是 0 或 1")
     data = _xhs_call("product.updateSkuAvailable", {
-        "skuId": str(sku_id), "available": str(available)})
-    _clear_product_cache()
+        "skuId": str(sku_id), "available": str(available)}, shop_id=sid)
+    _clear_product_cache(sid)
     return {"ok": True, "result": data}
 
 
@@ -615,38 +723,41 @@ def set_sku_available(sku_id: str, body: dict = Body(..., example={"available": 
 # 商品编辑页
 # ==================================================================
 @app.get("/items/{item_id}")
-def get_item(item_id: str):
+def get_item(item_id: str, request: Request):
     """商品详情:完整信息 + skus[].buyable 审核状态(编辑页回填用)"""
+    sid = shop_of(request)["shop_id"]
     data = _cached(
-        ("item_detail", str(item_id)), 60,
-        lambda: _xhs_call("product.getItemInfo", {"itemId": item_id}),
+        sid, ("item_detail", str(item_id)), 60,
+        lambda: _xhs_call("product.getItemInfo", {"itemId": item_id}, shop_id=sid),
     )
     return {"ok": True, "result": data}
 
 
 @app.put("/items/{item_id}")
-def update_item(item_id: str, body: dict = Body(..., example={
+def update_item(item_id: str, request: Request, body: dict = Body(..., example={
     "item": {"name": "新标题"}, "updated_fields": ["name"]})):
     """改商品。建议传 updated_fields 只更新指定字段,不传=全量更新(有风险)"""
+    sid = shop_of(request)["shop_id"]
     item = body.get("item")
     if not item:
         raise HTTPException(status_code=400, detail="请求体需要 item 字段")
     payload = {"id": item_id, **item}
     if body.get("updated_fields"):
         payload["updatedFields"] = body["updated_fields"]
-    result = ok_or_400(lambda: _xhs_call("product.updateItemV2", payload))
-    _clear_product_cache()
+    result = ok_or_400(lambda: _xhs_call("product.updateItemV2", payload, shop_id=sid))
+    _clear_product_cache(sid)
     return result
 
 
 @app.put("/skus/{sku_id}")
-def update_sku(sku_id: str, body: dict = Body(..., example={
+def update_sku(sku_id: str, request: Request, body: dict = Body(..., example={
     "sku": {"price": 9000, "stock": 50}, "updated_fields": ["price", "stock"]})):
     """改 SKU(价格/库存/规格图等)。updated_fields 可选。
 
     ⚠️ 小红书 product.updateSkuV2 必须带 itemId, 否则报「入参itemId不能为空」。
        用 body.item_id 或在 sku 里带 itemId 传进来(二选一)。
     """
+    sid = shop_of(request)["shop_id"]
     sku = body.get("sku")
     if not sku:
         raise HTTPException(status_code=400, detail="请求体需要 sku 字段")
@@ -655,8 +766,8 @@ def update_sku(sku_id: str, body: dict = Body(..., example={
         payload["itemId"] = str(body["item_id"])
     if body.get("updated_fields"):
         payload["updatedFields"] = body["updated_fields"]
-    result = ok_or_400(lambda: _xhs_call("product.updateSkuV2", payload))
-    _clear_product_cache()
+    result = ok_or_400(lambda: _xhs_call("product.updateSkuV2", payload, shop_id=sid))
+    _clear_product_cache(sid)
     return result
 
 

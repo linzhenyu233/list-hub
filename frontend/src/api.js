@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { applyShopHeaders } from './shopContext'
 
 const http = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
@@ -6,6 +7,9 @@ const http = axios.create({
   // 原 30 秒超时刚好卡在边界,偶发超时会导致列表被清空成"暂无商品数据"。
   timeout: 120000,
 })
+
+// 多店铺:每个请求都带上 X-Shop-Id / X-Operator(未选店铺时后端回退默认店)
+http.interceptors.request.use((config) => applyShopHeaders(config))
 
 http.interceptors.response.use(
   (response) => response.data,
