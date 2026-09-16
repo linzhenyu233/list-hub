@@ -82,3 +82,8 @@ screenshots/
 Thumbs.db
 *.pid
 *.lock
+
+# ---- 工具目录 / 临时产物（2026-09-16 收尾补充）----
+.codebuddy/
+ui-preview/
+generated-images/
