@@ -166,6 +166,8 @@ def _create_tables(conn):
         id TEXT PRIMARY KEY, shop_id TEXT NOT NULL, filename TEXT, status TEXT,
         total INTEGER DEFAULT 0, valid INTEGER DEFAULT 0, errors INTEGER DEFAULT 0,
         created_at TEXT, operator TEXT,
+        -- 每次 rows_json / mappings_json 被改写就 +1: 供跨进程批次缓存判新旧
+        revision INTEGER NOT NULL DEFAULT 0,
         rows_json TEXT NOT NULL, mappings_json TEXT NOT NULL DEFAULT '{}'
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS category_aliases (
@@ -222,7 +224,8 @@ def _migrate_add_shop_id(conn):
 
     迁移内容：
       1. priority 列（更早版本遗留）—— 必须在建索引前补齐。
-      2. 5 张表的 shop_id / operator 列，历史数据回填默认 shop_id。
+      2. batches.revision 列 —— 供跨进程批次缓存判新旧（见 get_batch_cached）。
+      3. 5 张表的 shop_id / operator 列，历史数据回填默认 shop_id。
 
     默认 shop_id 从 shop_registry.default_shop() 取：
       - 已有 shops.json → 取其默认店铺的 shop_id（推荐：先建好 shops.json 再首次启动）
@@ -232,7 +235,12 @@ def _migrate_add_shop_id(conn):
     if "priority" not in {row["name"] for row in conn.execute("PRAGMA table_info(publish_items)")}:
         conn.execute("ALTER TABLE publish_items ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
-    # --- 2. shop_id 相关列 ---
+    # --- 2. batches.revision：跨进程批次缓存判新旧（见 get_batch_cached）。
+    #     必须在下面「已是新版就 return」之前判断，否则已有库永远补不上这一列。 ---
+    if "revision" not in {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}:
+        conn.execute("ALTER TABLE batches ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+
+    # --- 3. shop_id 相关列 ---
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
     if "shop_id" in cols:
         return  # 已是新版
@@ -1693,7 +1701,7 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
 
     if not dry_run:
         conn = db()
-        conn.execute("UPDATE batches SET rows_json=? WHERE id=? AND shop_id=?",
+        conn.execute("UPDATE batches SET rows_json=?, revision=revision+1 WHERE id=? AND shop_id=?",
                      (json.dumps(rows, ensure_ascii=False), batch_id, shop_id))
         conn.commit()
         conn.close()
@@ -1797,28 +1805,45 @@ def batch_or_404(batch_id, shop_id=None):
 # ------------------------------------------------------------------
 # 批次解析缓存:worker 每发一个商品都要拿批次的 rows/mappings,
 # 全量 json.loads + group_products 在 800 商品时单次近百毫秒,
-# 2N 次(商品×平台)调用就是 O(N²)。这里按 batch_id 缓存解析结果,
-# 写接口(items/mappings/status)主动失效,避免 worker 用到旧数据。
+# 2N 次(商品×平台)调用就是 O(N²)。这里按 batch_id 缓存解析结果。
+#
+# 跨进程失效: _invalidate_batch_cache 只清本进程的缓存, 而"改映射"发生在 API
+# 进程、"发品"发生在 worker 进程, 只靠它 worker 会一直用旧 mappings
+# (实测: 改完运费模板立刻重试, 平台仍报旧模板 id 不存在)。
+# 因此缓存里额外记住 batches.revision, 命中后再比一次(单列查询, 亚毫秒),
+# revision 变了就回源重解析。TTL 仅作兜底(防止将来某条写路径漏 bump revision)。
 # ------------------------------------------------------------------
 _BATCH_CACHE: dict = {}
 _BATCH_CACHE_TTL = 60.0
 
 
 def _invalidate_batch_cache(batch_id: str = None) -> None:
-    """写接口改完 batches 后调用;batch_id 为空则全清。"""
+    """写接口改完 batches 后调用(只影响本进程);batch_id 为空则全清。"""
     if batch_id:
         _BATCH_CACHE.pop(batch_id, None)
     else:
         _BATCH_CACHE.clear()
 
 
+def _batch_revision(batch_id: str):
+    """读该批次当前 revision(单列查询, 不做 JSON 解析);批次不存在返回 None。"""
+    conn = db()
+    try:
+        row = conn.execute("SELECT revision FROM batches WHERE id=?", (batch_id,)).fetchone()
+    finally:
+        conn.close()
+    return row["revision"] if row else None
+
+
 def get_batch_cached(batch_id: str) -> dict:
-    """命中且未过期则复用解析结果,否则回源 batch_or_404 并写缓存。"""
+    """命中、未过期、且 revision 没变时复用解析结果,否则回源 batch_or_404 并写缓存。"""
     hit = _BATCH_CACHE.get(batch_id)
     if hit and (time.time() - hit["ts"]) < _BATCH_CACHE_TTL:
-        return hit["data"]
+        revision = _batch_revision(batch_id)
+        if revision is not None and revision == hit["revision"]:
+            return hit["data"]
     data = batch_or_404(batch_id)
-    _BATCH_CACHE[batch_id] = {"ts": time.time(), "data": data}
+    _BATCH_CACHE[batch_id] = {"ts": time.time(), "revision": _batch_revision(batch_id), "data": data}
     return data
 
 
@@ -1833,7 +1858,7 @@ def update_items(batch_id: str, body: ItemsBody, request: Request):
     shop_id = _current_shop_id(request)
     batch = batch_or_404(batch_id, shop_id); rows = body.items
     errors = sum(bool(row.get("errors")) for row in rows)
-    conn = db(); conn.execute("UPDATE batches SET rows_json=?,status=?,valid=?,errors=? WHERE id=? AND shop_id=?", (json.dumps(rows, ensure_ascii=False), "待校验" if errors else "待发布", len(rows)-errors, errors, batch_id, shop_id)); conn.commit(); conn.close()
+    conn = db(); conn.execute("UPDATE batches SET rows_json=?,status=?,valid=?,errors=?, revision=revision+1 WHERE id=? AND shop_id=?", (json.dumps(rows, ensure_ascii=False), "待校验" if errors else "待发布", len(rows)-errors, errors, batch_id, shop_id)); conn.commit(); conn.close()
     _invalidate_batch_cache(batch_id)
     products = group_products(rows)
     return {"ok": True, "result": {"total": len(rows), "product_count": len(products), "valid": len(rows)-errors, "errors": errors, "product_errors": sum(bool(product["errors"]) for product in products)}}
@@ -1842,7 +1867,7 @@ def update_items(batch_id: str, body: ItemsBody, request: Request):
 @app.put("/import/{batch_id}/mappings")
 def update_mappings(batch_id: str, body: MappingsBody, request: Request):
     shop_id = _current_shop_id(request)
-    batch_or_404(batch_id, shop_id); conn = db(); conn.execute("UPDATE batches SET mappings_json=? WHERE id=? AND shop_id=?", (json.dumps(body.mappings, ensure_ascii=False), batch_id, shop_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id); return {"ok": True, "result": body.mappings}
+    batch_or_404(batch_id, shop_id); conn = db(); conn.execute("UPDATE batches SET mappings_json=?, revision=revision+1 WHERE id=? AND shop_id=?", (json.dumps(body.mappings, ensure_ascii=False), batch_id, shop_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id); return {"ok": True, "result": body.mappings}
 
 
 @app.post("/import/{batch_id}/validate")
