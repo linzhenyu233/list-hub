@@ -10,8 +10,14 @@
 """
 
 import os
+import sys
 import ctypes
 import threading
+
+# 与 bulk_api.py / fastapi_server.py 保持一致，把项目根加入 sys.path：
+# 直接跑 `python bulk_api/bulk_worker.py` 时 sys.path[0] 是 bulk_api/ 目录，
+# 项目根的 shop_registry 会导入失败（此前只能靠外部 PYTHONPATH 兜着）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import shop_registry
 from bulk_api import _worker_loop, recover_interrupted_items
