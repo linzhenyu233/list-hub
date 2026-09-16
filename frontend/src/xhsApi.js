@@ -19,9 +19,11 @@ http.interceptors.response.use(
 
 export const xhsApi = {
   health: () => http.get('/health'),
-  tokenInfo: () => http.get('/token/info'),
+  // shopId 可选：不传用"当前选中店铺"，传了就用指定店铺（店铺管理页逐个店巡检用）。
+  // 依赖 shopContext.applyShopHeaders 的"显式头不覆盖"规则。
+  tokenInfo: (shopId = '') => http.get('/token/info', { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   tokenByCode: (code) => http.post('/token/code', { code }),
-  tokenRefresh: () => http.post('/token/refresh'),
+  tokenRefresh: (shopId = '') => http.post('/token/refresh', null, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   listItems: (params = {}) => http.get('/items', { params }),
   itemStatus: (itemIds) => http.post('/items/status', { item_ids: itemIds }),
   getItem: (itemId) => http.get(`/items/${itemId}`),

@@ -25,7 +25,8 @@ http.interceptors.response.use(
 
 export const storeApi = {
   health: () => http.get('/health'),
-  testToken: () => http.post('/token/test'),
+  // shopId 可选：不传用"当前选中店铺"，传了就用指定店铺（店铺管理页逐店检查用）
+  testToken: (shopId = '') => http.post('/token/test', null, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   searchCategories: (keyword) => http.get('/categories', { params: { keyword } }),
   uploadImage: (imgUrl) => http.post('/images/upload', { img_url: imgUrl }),
   freightTemplates: (params = {}) => http.get('/freight-templates', { params }),

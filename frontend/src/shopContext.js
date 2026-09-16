@@ -47,12 +47,18 @@ export function shopHeaders() {
   return headers
 }
 
-/** 把店铺请求头合并进 axios 的 config（axios 各版本 headers 结构略有差异，做兼容）。 */
+/**
+ * 把店铺请求头合并进 axios 的 config（axios 各版本 headers 结构略有差异，做兼容）。
+ *
+ * ⚠️ 调用方**显式指定**的同名头不覆盖：店铺管理页要在一屏里逐个店查状态
+ *    （xhsApi.tokenInfo('xxx') 之类），统一塞当前店会让所有请求都打到同一个店。
+ */
 export function applyShopHeaders(config) {
   const headers = shopHeaders()
   Object.entries(headers).forEach(([key, value]) => {
+    if (config.headers && typeof config.headers.has === 'function' && config.headers.has(key)) return
     if (config.headers && typeof config.headers.set === 'function') config.headers.set(key, value)
-    else config.headers = { ...(config.headers || {}), [key]: value }
+    else if (!config.headers || !(key in config.headers)) config.headers = { ...(config.headers || {}), [key]: value }
   })
   return config
 }

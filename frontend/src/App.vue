@@ -14,6 +14,7 @@ import {
   Refresh,
   Remove,
   Setting,
+  Shop,
   ShoppingBag,
   Warning,
   Notebook,
@@ -26,6 +27,7 @@ import XhsProductPanel from './components/XhsProductPanel.vue'
 import XhsProductForm from './components/XhsProductForm.vue'
 import BulkPublishPanel from './components/BulkPublishPanel.vue'
 import CategoryAliasPanel from './components/CategoryAliasPanel.vue'
+import ShopPanel from './components/ShopPanel.vue'
 import ProductSearchBar from './components/ProductSearchBar.vue'
 import ProductDetailView from './components/ProductDetailView.vue'
 import EllipsisText from './components/EllipsisText.vue'
@@ -497,6 +499,7 @@ onMounted(async () => {
         <el-menu-item index="xhs-create" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
         <el-menu-item index="bulk-publish" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
         <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
+        <el-menu-item index="shops"><el-icon><Shop /></el-icon><span>店铺管理</span></el-menu-item>
         <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
       </el-menu>
       <div class="sidebar-footer">
@@ -509,7 +512,7 @@ onMounted(async () => {
       <el-header class="topbar">
         <div>
           <span class="breadcrumb">运营中心 /</span>
-          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : '连接设置' }}</strong>
+          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : activeView === 'shops' ? '店铺管理' : '连接设置' }}</strong>
         </div>
         <div class="topbar-actions">
           <el-select v-model="shopIdProxy" :loading="shopSwitching" placeholder="选择店铺"
@@ -620,6 +623,8 @@ onMounted(async () => {
           <ProductForm @created="afterCreated" @cancel="activeView = 'products'" />
         </template>
 
+        <ShopPanel v-if="activeView === 'shops'" :refresh-tick="globalRefreshTick" />
+
         <template v-if="activeView === 'settings'">
           <div class="page-heading"><div><h1>连接设置</h1><p>查看平台服务的连接状态</p></div></div>
           <section class="settings-panel">
@@ -643,6 +648,7 @@ onMounted(async () => {
               <el-button type="primary" :loading="xhsAuthorizing" :disabled="!xhsOnline" @click="authorizeXhs">提交授权</el-button>
             </div>
             <p class="muted-copy xhs-auth-tip">获取 code：浏览器打开授权链接（appId 换成应用 ID、redirectUri 换成回调地址），用店铺主账号登录后从回调地址复制 code。授权成功后 token 保存在服务端，快过期时会自动续期。</p>
+            <p class="muted-copy">本页的授权/续期只作用于「顶栏当前选中的店铺」；想一次看清所有店铺的 token 有效期与凭证状态，走左侧「店铺管理」。</p>
             <div class="security-note"><el-icon><Warning /></el-icon><div><strong>安全提醒</strong><p>账号授权信息仅由服务端保存，不会显示在前端或返回给页面</p></div></div>
           </section>
         </template>
