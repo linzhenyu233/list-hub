@@ -1,5 +1,5 @@
 ﻿<script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   ArrowLeft,
@@ -22,14 +22,16 @@ import {
 } from '@element-plus/icons-vue'
 import { storeApi } from './api'
 import { xhsApi } from './xhsApi'
-import ProductForm from './components/ProductForm.vue'
-import XhsProductPanel from './components/XhsProductPanel.vue'
-import XhsProductForm from './components/XhsProductForm.vue'
-import BulkPublishPanel from './components/BulkPublishPanel.vue'
-import CategoryAliasPanel from './components/CategoryAliasPanel.vue'
-import ShopPanel from './components/ShopPanel.vue'
-import ProductSearchBar from './components/ProductSearchBar.vue'
-import ProductDetailView from './components/ProductDetailView.vue'
+// 视图级组件按需异步加载：仅当切换到对应标签时才下载并执行其代码块
+// 首屏只保留商品列表所需的 ProductSearchBar / EllipsisText 同步引入
+const ProductForm = defineAsyncComponent(() => import('./components/ProductForm.vue'))
+const XhsProductPanel = defineAsyncComponent(() => import('./components/XhsProductPanel.vue'))
+const XhsProductForm = defineAsyncComponent(() => import('./components/XhsProductForm.vue'))
+const BulkPublishPanel = defineAsyncComponent(() => import('./components/BulkPublishPanel.vue'))
+const CategoryAliasPanel = defineAsyncComponent(() => import('./components/CategoryAliasPanel.vue'))
+const ShopPanel = defineAsyncComponent(() => import('./components/ShopPanel.vue'))
+const ProductDetailView = defineAsyncComponent(() => import('./components/ProductDetailView.vue'))
+const ProductSearchBar = defineAsyncComponent(() => import('./components/ProductSearchBar.vue'))
 import EllipsisText from './components/EllipsisText.vue'
 import {
   currentOperator,
@@ -212,8 +214,9 @@ async function testToken() {
 
 // 微信接口慢:每一页都要重新「拉 ID 列表 + 逐个查详情」。翻回已经看过的页时直接复用缓存,
 // 不再转圈;点顶栏刷新 / 上架下架后由 refreshFromStart 清缓存,保证能看到最新数据。
+// 缓存键必须带 currentShopId:否则切店后会命中上一家店的缓存,列表串店(统计是真实请求、列表是缓存,两边对不上)。
 const productPageCache = new Map()
-const pageCacheKey = (cursor) => `${statusFilter.value}|${pageSize.value}|${cursor || ''}`
+const pageCacheKey = (cursor) => `${currentShopId.value || ''}|${statusFilter.value}|${pageSize.value}|${cursor || ''}`
 
 async function loadProducts(cursor = null, pushHistory = false) {
   const cached = productPageCache.get(pageCacheKey(cursor))
@@ -365,6 +368,24 @@ function selectPlatform(nextPlatform) {
   activeView.value = nextPlatform === 'xhs' ? 'xhs-products' : 'products'
 }
 
+// 拆店后一家店只属于一个平台：当前视图与店铺平台不匹配时自动跳转，免得切到小红书店后还停在微信商品页要再手动换。
+// 只管平台专属页（微信商品 / 小红书商品 / 发布小红书商品）；批量发布、类目映射、店铺管理、设置不限平台，不干预。
+// 返回 'wechat' / 'xhs'（发生了跳转）或 ''（视图本来就匹配）。
+function alignViewWithShop(shop) {
+  if (!shop) return ''
+  const isWechatOnly = Boolean(shop.wechat?.appid) && !shop.xhs?.app_id
+  const isXhsOnly = Boolean(shop.xhs?.app_id) && !shop.wechat?.appid
+  if (isWechatOnly && (activeView.value === 'xhs-products' || activeView.value === 'xhs-create')) {
+    selectPlatform('wechat')
+    return 'wechat'
+  }
+  if (isXhsOnly && activeView.value === 'products') {
+    selectPlatform('xhs')
+    return 'xhs'
+  }
+  return ''
+}
+
 function afterXhsCreated() {
   platform.value = 'xhs'
   activeView.value = 'xhs-products'
@@ -466,20 +487,30 @@ async function refreshShops() {
 
 watch(currentShopId, (value) => {
   const target = shops.value.find((item) => item.shop_id === value)
-  if (target) ElMessage.success(`已切换到「${target.name}」`)
+  const realigned = target ? alignViewWithShop(target) : ''
   // 旧店铺的商品列表/分页/详情/编辑态全部失效，清掉再刷新
   products.value = []
   total.value = 0
   pageHistory.value = []
   nextKey.value = null
+  productPageCache.clear() // 分页缓存一并清掉：切店后强制重新拉取，不读上一家店的旧页
   detailVisible.value = false
   editVisible.value = false
   if (serviceOnline.value) void globalRefresh()
+  if (target) {
+    ElMessage.success(
+      realigned === 'xhs' ? `已切换到「${target.name}」，该店是小红书店，已自动进入小红书商品页`
+        : realigned === 'wechat' ? `已切换到「${target.name}」，该店是微信店，已自动回到微信商品页`
+        : `已切换到「${target.name}」`,
+    )
+  }
 })
 
 onMounted(async () => {
   // 先取店铺清单：请求头要靠它，否则后续请求会落到后端默认店上
   await refreshShops()
+  // 刷新页面后 activeView 固定回「微信商品」，若恢复的店铺是小红书店，这里静默对齐到小红书商品页
+  alignViewWithShop(shops.value.find((item) => item.shop_id === currentShopId.value))
   await checkHealth()
   if (serviceOnline.value) { await loadProducts(); void loadStats() }
 })

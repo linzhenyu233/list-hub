@@ -5,6 +5,20 @@ export default defineConfig(({ mode }) => {
   const env = { ...loadEnv(mode, '..', ''), ...process.env }
   return {
   plugins: [vue()],
+  build: {
+    // 提高警告阈值，同时按依赖来源拆包，避免单个 chunk 过大
+    chunkSizeWarningLimit: 800,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (id.includes('element-plus') || id.includes('@element-plus')) return 'vendor-element'
+          if (id.includes('/vue/') || id.includes('@vue/') || id.includes('vue-router')) return 'vendor-vue'
+          return 'vendor'
+        },
+      },
+    },
+  },
   server: {
     port: Number(env.VITE_DEV_PORT || 5173),
     proxy: {
