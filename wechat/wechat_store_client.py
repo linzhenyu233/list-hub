@@ -69,10 +69,21 @@ class WxStore:
 
     BASE = "https://api.weixin.qq.com"  # 微信所有接口的公共服务器地址
 
-    def __init__(self, appid, secret):
-        """初始化:记住 appid/secret,准备一个空的 token 缓存"""
+    def __init__(self, appid, secret, after_sale_address_id="", freight_template_id="", legacy_defaults=False):
+        """初始化:记住 appid/secret,准备一个空的 token 缓存
+
+        多店铺:
+          - after_sale_address_id / freight_template_id 是**该店自己的**兜底值,
+            由 wechat/fastapi_server.store_for 从 shops.json 的 shop["wechat"] 传入。
+          - legacy_defaults=True 表示"这家店就是默认店",此时才允许回退到 .env 里的
+            单店时代默认值(WX_FREIGHT_TEMPLATE_ID / WX_AFTER_SALE_ADDRESS_ID)。
+            非默认店一律不回退 —— 否则第二家店发品会带上第一家店的退货地址/运费模板(串店)。
+        """
         self.appid = appid
         self.secret = secret
+        self.after_sale_address_id = after_sale_address_id or ""
+        self.freight_template_id = freight_template_id or ""
+        self.legacy_defaults = bool(legacy_defaults)
         self._token = None            # 缓存 access_token,避免每次都重新换
         self._token_expire_at = 0     # token 的过期时间戳(Unix时间)
         self._cat_cache = None        # 类目树缓存(发品归一化类目用,避免每次拉15000+节点)
@@ -720,18 +731,22 @@ class WxStore:
         express = product.get("express_info")
         express = dict(express) if isinstance(express, dict) else {}
         if not express.get("template_id"):
-            tid = top_tid or DEFAULT_FREIGHT_TEMPLATE_ID
+            # 优先用"本店"的模板;只有默认店才回退 .env 的单店默认值(见 __init__)
+            tid = top_tid or self.freight_template_id or (
+                DEFAULT_FREIGHT_TEMPLATE_ID if self.legacy_defaults else "")
             # deliver_method=1/3(无需快递)时官方不需要运费模板,不兜底
             if tid and product.get("deliver_method", 0) in (0, None):
                 express["template_id"] = str(tid)
         if express:
             product["express_info"] = express
 
-        # 售后/退货地址(官方已改为必填)兜底
+        # 售后/退货地址(官方已改为必填)兜底:本店的优先,默认店才回退 .env 单店默认值
         asi = product.get("after_sale_info")
         asi = dict(asi) if isinstance(asi, dict) else {}
-        if not asi.get("after_sale_address_id") and DEFAULT_AFTER_SALE_ADDRESS_ID:
-            asi["after_sale_address_id"] = str(DEFAULT_AFTER_SALE_ADDRESS_ID)
+        legacy_address = DEFAULT_AFTER_SALE_ADDRESS_ID if self.legacy_defaults else ""
+        fallback_address = self.after_sale_address_id or legacy_address
+        if not asi.get("after_sale_address_id") and fallback_address:
+            asi["after_sale_address_id"] = str(fallback_address)
         if asi:
             product["after_sale_info"] = asi
 

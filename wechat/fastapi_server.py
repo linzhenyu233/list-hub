@@ -105,7 +105,14 @@ def store_for(shop: dict) -> "WxStore":
             appid = conf.get("appid") or ""
             if not appid:
                 raise HTTPException(status_code=400, detail=f"店铺 {shop_id} 未配置微信小店凭证")
-            inst = WxStore(appid, conf.get("secret") or "")
+            inst = WxStore(
+                appid, conf.get("secret") or "",
+                # 本店自己的兜底值（之前这两个参数写死在 .env 里，第二家店会串用第一家店的）
+                after_sale_address_id=conf.get("after_sale_address_id") or "",
+                freight_template_id=conf.get("freight_template_id") or "",
+                # 只有默认店才允许回退 .env 的单店时代默认值
+                legacy_defaults=(shop_id == shop_registry.default_shop()["shop_id"]),
+            )
             _STORES[shop_id] = inst
         return inst
 

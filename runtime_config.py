@@ -22,6 +22,23 @@ PROJECT_VARIABLES = {
     "XHS_TOKEN_DIR",
 }
 
+# 各店自己的平台凭证：键名约定 = 原键名 + "_" + SHOP_ID 大写，
+# 例：WX_APPID_XIANLUODINGZHI / WX_SECRET_XIANLUODINGZHI
+#     （shops.json 里照常写 ${WX_APPID_XIANLUODINGZHI} 占位）
+# 这类键不进 PROJECT_VARIABLES，而是按前缀放行 —— 否则每新增一家店都要改本文件，
+# 忘改就会静默读不到（.env 与用户环境变量都会被过滤），排查成本很高。
+_PER_SHOP_PREFIXES = (
+    "WX_APPID_", "WX_SECRET_", "WX_BRAND_ID_",
+    "WX_FREIGHT_TEMPLATE_ID_", "WX_AFTER_SALE_ADDRESS_ID_",
+    "XHS_APP_ID_", "XHS_APP_SECRET_", "XHS_BRAND_ID_", "XHS_CATEGORY_ID_",
+    "XHS_SHIPPING_TEMPLATE_ID_", "XHS_LOGISTICS_PLAN_ID_",
+)
+
+
+def _is_allowed_variable(name: str) -> bool:
+    """白名单：显式列出的项目变量，或"某店自己的平台凭证"（见 _PER_SHOP_PREFIXES）。"""
+    return name in PROJECT_VARIABLES or name.startswith(_PER_SHOP_PREFIXES)
+
 # ensure_env_loaded() 的幂等标记
 _ENV_LOADED = False
 
@@ -38,7 +55,7 @@ def _load_dotenv(path):
         value = value.strip()
         if value[:1] == value[-1:] and value[:1] in {"'", '"'}:
             value = value[1:-1]
-        if key in PROJECT_VARIABLES and value:
+        if _is_allowed_variable(key) and value:
             os.environ.setdefault(key, value)
 
 
@@ -48,15 +65,19 @@ def _load_windows_user_environment():
     try:
         import winreg
 
+        # 枚举用户环境变量后按白名单过滤：不能只遍历 PROJECT_VARIABLES，
+        # 否则各店自己的凭证（如 WX_APPID_XIANLUODINGZHI）读不到。
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-            for name in PROJECT_VARIABLES:
-                if os.environ.get(name):
-                    continue
+            index = 0
+            while True:
                 try:
-                    value, _ = winreg.QueryValueEx(key, name)
-                except FileNotFoundError:
+                    name, value, _type = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                index += 1
+                if not value or os.environ.get(name):
                     continue
-                if value:
+                if _is_allowed_variable(name):
                     os.environ[name] = str(value)
     except OSError:
         pass
