@@ -10,7 +10,7 @@
       「上架价」列(如 489300/0.7=699000, 货盘该列就是 699000)。此前误当成"分"又除了 100,
       导致上架价比货盘价小 100 倍。
 - 库存：供定制/可定制 → 预售(不设库存)；售罄 → 0；数字 → 原样
-- 图片：uploaded_images.json 按商家编码前缀匹配，排除 .psd
+- 图片：上传结果文件(uploaded_images[_<shop_id>].json)按商家编码前缀匹配，排除 .psd
 - 标题：所有拆分跑完后按商品编码生成微信/小红书两套标题（见 enrich_titles）
   标题里不放款号/货号、也不放克拉；同系列同形状的不同设计款在货盘里没有区分字段，
   标题必然重复（平台会拒），处理方案见 enrich_titles 上方的「待办」
@@ -36,6 +36,22 @@ HUOPAI_PATH = os.environ.get(
     r"C:\Users\zssj\Desktop\共享-线上渠道货盘表（附库存）最新.xlsx",
 )
 UPLOADED_JSON = os.path.join(BASE_DIR, "uploaded_images.json")
+
+
+def uploaded_json_for(shop_id=None):
+    """按店铺解析图片上传结果文件：优先 uploaded_images_<shop_id>.json，回退旧文件。
+
+    旧文件是单店时代 upload_images.py 的输出（历史数据沿用）；指定 --shop-id
+    重跑上传后会生成按店命名的新文件。多店铺下两店素材空间不同，
+    转换发品前必须用对应店铺的上传结果，否则 A 店发的是 B 店的图。
+    """
+    if shop_id:
+        per_shop = os.path.join(BASE_DIR, f"uploaded_images_{shop_id}.json")
+        if os.path.exists(per_shop):
+            return per_shop
+    return UPLOADED_JSON
+
+
 OUTPUT_PATH = os.path.join(BASE_DIR, "货盘转换预览.xlsx")
 
 HEADERS = ["商品编码", "标题", "微信标题", "小红书标题", "内部类目", "品牌", "描述", "商品属性",
@@ -278,8 +294,11 @@ def enrich_carat(rows):
 # 卖点词（轻奢/通勤/百搭）是运营手写的，没有数据依据，不自动生成；
 # 唯一自动加的尾缀是「附XX证书」，来源是商品属性「鉴定证书」。
 # ==================================================================
-WECHAT_BRAND = "SHINING HOUSE/钻石世家"
-XHS_BRAND = "SHINING HOUSE"
+# 品牌写法：默认保持原值；某店品牌写法不同时用 .env 覆盖
+# （HUOPAI_WECHAT_BRAND / HUOPAI_XHS_BRAND）。enrich_titles 的拼接顺序与字段
+# 一律不动（运营硬约束），只允许替换这两个前缀常量。
+WECHAT_BRAND = os.environ.get("HUOPAI_WECHAT_BRAND") or "SHINING HOUSE/钻石世家"
+XHS_BRAND = os.environ.get("HUOPAI_XHS_BRAND") or "SHINING HOUSE"
 # 微信：官方《添加商品》文档 title 最多 60 字符，且「中文/字母/数字各算 1 个字符」
 # （线上 57 字的中文标题能过，也印证了中文按 1 算）。取 58 留 2 个余量。
 WECHAT_TITLE_MAX = 58
@@ -450,10 +469,12 @@ def parse_stock(val):
     return m.group(0) if m else "1"
 
 
-def load_images():
-    if not os.path.exists(UPLOADED_JSON):
+def load_images(shop_id=None):
+    """读图片上传结果；传 shop_id 时按店取文件（无按店文件则回退旧文件）。"""
+    path = uploaded_json_for(shop_id)
+    if not os.path.exists(path):
         return []
-    with open(UPLOADED_JSON, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -597,7 +618,7 @@ def write_preview(rows, path=OUTPUT_PATH):
 
 def main():
     images = load_images()
-    print(f"uploaded_images.json 图片数: {len(images)}")
+    print(f"图片上传结果: {uploaded_json_for()} ({len(images)} 张)")
     wb = openpyxl.load_workbook(HUOPAI_PATH, read_only=True, data_only=True)
     print(f"货盘表 sheets: {wb.sheetnames}")
 

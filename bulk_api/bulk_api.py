@@ -41,12 +41,13 @@ OPERATOR_HEADER = "x-operator"
 
 
 def _current_shop_id(request: Request) -> str:
-    """从请求头取 shop_id，空则回退默认店。不抛 404（由业务代码校验）。"""
+    """从请求头取 shop_id，空则回退默认店。未知/停用店直接抛 400。"""
     sid = request.headers.get(SHOP_HEADER) or ""
     sid = sid.strip()
     if not sid:
         return shop_registry.default_shop()["shop_id"]
-    return sid
+    shop = _verify_shop(sid)
+    return shop["shop_id"]
 
 
 def _current_operator(request: Request) -> str:
@@ -1528,7 +1529,7 @@ def import_huopai(body: HuopaiImportBody | None = None, request: Request = None)
     path = _resolve_huopai_file((body.path if body and body.path else None) or H.HUOPAI_PATH)
     # ① 转换:货盘 → 标准列 dict(复用 huopai_adapter 的业务规则)
     try:
-        images = H.load_images()
+        images = H.load_images(shop_id)
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         try:
             raw_rows = []

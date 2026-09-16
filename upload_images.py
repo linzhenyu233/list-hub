@@ -10,12 +10,15 @@
     python upload_images.py                      # 上传 images/ 目录下所有图片
     python upload_images.py a.jpg b.png          # 指定文件
     python upload_images.py D:/图片目录           # 指定目录
+    python upload_images.py --shop-id zuanshishijia   # 用指定店铺的凭证上传(多店铺)
 
 输出:
     uploaded_images.json    结构化结果(文件名 + 两平台URL)
     uploaded_images.txt     每行: 文件名 | 微信URL | 小红书URL
+    带 --shop-id 时输出 uploaded_images_<shop_id>.json/.txt(按店隔离,多店不互踩)
 ====================================================================
 """
+import argparse
 import base64
 import hashlib
 import json
@@ -45,6 +48,43 @@ XHS_ACCESS_TOKEN = os.environ.get("XHS_ACCESS_TOKEN", "")
 DEFAULT_INPUT_DIR = "images"
 OUTPUT_JSON = "uploaded_images.json"
 OUTPUT_TXT = "uploaded_images.txt"
+
+
+def xhs_token_file(shop_id):
+    """该店铺的小红书 token 文件(xhs/xhs_api.py 自动续期写回的同一份)。"""
+    token_dir = (os.environ.get("XHS_TOKEN_DIR")
+                 or os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs", "tokens"))
+    return os.path.join(token_dir, f"{shop_id}.json")
+
+
+def apply_shop(shop_id):
+    """按店铺取凭证覆盖上面的模块级配置，并返回按店命名的输出文件对。
+
+    凭证来自 shops.json(经 shop_registry 解析 ${环境变量} 占位)，未配置的平台
+    保留 env 回退值。小红书 accessToken 优先读 xhs/tokens/<shop_id>.json
+    (与 xhs_api 共用，含自动续期结果)，店铺配置里的 access_token 留空是刻意的。
+    """
+    global WX_APPID, WX_SECRET, XHS_APP_ID, XHS_APP_SECRET, XHS_ACCESS_TOKEN
+    import shop_registry
+    shop = shop_registry.resolve(shop_id)
+    wechat = shop.get("wechat") or {}
+    xhs = shop.get("xhs") or {}
+    if wechat.get("appid"):
+        WX_APPID, WX_SECRET = wechat["appid"], wechat.get("secret", "")
+    if xhs.get("app_id"):
+        XHS_APP_ID, XHS_APP_SECRET = xhs["app_id"], xhs.get("app_secret", "")
+    token_path = xhs_token_file(shop_id)
+    if os.path.exists(token_path):
+        with open(token_path, encoding="utf-8") as f:
+            access = (json.load(f) or {}).get("accessToken")
+        if access:
+            XHS_ACCESS_TOKEN = access
+    if not wechat.get("appid"):
+        print(f"WARN: 店铺 {shop_id} 未配置微信凭证，微信上传会失败")
+    if not xhs.get("app_id"):
+        print(f"WARN: 店铺 {shop_id} 未配置小红书凭证，小红书上传会失败")
+    print(f"店铺: {shop_id} ({shop.get('name', '')})")
+    return f"uploaded_images_{shop_id}.json", f"uploaded_images_{shop_id}.txt"
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
@@ -183,7 +223,18 @@ def upload_xhs(path):
 # 主流程:逐张上传,收集结果,保存到本地
 # ==================================================================
 def main():
-    files = collect_images(sys.argv[1:])
+    parser = argparse.ArgumentParser(description="双平台图片上传(微信小店 + 小红书)")
+    parser.add_argument("paths", nargs="*", help="图片文件或目录(缺省 images/)")
+    parser.add_argument("--shop-id", default="",
+                        help="按店铺取凭证(shops.json + xhs/tokens/<shop_id>.json)，"
+                             "输出 uploaded_images_<shop_id>.json/.txt；缺省用 env 凭证 + 旧文件名")
+    args = parser.parse_args()
+
+    output_json, output_txt = OUTPUT_JSON, OUTPUT_TXT
+    if args.shop_id:
+        output_json, output_txt = apply_shop(args.shop_id)
+
+    files = collect_images(args.paths)
     if not files:
         print("没有找到可上传的图片")
         sys.exit(1)
@@ -211,15 +262,15 @@ def main():
         results.append(row)
 
     # 保存结果
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+    with open(output_json, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
+    with open(output_txt, "w", encoding="utf-8") as f:
         for r in results:
             f.write(f"{r['file']} | {r['wx_url'] or '-'} | {r['xhs_url'] or '-'}\n")
 
     ok = sum(1 for r in results if r["wx_url"] and r["xhs_url"])
     print(f"\n完成: {len(results)} 张,双平台都成功 {ok} 张")
-    print(f"结果已保存: {OUTPUT_JSON} / {OUTPUT_TXT}")
+    print(f"结果已保存: {output_json} / {output_txt}")
 
 
 if __name__ == "__main__":
