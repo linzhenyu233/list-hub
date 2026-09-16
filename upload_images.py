@@ -10,15 +10,16 @@
     python upload_images.py                      # 上传 images/ 目录下所有图片
     python upload_images.py a.jpg b.png          # 指定文件
     python upload_images.py D:/图片目录           # 指定目录
-    python upload_images.py --shop-id zuanshishijia   # 用指定店铺的凭证上传(多店铺)
 
 输出:
     uploaded_images.json    结构化结果(文件名 + 两平台URL)
     uploaded_images.txt     每行: 文件名 | 微信URL | 小红书URL
-    带 --shop-id 时输出 uploaded_images_<shop_id>.json/.txt(按店隔离,多店不互踩)
+
+说明:
+    凭证用 .env 全局配置,一次上传双平台、产出一份双平台 URL 文件;
+    拆分后的微信店/小红书店货盘转换都读同一份文件,各自取自己平台的 URL。
 ====================================================================
 """
-import argparse
 import base64
 import hashlib
 import json

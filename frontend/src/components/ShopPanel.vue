@@ -127,12 +127,12 @@ watch(() => props.refreshTick, loadShopsList)
           <strong class="shop-name">{{ shop.name }}</strong>
           <el-tag v-if="shop.is_default" type="success" effect="light" round size="small">默认店</el-tag>
           <span class="shop-status">
-            <span class="status-item" :title="wechatState(shop).hint || ''">
+            <span v-if="hasWechat(shop)" class="status-item" :title="wechatState(shop).hint || ''">
               <span class="status-label">微信</span>
               <el-tag :type="wechatState(shop).type" effect="light" round>{{ wechatState(shop).text }}</el-tag>
               <el-button v-if="wechatState(shop).needAction" link type="primary" size="small" :loading="wechatStates[shop.shop_id]?.checking" @click="checkWechatToken(shop)">检查</el-button>
             </span>
-            <span class="status-item" :title="xhsState(shop).hint || ''">
+            <span v-if="hasXhs(shop)" class="status-item" :title="xhsState(shop).hint || ''">
               <span class="status-label">小红书</span>
               <el-tag :type="xhsState(shop).type" effect="light" round>{{ xhsState(shop).text }}</el-tag>
               <el-button v-if="xhsState(shop).needAction" link type="primary" size="small" :loading="renewing[shop.shop_id]" @click="renewXhsToken(shop)">续期</el-button>

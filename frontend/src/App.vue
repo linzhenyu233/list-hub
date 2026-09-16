@@ -516,9 +516,17 @@ onMounted(async () => {
         </div>
         <div class="topbar-actions">
           <el-select v-model="shopIdProxy" :loading="shopSwitching" placeholder="选择店铺"
-                     style="width: 190px" :disabled="!shops.length"
+                     style="width: 250px" :disabled="!shops.length"
                      :title="shopsError ? `店铺列表加载失败：${shopsError}` : '当前店铺：批次/任务/图片缓存/类目映射都按它隔离'">
-            <el-option v-for="item in shops" :key="item.shop_id" :label="item.name" :value="item.shop_id" />
+            <el-option v-for="item in shops" :key="item.shop_id" :label="item.name" :value="item.shop_id">
+              <div class="shop-option">
+                <span class="shop-option-name">{{ item.name }}</span>
+                <span class="shop-option-tags">
+                  <el-tag v-if="item.wechat?.appid" size="small" effect="light" round>微信</el-tag>
+                  <el-tag v-if="item.xhs?.app_id" size="small" type="danger" effect="light" round>小红书</el-tag>
+                </span>
+              </div>
+            </el-option>
           </el-select>
           <el-tooltip content="操作人：切换店铺/发布时记录，用于留痕">
             <el-input v-model="operatorProxy" placeholder="操作人" clearable maxlength="20" style="width: 116px" />

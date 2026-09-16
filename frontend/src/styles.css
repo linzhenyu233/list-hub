@@ -36,6 +36,10 @@ button, input { font-family: inherit; }
 .topbar strong { margin-left: 5px; font-size: 14px; }
 .breadcrumb { color: #98a0ac; font-size: 13px; }
 .topbar-actions, .operator { display: flex; align-items: center; gap: 12px; }
+/* 店铺下拉项：店名 + 平台标签（微信/小红书），一眼分清哪家店是哪个平台 */
+.shop-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; }
+.shop-option-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shop-option-tags { display: inline-flex; gap: 4px; flex-shrink: 0; }
 .operator { padding-left: 12px; border-left: 1px solid var(--border); font-size: 13px; }
 .avatar { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%; background: #e8f2ff; color: #1264c7; font-weight: 700; font-size: 12px; }
 .main-content { padding: 28px; overflow: visible; }
