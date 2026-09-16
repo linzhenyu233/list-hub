@@ -5,6 +5,7 @@ import { ArrowLeft, Check, Download, Upload, Refresh, Right, Search } from '@ele
 import { bulkApi } from '../bulkApi'
 import { xhsApi } from '../xhsApi'
 import { storeApi } from '../api'
+import { currentShopId } from '../shopContext'
 import CategoryAliasPanel from './CategoryAliasPanel.vue'
 import ProductReviewDrawer from './ProductReviewDrawer.vue'
 
@@ -1032,6 +1033,26 @@ watch(step, (value) => {
     void loadPlatformSettings(); void autoMatchWechatCategories()
     if (mapping.value.attr_groups) Object.assign(groupAttrDefs, mapping.value.attr_groups)
   }
+})
+
+// 多店铺：切换店铺后必须整块重置。
+// 批次/商品/映射/发布记录全部按店铺隔离，若不重置，界面还显示 A 店的批次，
+// 而请求已经带上 B 店的 X-Shop-Id —— 轻则 404（批次不属于该店），重则操作到错误数据。
+watch(currentShopId, () => {
+  const untouched = step.value === 0 && !batch.value
+  step.value = 0
+  batch.value = null
+  file.value = null
+  imageScanResult.value = null
+  mapping.value = { mode: 'auto', products: {} }
+  batchPlatformSettings.wechatFreightId = ''
+  batchPlatformSettings.xhsShippingId = ''
+  batchPlatformSettings.xhsLogisticsId = ''
+  Object.keys(groupAttrDefs).forEach((key) => { delete groupAttrDefs[key] })
+  huopaiPath.value = ''
+  if (!untouched) ElMessage.info('已切换店铺，批量发布流程已重置')
+  // 货盘文件列表与图片根目录也是按店铺取的，重新拉一次
+  void loadServerPaths()
 })
 
 function readAsBase64(input) {

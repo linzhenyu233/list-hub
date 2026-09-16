@@ -31,11 +31,19 @@ export const currentShop = computed(
   () => shops.value.find((item) => item.shop_id === currentShopId.value) || null,
 )
 
-/** 当前店铺对应的请求头；没有选中店铺时返回空对象，由后端回退到默认店。 */
+/**
+ * 当前店铺对应的请求头；没有选中店铺时不发 X-Shop-Id，由后端回退到默认店。
+ *
+ * ⚠️ HTTP 头只允许 ASCII（ByteString）。操作人姓名基本都是中文，
+ *    直接塞进 X-Operator 会被浏览器直接抛错
+ *    （实测："Cannot convert argument to a ByteString..."），
+ *    所以这里做 encodeURIComponent，后端 _current_operator 再 decode 回来。
+ *    shop_id 受校验限制只含小写字母/数字/下划线，本身就是 ASCII，无需编码。
+ */
 export function shopHeaders() {
   const headers = {}
   if (currentShopId.value) headers['X-Shop-Id'] = currentShopId.value
-  if (currentOperator.value) headers['X-Operator'] = currentOperator.value
+  if (currentOperator.value) headers['X-Operator'] = encodeURIComponent(currentOperator.value)
   return headers
 }
 

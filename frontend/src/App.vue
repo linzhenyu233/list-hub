@@ -29,6 +29,16 @@ import CategoryAliasPanel from './components/CategoryAliasPanel.vue'
 import ProductSearchBar from './components/ProductSearchBar.vue'
 import ProductDetailView from './components/ProductDetailView.vue'
 import EllipsisText from './components/EllipsisText.vue'
+import {
+  currentOperator,
+  currentShopId,
+  loadShops,
+  setCurrentShop,
+  setOperator,
+  shops,
+  shopsError,
+  shopsLoaded,
+} from './shopContext'
 
 const activeView = ref('products')
 const platform = ref('wechat')
@@ -424,7 +434,50 @@ watch(activeView, (value) => {
   if (value === 'settings') void checkXhsStatus()
 })
 
+// ------------------------------------------------------------------
+// 多店铺：顶栏店铺选择器 + 操作人留痕
+// 切换店铺后，所有请求自动带上新的 X-Shop-Id（见 shopContext 的请求拦截器），
+// 这里负责把"属于旧店铺的界面数据"清干净并重新拉取，避免看到串店的数据。
+// ------------------------------------------------------------------
+const shopSwitching = ref(false)
+const shopIdProxy = computed({
+  get: () => currentShopId.value,
+  set: (value) => {
+    if (!value || value === currentShopId.value) return
+    setCurrentShop(value)
+  },
+})
+const operatorProxy = computed({
+  get: () => currentOperator.value,
+  set: (value) => setOperator(String(value || '').trim()),
+})
+
+async function refreshShops() {
+  shopSwitching.value = true
+  try {
+    await loadShops()
+    if (shopsError.value) ElMessage.error(`店铺列表加载失败：${shopsError.value}`)
+  } finally {
+    shopSwitching.value = false
+  }
+}
+
+watch(currentShopId, (value) => {
+  const target = shops.value.find((item) => item.shop_id === value)
+  if (target) ElMessage.success(`已切换到「${target.name}」`)
+  // 旧店铺的商品列表/分页/详情/编辑态全部失效，清掉再刷新
+  products.value = []
+  total.value = 0
+  pageHistory.value = []
+  nextKey.value = null
+  detailVisible.value = false
+  editVisible.value = false
+  if (serviceOnline.value) void globalRefresh()
+})
+
 onMounted(async () => {
+  // 先取店铺清单：请求头要靠它，否则后续请求会落到后端默认店上
+  await refreshShops()
   await checkHealth()
   if (serviceOnline.value) { await loadProducts(); void loadStats() }
 })
@@ -459,14 +512,23 @@ onMounted(async () => {
           <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : '连接设置' }}</strong>
         </div>
         <div class="topbar-actions">
+          <el-select v-model="shopIdProxy" :loading="shopSwitching" placeholder="选择店铺"
+                     style="width: 190px" :disabled="!shops.length"
+                     :title="shopsError ? `店铺列表加载失败：${shopsError}` : '当前店铺：批次/任务/图片缓存/类目映射都按它隔离'">
+            <el-option v-for="item in shops" :key="item.shop_id" :label="item.name" :value="item.shop_id" />
+          </el-select>
+          <el-tooltip content="操作人：切换店铺/发布时记录，用于留痕">
+            <el-input v-model="operatorProxy" placeholder="操作人" clearable maxlength="20" style="width: 116px" />
+          </el-tooltip>
           <el-tooltip content="刷新服务状态与当前列表"><el-button circle :icon="Refresh" @click="globalRefresh" /></el-tooltip>
-          <div class="operator"><span>运营</span><div class="avatar">OP</div></div>
+          <div class="operator"><div class="avatar">OP</div></div>
         </div>
       </el-header>
 
       <el-main class="main-content">
-        <KeepAlive>
-          <XhsProductPanel v-if="activeView === 'xhs-products'" :refresh-tick="globalRefreshTick" @create="activeView = 'xhs-create'" />
+        <!-- key 里带 currentShopId：切店时强制重建组件，避免保留上一家店的列表/分页状态；max=1 保证旧店铺实例被淘汰，不累积缓存 -->
+        <KeepAlive :max="1">
+          <XhsProductPanel v-if="activeView === 'xhs-products'" :key="`xhs-products-${currentShopId}`" :refresh-tick="globalRefreshTick" @create="activeView = 'xhs-create'" />
         </KeepAlive>
 
         <template v-if="activeView === 'xhs-create'">
@@ -474,11 +536,12 @@ onMounted(async () => {
           <XhsProductForm @created="afterXhsCreated" @cancel="activeView = 'xhs-products'" />
         </template>
 
-        <KeepAlive>
-          <BulkPublishPanel v-if="activeView === 'bulk-publish'" @back="activeView = 'products'" />
+        <!-- key 里带 currentShopId：批次/任务/图片缓存都按店铺隔离，切店必须重建；max=1 保证旧店铺实例被淘汰，不累积缓存 -->
+        <KeepAlive :max="1">
+          <BulkPublishPanel v-if="activeView === 'bulk-publish'" :key="`bulk-publish-${currentShopId}`" @back="activeView = 'products'" />
         </KeepAlive>
 
-        <CategoryAliasPanel v-if="activeView === 'category-aliases'" />
+        <CategoryAliasPanel v-if="activeView === 'category-aliases'" :key="`category-aliases-${currentShopId}`" />
 
         <template v-if="activeView === 'products'">
           <div class="page-heading">

@@ -50,10 +50,14 @@ def _current_shop_id(request: Request) -> str:
 
 
 def _current_operator(request: Request) -> str:
-    """从请求头取操作人，空则取默认。"""
+    """从请求头取操作人，空则取默认。
+
+    前端会做 encodeURIComponent：HTTP 头只允许 ASCII，中文姓名直接放会报
+    "Cannot convert argument to a ByteString"。这里 decode 回来；
+    若调用方（脚本/curl）没编码，unquote 对纯 ASCII 是空操作，向后兼容。
+    """
     op = request.headers.get(OPERATOR_HEADER) or ""
-    op = op.strip()
-    return op or shop_registry.default_operator()
+    return urllib.parse.unquote(op.strip()) or shop_registry.default_operator()
 
 
 def _verify_shop(shop_id: str) -> dict:
@@ -1740,15 +1744,19 @@ def upload_sku_image(batch_id: str, body: SkuImageBody, request: Request):
 
 
 @app.get("/images/preview")
-def preview_image(ref: str, request: Request = None):
+def preview_image(ref: str, shop_id: str = None, request: Request = None):
     """预览批次里的图片(供浏览器显示纯文本路径无法渲染的图)。
 
     支持两种引用:
       - local://{批次id}/{hash}.{ext}   浏览器上传或懒拷贝落盘后的本地图
       - disk:{共享盘绝对路径}            图片直读扫描写入的引用
     出于安全只允许读取白名单(店铺 image_root + ALLOWED_IMAGE_ROOTS)下的文件, 否则参数可读任意文件。
+
+    多店铺: 这个接口常被 <img src> 直接调用, 而浏览器自己发的请求**带不了**
+    X-Shop-Id 自定义头, 所以这里额外接受 ?shop_id= 查询参数(header 仍可用, 且优先用参数)。
     """
-    shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
+    shop_id = ((shop_id or "").strip()
+               or (_current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]))
     shop_root = shop_registry.image_root_for(shop_id)
     allowed_roots = list(dict.fromkeys(
         ([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)
