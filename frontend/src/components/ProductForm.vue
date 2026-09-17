@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Check, Delete, Plus, Search } from '@element-plus/icons-vue'
 import { storeApi } from '../api'
+import { currentShop } from '../shopContext'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -21,6 +22,10 @@ const categoryOptions = ref([])
 const selectedCategory = ref(null)
 const freightTemplates = ref([])
 const loadingFreightTemplates = ref(false)
+// 品牌的显示名：按 brand_id 调一次接口拿（微信有按 ID 精确查询的接口，不需要翻品牌库）
+const brandName = ref('')
+const brandEnName = ref('')
+const loadingBrandName = ref(false)
 const attrDefs = ref([])
 const attrValues = reactive({})
 const specDefs = ref([])
@@ -48,8 +53,63 @@ const form = reactive({
 const rules = {
   title: [{ required: true, message: '请输入商品标题', trigger: 'blur' }],
   out_product_id: [{ required: true, message: '请输入外部商品编码', trigger: 'blur' }],
-  brand_id: [{ required: true, message: '请输入品牌 ID', trigger: 'blur' }],
+  brand_id: [
+    { required: true, message: '请选择品牌', trigger: 'change' },
+    // 品牌框显示的是名称，但值必须是数字 ID（允许运营直接输入新的品牌 ID）
+    { pattern: /^\d+$/, message: '品牌必须是数字 ID；无品牌请选「无品牌（平台默认）」', trigger: 'change' },
+  ],
 }
+
+// 微信"无品牌"占位值（官方规定：无品牌填 2100000000）
+const WECHAT_DEFAULT_BRAND_ID = '2100000000'
+
+// 把品牌 ID 换成品牌名显示：微信有 /channels/ec/brand/get 可以**按 ID 精确查询**，一次请求即可。
+// （平台公共品牌库 /channels/ec/brand/all 是上万条、每页只给 10 条，翻页既慢又找不到店铺自有品牌，
+//   所以那个接口不能用来做下拉。）
+async function loadBrandName() {
+  const id = String(form.brand_id || '').trim()
+  brandName.value = ''
+  brandEnName.value = ''
+  if (!id || id === WECHAT_DEFAULT_BRAND_ID) return
+  loadingBrandName.value = true
+  try {
+    const data = await storeApi.brandDetail(id)
+    const result = data?.result || data || {}
+    brandName.value = result.name || ''
+    brandEnName.value = result.en_name || ''
+  } catch {
+    brandName.value = ''   // 查不到就走兜底文案，不打断编辑
+  } finally {
+    loadingBrandName.value = false
+  }
+}
+
+// 品牌选择框：**框里给运营看品牌名，实际提交的仍是 brand_id**。
+// 微信没有可用的品牌列表（平台库上万条、每页只给 10 条），所以选项就两项：
+// 本商品在用的品牌（按 ID 查出名称）+ 无品牌占位值；要换成别的品牌时可直接输入品牌 ID。
+const brandOptions = computed(() => {
+  const list = [{ id: WECHAT_DEFAULT_BRAND_ID, name: '无品牌（平台默认）' }]
+  const id = String(form.brand_id || '').trim()
+  if (id && id !== WECHAT_DEFAULT_BRAND_ID) {
+    const label = loadingBrandName.value
+      ? `${id}（查询中…）`
+      : (brandName.value || `${id}（未查到名称，请核对）`)
+    list.unshift({ id, name: label })
+  }
+  return list
+})
+
+const brandHint = computed(() => {
+  const id = String(form.brand_id || '').trim()
+  if (!id) return '请选择品牌；无品牌选「无品牌（平台默认）」'
+  if (id === WECHAT_DEFAULT_BRAND_ID) return '当前：无品牌（微信平台默认占位）'
+  if (loadingBrandName.value) return '正在查询品牌名称…'
+  if (brandEnName.value) return `英文名：${brandEnName.value}（品牌 ID：${id}）`
+  if (brandName.value) return `品牌 ID：${id}`
+  const conf = currentShop.value?.wechat || {}
+  if (String(conf.brand_id || '') === id && conf.brand_name) return `当前：${conf.brand_name}（店铺配置的品牌）`
+  return `品牌 ID：${id} —— 具体名称可在微信小店后台的品牌列表里核对`
+})
 
 const validHeadImages = computed(() => form.head_imgs.filter(Boolean))
 
@@ -91,6 +151,7 @@ onMounted(async () => {
     form.short_title = d.short_title || ''
     form.out_product_id = d.out_product_id || ''
     form.brand_id = d.brand_id || '2100000000'
+    void loadBrandName()   // 把品牌 ID 换成品牌名显示
     // 运费模板回填:微信商品详情用 express_info.template_id(非顶层 freight_template_id)
     form.freight_template_id = String(d.express_info?.template_id || d.freight_template_id || '')
     form.deliver_method = d.deliver_method ?? 0
@@ -317,8 +378,11 @@ async function submit() {
         <el-form-item label="外部商品编码" prop="out_product_id">
           <el-input v-model="form.out_product_id" placeholder="例如：SPU-2026-001" />
         </el-form-item>
-        <el-form-item label="品牌 ID" prop="brand_id">
-          <el-input v-model="form.brand_id" placeholder="无品牌可使用平台无品牌 ID" />
+        <el-form-item label="品牌" prop="brand_id">
+          <el-select v-model="form.brand_id" filterable allow-create default-first-option style="width: 100%" placeholder="选择品牌；要换其它品牌可直接输入品牌 ID" @change="loadBrandName">
+            <el-option v-for="item in brandOptions" :key="item.id" :label="item.name" :value="item.id" />
+          </el-select>
+          <div class="muted-copy" style="font-size: 12px; line-height: 1.5; margin-top: 4px">{{ brandHint }}</div>
         </el-form-item>
         <el-form-item label="商品毛重（克）">
           <el-input v-model="form.weight" placeholder="例如：500（将作为属性传给平台）" />

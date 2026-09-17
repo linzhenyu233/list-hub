@@ -31,6 +31,14 @@ export const storeApi = {
   uploadImage: (imgUrl) => http.post('/images/upload', { img_url: imgUrl }),
   // shopId 可选：不传用"当前选中店铺"，传了就用指定店铺（跨店发布要按目标店取该店运费模板）
   freightTemplates: (params = {}, shopId = '') => http.get('/freight-templates', { params, headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
+  // 按品牌 ID 查品牌名（编辑商品时把 10002926 显示成「钻石世家」）。一次请求即可，无需翻页。
+  brandDetail: (brandId) => http.get('/brand', { params: { brand_id: brandId }, timeout: 60000 }),
+  // 微信品牌列表。
+  // ⚠️ 当前前端**没有使用**它：微信品牌库上万条，而接口只能游标翻页、每页 10 条
+  //    （实测翻 40 页取 400 个耗时 58 秒，仍找不到本店在用的品牌），做不了下拉。
+  //    编辑商品页已改为「输入框 + 可读提示」（见 ProductForm.vue 的 brandHint）。
+  //    保留此方法以备后用（例如微信后续开放按名称搜索品牌）。
+  brands: () => http.get('/brands', { timeout: 180000 }),
   categoryDetail: (catId) => http.get('/category-detail', { params: { cat_id: catId } }),
   listProducts: (params = {}) => http.get('/products', { params }),
   getProduct: (id) => http.get(`/products/${id}`),

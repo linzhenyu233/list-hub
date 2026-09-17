@@ -335,6 +335,44 @@ def freight_templates(request: Request, page_size: int = Query(100, ge=1, le=100
     )
 
 
+@app.get("/brand")
+def brand_detail(request: Request, brand_id: str = Query("", description="微信品牌 ID")):
+    """按品牌 ID 查品牌名（编辑商品页把 10002926 显示成「钻石世家」用）。
+
+    一次请求就能拿到名称，不需要翻品牌库（`/brands` 那个列表接口因品牌库上万条已弃用）。
+    无品牌占位值(2100000000)直接返回空，由前端显示"无品牌"。
+    """
+    if not brand_id or brand_id == "2100000000":
+        return {"ok": True, "result": {}}
+    shop = shop_of(request)
+    store = store_for(shop)
+    shop_id = shop["shop_id"]
+    return ok_or_400(
+        lambda: _cached(
+            shop_id, ("brand", str(brand_id)), 12 * 3600,
+            lambda: store.get_brand(brand_id),
+        )
+    )
+
+
+@app.get("/brands")
+def brands(request: Request):
+    """微信品牌列表(前端品牌下拉用:运营看到的应该是品牌名,而不是 10002926 这种数字 ID)。
+
+    ⚠️ 微信接口是游标分页、每页 10 条,全量可能上千,所以这里给了长缓存(12 小时):
+       首次调用会慢几秒(前端点开下拉时懒加载),之后都命中缓存秒回。
+    """
+    shop = shop_of(request)
+    store = store_for(shop)
+    shop_id = shop["shop_id"]
+    return ok_or_400(
+        lambda: _cached(
+            shop_id, ("brands",), 12 * 3600,
+            lambda: store.get_all_brands(),
+        )
+    )
+
+
 @app.get("/category-detail")
 def category_detail(request: Request, cat_id: str = Query(..., description="叶子类目 ID")):
     """查叶子类目的属性(product_attr_list)和规格(sale_attr_list)定义。

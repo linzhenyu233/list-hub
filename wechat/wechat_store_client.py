@@ -340,6 +340,52 @@ class WxStore:
                           {"template_id": str(template_id)})
         return data.get("freight_template", {}) or {}
 
+    def get_brand(self, brand_id):
+        """按品牌 ID 查品牌名(编辑商品页要把 brand_id 显示成名字)。
+
+        ⚠️ 千万别用 /channels/ec/brand/all 去"翻"品牌名: 那是平台公共品牌库(上万条、
+           每页只给 10 条, 实测翻 40 页耗时 58 秒仍找不到本店品牌 10002926)。
+           微信提供了本接口按 ID 精确查询, **一次请求**即可拿到 ch_name/en_name。
+        返回 {"brand_id","name","en_name"}; 查不到返回 {} 由调用方兜底。
+        """
+        data = self._post("/channels/ec/brand/get", {"brand_id": str(brand_id)})
+        brand = data.get("brand") or {}
+        if not brand:
+            return {}
+        return {
+            "brand_id": str(brand.get("brand_id") or brand_id),
+            "name": brand.get("ch_name") or brand.get("en_name") or "",
+            "en_name": brand.get("en_name") or "",
+        }
+
+    def get_all_brands(self, max_pages=10):
+        """拉微信品牌列表(按品牌 ID 显示名称用)。
+
+        ⚠️ 实测(2026-09-17):官方 /channels/ec/brand/all 是**游标分页、每页固定只给 10 条**
+           (传 page_size 无效),品牌库上万条 —— 翻 40 页只取到 400 个、耗时 58 秒,
+           且本店在用的品牌(10002926)仍不在其中。**因此前端放弃了品牌下拉**,
+           改在编辑页用「输入框 + 可读提示」;本方法仅保留给按需人工查询/将来平台开放搜索时使用。
+        返回 {"brands": [{"brand_id","name","en_name"}], "truncated": 是否因页数上限截断}
+        """
+        brands = []
+        next_key = ""
+        for _ in range(max(1, int(max_pages))):
+            data = self._post("/channels/ec/brand/all", {"next_key": next_key} if next_key else {})
+            for row in (data.get("brands") or []):
+                brand_id = str(row.get("brand_id") or "").strip()
+                if not brand_id:
+                    continue
+                brands.append({
+                    "brand_id": brand_id,
+                    "name": row.get("ch_name") or row.get("en_name") or brand_id,
+                    "en_name": row.get("en_name") or "",
+                })
+            next_key = str(data.get("next_key") or "")
+            if not data.get("continue_flag") or not next_key:
+                return {"brands": brands, "truncated": False}
+        print(f"[brand] 品牌列表达到 {max_pages} 页上限仍未取完, 已取 {len(brands)} 个")
+        return {"brands": brands, "truncated": True}
+
     def get_freight_templates(self, page_size=100, page_num=1):
         """获取微信小店运费模板列表(带模板名称,前端下拉框直接可用)。
         ⚠️ 官方 getfreighttemplatelist 只返回 template_id_list(纯 ID 数组),没有名称,
