@@ -29,7 +29,8 @@ export const storeApi = {
   testToken: (shopId = '') => http.post('/token/test', null, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   searchCategories: (keyword) => http.get('/categories', { params: { keyword } }),
   uploadImage: (imgUrl) => http.post('/images/upload', { img_url: imgUrl }),
-  freightTemplates: (params = {}) => http.get('/freight-templates', { params }),
+  // shopId 可选：不传用"当前选中店铺"，传了就用指定店铺（跨店发布要按目标店取该店运费模板）
+  freightTemplates: (params = {}, shopId = '') => http.get('/freight-templates', { params, headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   categoryDetail: (catId) => http.get('/category-detail', { params: { cat_id: catId } }),
   listProducts: (params = {}) => http.get('/products', { params }),
   getProduct: (id) => http.get(`/products/${id}`),

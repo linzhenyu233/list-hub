@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus } from '@element-plus/icons-vue'
 import { xhsApi } from '../xhsApi'
+import { currentShop } from '../shopContext'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -44,6 +45,21 @@ const isLeaf = (item) => item.isLeaf === true || item.leaf === true || item.isLe
 const isSystemPlan = (item) => optionName(item).includes('系统创建')
 const isVirtualSystemPlan = (item) => isSystemPlan(item) && /虚拟|电子资料|自动发货/.test(optionName(item))
 const logisticsPlanLabel = (item) => `${isSystemPlan(item) ? '系统创建' : '商家创建'} · ${optionName(item)}`
+
+// 品牌下拉选项：当前品牌常常**不在平台品牌库里**（店铺已授权/自有品牌不参与品牌库检索，
+// 实测 brand_id=241795 翻遍该类目 320 个品牌都找不到），那样 el-select 匹配不到选项，
+// 就会把裸 ID「241795」直接显示给运营。这里用「店铺配置里的品牌名」补一条可读的兜底选项。
+const brandOptions = computed(() => {
+  const list = [...brands.value]
+  const id = String(form.brandId || '')
+  if (!id || list.some((brand) => String(optionId(brand)) === id)) return list
+  const conf = currentShop.value?.xhs || {}
+  const label = String(conf.brand_id || '') === id && conf.brand_name
+    ? `${conf.brand_name}（店铺默认品牌）`
+    : `当前品牌（ID: ${id}，请重新选择）`
+  list.unshift({ id, name: label })
+  return list
+})
 
 async function loadCategories(parentId = null, level = 0) {
   const data = await xhsApi.categories(parentId ? { category_id: parentId } : {})
@@ -234,12 +250,15 @@ onMounted(async () => {
     form.subName = d.subName || ''
     form.articleNo = d.articleNo || ''
     form.description = d.description || ''
-    form.brandId = d.brandId || ''
-    form.categoryId = d.categoryId || ''
-    form.shippingTemplateId = d.shippingTemplateId || ''
+    // ⚠️ 平台回填的数字型字段必须统一转成字符串：下拉选项的 value 都是字符串，
+    //    数字与字符串不相等会让 el-select 匹配不到选项、直接把原始数字显示出来
+    //    （运营看到的就是品牌「241795」、七天无理由「1」这种看不懂的值）。
+    form.brandId = d.brandId == null || d.brandId === '' ? '' : String(d.brandId)
+    form.categoryId = d.categoryId == null || d.categoryId === '' ? '' : String(d.categoryId)
+    form.shippingTemplateId = d.shippingTemplateId == null || d.shippingTemplateId === '' ? '' : String(d.shippingTemplateId)
     form.shippingGrossWeight = d.shippingGrossWeight || 500
-    form.freeReturn = d.freeReturn ?? '1'
-    form.deliveryMode = d.deliveryMode || '0'
+    form.freeReturn = d.freeReturn == null ? '1' : String(d.freeReturn)
+    form.deliveryMode = d.deliveryMode == null ? '0' : String(d.deliveryMode)
     form.videoUrl = d.videoUrl || ''
     form.transparentImage = d.transparentImage || ''
     form.images = d.images?.length ? [...d.images] : ['']
@@ -255,7 +274,7 @@ onMounted(async () => {
         originalPriceYuan: sku.originalPrice != null ? sku.originalPrice / 100 : null,
         priceYuan: sku.price != null ? sku.price / 100 : null,
         stock: sku.stock || 0,
-        logisticsPlanId: sku.logisticsPlanId || '',
+        logisticsPlanId: sku.logisticsPlanId == null ? '' : String(sku.logisticsPlanId),
         deliveryHours: sku.deliveryTime?.time ? Number(sku.deliveryTime.time) : 24,
         _variants: sku.variants || [],
       }))
@@ -263,6 +282,8 @@ onMounted(async () => {
     // 加载类目属性和规格
     if (form.categoryId) {
       try {
+        // 只取第一页：平台按相关性排序，店铺在用的品牌通常就在前面。
+        // 万一不在（店铺自有品牌不参与品牌库检索），下面 brandOptions 会用店铺配置兜底显示可读名称。
         const [brandData, attrData, varData] = await Promise.all([
           xhsApi.brands(form.categoryId),
           xhsApi.categoryAttributes(form.categoryId),
@@ -302,7 +323,7 @@ onMounted(async () => {
       </div>
       <el-form-item label="末级类目" required><div class="category-levels"><el-select v-for="(options, level) in categoryLevels" :key="level" :model-value="selectedCategories[level]" :loading="loadingOptions" placeholder="请选择类目" @change="selectCategory($event, level)"><el-option v-for="item in options" :key="optionId(item)" :label="optionName(item)" :value="optionId(item)" /></el-select></div></el-form-item>
       <div class="form-grid form-grid-2">
-        <el-form-item label="品牌" prop="brandId" :rules="[{ required: true, message: '请选择品牌' }]"><el-select v-model="form.brandId" :loading="loadingOptions" filterable placeholder="选择末级类目后加载"><el-option v-for="item in brands" :key="optionId(item)" :label="optionName(item)" :value="optionId(item)" /></el-select></el-form-item>
+        <el-form-item label="品牌" prop="brandId" :rules="[{ required: true, message: '请选择品牌' }]"><el-select v-model="form.brandId" :loading="loadingOptions" filterable placeholder="选择末级类目后加载"><el-option v-for="item in brandOptions" :key="optionId(item)" :label="optionName(item)" :value="optionId(item)" /></el-select></el-form-item>
         <el-form-item label="运费模板" prop="shippingTemplateId" :rules="[{ required: true, message: '请选择运费模板' }]"><el-select v-model="form.shippingTemplateId" :loading="loadingOptions"><el-option v-for="item in shippingTemplates" :key="optionId(item)" :label="optionName(item)" :value="optionId(item)" /></el-select></el-form-item>
         <el-form-item label="商品毛重（克）"><el-input-number v-model="form.shippingGrossWeight" :min="1" /></el-form-item>
         <el-form-item label="七天无理由退货"><el-select v-model="form.freeReturn"><el-option label="支持" value="1" /><el-option label="不支持" value="0" /></el-select></el-form-item>

@@ -49,6 +49,9 @@ const itemName = (item) => item.name || item.title || '未命名商品'
 const itemImage = (item) => item.images?.[0] || item.image || ''
 const itemSkus = (item) => item.skus || item.skuInfos || []
 const skuId = (sku) => sku.skuId || sku.id || sku.sku_id
+// ⚠️ 2026-09-17 实测纠正：buyable 不能作为「能否上架」的判据。
+//    运营在小红书后台把商品上架成功后，接口返回的 buyable 依然是 false（三个商品、所有规格都如此）。
+//    因此这里只用于列表页的粗略标注（"售卖中/未在售"），上架操作一律不再拿它拦截 —— 直接调平台让平台裁决。
 const buyable = (sku) => sku.buyable === true || sku.buyable === 1 || sku.available === 1
 const itemPrice = (item) => {
   const prices = itemSkus(item).map((sku) => Number(sku.price)).filter(Number.isFinite)
@@ -133,7 +136,7 @@ const pagedItems = computed(() => {
 const filterOptions = computed(() => [
   { label: `全部（${stats.value.total}）`, value: 'all' },
   { label: `售卖中（${stats.value.buyable}）`, value: 'buyable' },
-  { label: `审核中/不可售（${stats.value.unavailable}）`, value: 'unavailable' },
+  { label: `未在售（${stats.value.unavailable}）`, value: 'unavailable' },
   { label: `无 SKU（${stats.value.noSku}）`, value: 'no_sku' },
 ])
 
@@ -241,16 +244,16 @@ function statusText(item) {
   const skus = itemSkus(item)
   if (!statusLoaded.value && !skus.length) return { label: '状态查询中', type: 'info' }
   if (skus.some(buyable)) return { label: '售卖中', type: 'success' }
-  if (skus.length) return { label: '审核中/不可售', type: 'warning' }
+  // 平台接口给不出可靠的审核状态，这里只说明"未在售"，真实状态以小红书后台为准
+  if (skus.length) return { label: '未在售', type: 'warning' }
   return { label: '未创建 SKU', type: 'info' }
 }
 
 async function setAvailable(sku, available) {
   const id = skuId(sku)
   if (!id) return ElMessage.warning('当前商品缺少 SKU ID')
-  if (available === 1 && !buyable(sku)) {
-    return ElMessage.warning('该 SKU 尚未审核通过，暂不能上架')
-  }
+  // 注意：这里不再用 buyable 预判能否上架（该字段在已可售的商品上也返回 false）。
+  // 审核未通过时平台会直接返回错误，把平台原文提示出来即可，运营一看就知道原因。
   actionId.value = `${id}-${available}`
   try {
     await xhsApi.setSkuAvailable(id, available)
@@ -263,13 +266,22 @@ async function setAvailable(sku, available) {
 }
 
 async function setItemAvailable(item, available) {
-  const skus = available === 1 ? itemSkus(item).filter(buyable) : itemSkus(item)
-  if (!skus.length) return ElMessage.warning(available ? '商品暂无审核通过、可以上架的规格' : '商品暂无可操作的规格')
+  // 关键修复：不再按 buyable 过滤规格。
+  // 该字段在"平台后台已上架成功"的商品上依然返回 false，按它过滤会让运营永远点不动上架。
+  // 现在对全部规格发起操作，逐个收结果：能上的上，不能上的把平台原因显示出来。
+  const skus = itemSkus(item).filter((sku) => skuId(sku))
+  if (!skus.length) return ElMessage.warning('商品暂无可操作的规格')
   const id = itemId(item)
   actionId.value = `${id}-${available}`
   try {
-    await Promise.all(skus.map((sku) => xhsApi.setSkuAvailable(skuId(sku), available)))
-    ElMessage.success(available ? '商品已提交上架' : '商品已提交下架')
+    const results = await Promise.allSettled(skus.map((sku) => xhsApi.setSkuAvailable(skuId(sku), available)))
+    const failed = results.filter((result) => result.status === 'rejected')
+    const ok = results.length - failed.length
+    const verb = available ? '上架' : '下架'
+    const reason = failed[0]?.reason?.message || '平台拒绝'
+    if (!failed.length) ElMessage.success(`商品已提交${verb}（${ok} 个规格）`)
+    else if (ok) ElMessage.warning(`已有 ${ok} 个规格${verb}成功，${failed.length} 个失败：${reason}`)
+    else ElMessage.error(`${verb}失败：${reason}`)
     await loadItems()
   } catch (error) {
     ElMessage.error(error.message)
@@ -346,7 +358,7 @@ watch(() => props.refreshTick, () => { if (serviceOnline.value) void loadItems()
     <div class="stats-grid">
       <div class="stat-item"><span>商品总数</span><strong>{{ stats.total }}</strong><el-icon><Goods /></el-icon></div>
       <div class="stat-item"><span>售卖中</span><strong>{{ stats.buyable }}</strong><el-icon class="green"><CircleCheck /></el-icon></div>
-      <div class="stat-item"><span>审核中 / 不可售</span><strong>{{ stats.unavailable }}</strong><el-icon class="amber"><Clock /></el-icon></div>
+      <div class="stat-item"><span>未在售</span><strong>{{ stats.unavailable }}</strong><el-icon class="amber"><Clock /></el-icon></div>
       <div class="stat-item"><span>无 SKU</span><strong>{{ stats.noSku }}</strong><el-icon class="gray"><Remove /></el-icon></div>
     </div>
     <section class="content-panel">

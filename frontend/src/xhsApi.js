@@ -28,9 +28,13 @@ export const xhsApi = {
   itemStatus: (itemIds) => http.post('/items/status', { item_ids: itemIds }),
   getItem: (itemId) => http.get(`/items/${itemId}`),
   categories: (params = {}) => http.get('/categories', { params }),
-  brands: (categoryId, keyword = '') => http.get('/brands', { params: { category_id: categoryId, keyword } }),
-  shippingTemplates: () => http.get('/shipping-templates'),
-  logisticsPlans: () => http.get('/logistics-plans'),
+  // brandId 可选：编辑页回显品牌的 ID 常不在第一页（平台每页只给 20 个），
+  // 传了它后端会翻页把该品牌捞回来，否则下拉匹配不到、只能显示数字 ID。
+  brands: (categoryId, keyword = '', brandId = '') => http.get('/brands', { params: { category_id: categoryId, keyword, brand_id: brandId || undefined } }),
+  // shopId 可选：不传用"当前选中店铺"，传了就用指定店铺（跨店发布时按目标店取该店参数）。
+  // 依赖 shopContext.applyShopHeaders 的"显式头不覆盖"规则。
+  shippingTemplates: (shopId = '') => http.get('/shipping-templates', { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
+  logisticsPlans: (shopId = '') => http.get('/logistics-plans', { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   categoryAttributes: (categoryId) => http.get('/category-attributes', { params: { category_id: categoryId } }),
   categoryVariations: (categoryId) => http.get('/category-variations', { params: { category_id: categoryId } }),
   attributeValues: (categoryId, attributeId) => http.get('/attribute-values', { params: { category_id: categoryId, attribute_id: attributeId } }),

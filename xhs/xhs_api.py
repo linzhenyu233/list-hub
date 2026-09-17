@@ -46,12 +46,15 @@
     PUT  /items/{item_id}                    改商品 {"item":{},"updated_fields":[...]}
     PUT  /skus/{sku_id}                      改价格/库存 {"sku":{},"updated_fields":[...]}
 
-审核状态说明(前端列表页"审核中/已上架"怎么来):
-    小红书"先审后发",商品创建后要过审核(24h~1-3工作日)才能上架。
-    用 GET /items/{id} 或 POST /items/status 查 skus[].buyable:
-        buyable=false → 审核中/不可售(上架按钮置灰,上架会报 -5000300)
-        buyable=true  → 审核通过/可售(可点上架)
-    建议列表页每 5 分钟调一次 /items/status 刷新状态。
+上下架与审核状态说明(前端列表页"售卖中/未在售"怎么来):
+    ⚠️ 2026-09-17 实测纠正: 曾经把 skus[].buyable 当作"审核是否通过"的依据并据此拦截上架,
+       结果运营在小红书后台手动上架成功后, 接口返回的 buyable 仍然是 false(三个商品、所有规格),
+       而商品确实已经可售 —— 说明 buyable 不能用来判断"能否上架"。
+       现行做法: 前端不做拦截, 直接调 product.updateSkuAvailable 让平台裁决;
+       失败时把平台错误原文透出(审核未通过时平台会报 -5000300 这类明确错误)。
+       buyable 仅用于列表页粗略标注, 文案统一说"未在售", 真实状态以平台后台为准。
+    小红书是"先审后发", 商品创建后要过审核(24h~1-3 工作日)才能上架。
+    建议列表页每 5 分钟调一次 /items/status 刷新标注。
 ====================================================================
 """
 import os
@@ -432,18 +435,53 @@ def categories(request: Request,
     return {"ok": True, "total": len(cats), "result": cats}
 
 
+# 平台品牌搜索每页最多给 20 个(实测传 pageSize=500 也只返回 20),而珠宝类目品牌上百个。
+# 编辑页回显一个排序靠后的品牌时, 只取第一页会让前端下拉匹配不到该选项、直接把数字 ID 显示给运营,
+# 所以传了 brand_id 就继续翻页把它捞回来。
+_BRAND_PAGE_MAX = 16      # 最多翻 16 页(约 300 个品牌), 兜底防止无限翻页
+_BRAND_PAGE_SIZE = 50     # 平台按自己的上限截断, 这里给大值以免平台放宽后取少了
+
+
+def _brand_page(sid: str, category_id: str, keyword: str, page: int) -> list:
+    """取品牌搜索的某一页(带缓存)。每页究竟多少条由平台决定,这里不做假设。"""
+    data = _cached(
+        sid, ("brands", str(category_id), str(keyword), page), 6 * 3600,
+        lambda: _xhs_call("common.brandSearch", {
+            "categoryId": category_id, "keyword": keyword,
+            "pageNo": page, "pageSize": _BRAND_PAGE_SIZE}, shop_id=sid),
+    )
+    return list((data or {}).get("brands") or (data or {}).get("brandList") or [])
+
+
 @app.get("/brands")
 def brands(request: Request,
            category_id: str = Query(..., description="末级类目ID(必填,选完类目再查)"),
-           keyword: str = Query("", description="品牌关键词")):
-    """搜索品牌(创建商品 brandId 必填,从这里查)"""
+           keyword: str = Query("", description="品牌关键词"),
+           brand_id: str = Query("", description="编辑页回显用：需要一并返回的品牌ID(可能不在第一页)")):
+    """搜索品牌(创建商品 brandId 必填,从这里查)
+
+    brand_id 非空且不在第一页时, 并发翻页把该品牌找出来补进结果 —— 否则前端下拉没有这个选项,
+    编辑页会把原始品牌ID(如 241795)直接展示给运营, 运营看不懂。
+    页结果有 6 小时缓存, 同一类目的第二次编辑不会再产生平台请求。
+    """
     sid = shop_of(request)["shop_id"]
-    data = _cached(
-        sid, ("brands", str(category_id), str(keyword)), 6 * 3600,
-        lambda: _xhs_call("common.brandSearch", {
-            "categoryId": category_id, "keyword": keyword, "pageNo": 1, "pageSize": 50}, shop_id=sid),
-    )
-    return {"ok": True, "result": data}
+    first_rows = _brand_page(sid, category_id, keyword, 1)
+    if not brand_id or any(str(b.get("id")) == str(brand_id) for b in first_rows):
+        return {"ok": True, "result": {"brands": first_rows}}
+
+    rows = list(first_rows)
+    seen = {str(b.get("id")) for b in rows}
+    pages = list(range(2, _BRAND_PAGE_MAX + 1))
+    with ThreadPoolExecutor(max_workers=min(8, len(pages))) as pool:
+        for chunk in pool.map(lambda page: _brand_page(sid, category_id, keyword, page), pages):
+            for brand in chunk:
+                key = str(brand.get("id"))
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(brand)
+            if str(brand_id) in seen:
+                break
+    return {"ok": True, "result": {"brands": rows}}
 
 
 @app.get("/shipping-templates")
@@ -707,7 +745,8 @@ def items_status(request: Request, body: dict = Body(..., example={"item_ids": [
 @app.post("/skus/{sku_id}/available")
 def set_sku_available(sku_id: str, request: Request, body: dict = Body(..., example={"available": 1})):
     """行内上下架。available: 1=上架(买家可见) 0=下架。
-    ⚠️ 上架前必须审核通过(buyable=true),否则报 -5000300。
+    ⚠️ 不要用 buyable 预判能否上架(2026-09-17 实测: 平台后台已上架成功的商品该字段仍返回 false)。
+       审核未通过时平台会直接报错(如 -5000300), 把错误原样透出给运营即可。
     小红书按 SKU 粒度上下架,商品多个 SKU 要逐个调。"""
     sid = shop_of(request)["shop_id"]
     available = body.get("available")

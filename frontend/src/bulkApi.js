@@ -26,18 +26,25 @@ export const bulkApi = {
   getBatch: (id) => http.get(`/import/${id}`),
   // 每个商品已有哪些发布记录(跨批次, 按商品编码汇总): step3 标记"已发布/失败/未发布", 避免重复勾选。
   // 注意是按商品而不是按批次 —— 重新导入货盘会生成新批次, 按批次统计会把历史记录丢掉。
-  publishStatus: () => http.get('/publish-status'),
+  // shopId 可选：不传用"当前选中店铺"；跨店发布后要看目标店的发布记录时显式传目标店
+  publishStatus: (shopId = '') => http.get('/publish-status', { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   // 核对发布状态: 把本地"已发布"记录拿去平台核一遍, 后台删掉的商品改回"未发布"以便重发。
   // mode=reset 表示人工确认已删除, 不请求平台(小红书查不出来时的兜底)。逐条查平台, 给足超时。
-  verifyPublishStatus: (body) => http.post('/publish-status/verify', body, { timeout: 600000 }),
+  // shopId 可选：跨店发布后核对的是目标店的记录（不传=当前选中店铺）
+  verifyPublishStatus: (body, shopId = '') => http.post('/publish-status/verify', body, { timeout: 600000, headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   updateItems: (id, items) => http.put(`/import/${id}/items`, { items }),
   updateMappings: (id, mappings) => http.put(`/import/${id}/mappings`, { mappings }),
   validate: (id) => http.post(`/import/${id}/validate`),
-  publish: (id, platforms, productCodes = null) => http.post(`/import/${id}/publish`, { platforms, product_codes: productCodes }),
+  // 跨店发布：targetShopId 不传=当前店铺（同店发布，行为与改造前完全一致）；
+  // params 是目标店的店铺私有参数（微信运费模板 / 小红书运费模板+物流方案+品牌），后端存成任务快照
+  publish: (id, platforms, productCodes = null, targetShopId = '', params = null) => http.post(`/import/${id}/publish`, {
+    platforms, product_codes: productCodes, target_shop_id: targetShopId || null, params,
+  }),
   imageCacheStats: () => http.get('/image-cache/stats'),
   clearImageCache: () => http.delete('/image-cache'),
-  job: (id) => http.get(`/jobs/${id}`),
-  retry: (id, itemIds = []) => http.post(`/jobs/${id}/retry`, { item_ids: itemIds }),
+  // shopId 可选：跨店发布的任务属于目标店，查进度/重试失败项必须带目标店，否则 404
+  job: (id, shopId = '') => http.get(`/jobs/${id}`, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
+  retry: (id, itemIds = [], shopId = '') => http.post(`/jobs/${id}/retry`, { item_ids: itemIds }, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   categoryAliases: () => http.get('/category-aliases'),
   saveCategoryAlias: (body) => http.post('/category-aliases', body),
   deleteCategoryAlias: (id) => http.delete(`/category-aliases/${id}`),

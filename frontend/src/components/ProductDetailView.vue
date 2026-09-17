@@ -34,7 +34,7 @@ const statusInfo = computed(() => {
   if (!skus.value.length) return { label: '暂无规格', type: 'info' }
   return skus.value.some((sku) => sku.buyable === true || sku.buyable === 1 || sku.available === 1)
     ? { label: '销售中', type: 'success' }
-    : { label: '待审核或未上架', type: 'warning' }
+    : { label: '未在售', type: 'warning' }
 })
 
 const merchantCode = computed(() => (
@@ -126,7 +126,7 @@ function skuStatus(sku) {
   }
   return sku.buyable === true || sku.buyable === 1 || sku.available === 1
     ? { label: '销售中', type: 'success' }
-    : { label: '待审核或未上架', type: 'warning' }
+    : { label: '未在售', type: 'warning' }
 }
 
 function formatSkuPrice(sku, field) {
