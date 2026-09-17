@@ -152,6 +152,7 @@ def db():
     # 如果索引先建，老库还没有 shop_id 列，CREATE INDEX 会直接报 no such column。
     _create_tables(conn)
     _migrate_add_shop_id(conn)
+    _migrate_add_job_params(conn)
     _rebuild_multishop_tables(conn)
     _reassign_legacy_shop(conn)
     _create_indexes(conn)
@@ -182,7 +183,10 @@ def _create_tables(conn):
         id TEXT PRIMARY KEY, shop_id TEXT NOT NULL, batch_id TEXT NOT NULL,
         platforms_json TEXT NOT NULL, status TEXT NOT NULL, total INTEGER DEFAULT 0,
         processed INTEGER DEFAULT 0, success INTEGER DEFAULT 0, failed INTEGER DEFAULT 0,
-        operator TEXT, created_at TEXT, updated_at TEXT
+        operator TEXT, created_at TEXT, updated_at TEXT,
+        -- 跨店发布：目标店铺的私有参数快照(运费模板/物流方案/品牌)。
+        -- shop_id 即目标店；本字段让 worker 执行时覆盖批次里的来源店参数。空对象=同店发布。
+        params_json TEXT NOT NULL DEFAULT '{}'
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS publish_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, batch_id TEXT NOT NULL,
@@ -344,6 +348,16 @@ def _safe_add_column(conn, table, col_def):
         if "duplicate column name" in str(e).lower():
             return
         raise
+
+
+def _migrate_add_job_params(conn):
+    """给 publish_jobs 补 params_json 列（跨店发布的目标店参数快照）。幂等。
+
+    ⚠️ 为什么不写进 _migrate_add_shop_id：那个函数在「表里已有 shop_id」时直接 return，
+       而所有现存库都早已是多店版，新列塞进去会永远补不上（老库启动即报 no such column）。
+    ⚠️ 已有任务行回填 '{}'：表示「与批次同店发布」，即改造前的语义，行为完全不变。
+    """
+    _safe_add_column(conn, "publish_jobs", "params_json TEXT NOT NULL DEFAULT '{}'")
 
 
 def _meta_get(conn, key, default=None):
@@ -808,13 +822,62 @@ def _xhs_payload(product, mapping, group_config=None):
     return {"item": item, "sku_list": sku_list}
 
 
+# 跨店发布：任务(job)里存了目标店的店铺私有参数，执行时必须覆盖批次里的来源店参数，
+# 否则会把来源店的运费模板/物流方案/品牌发给目标店（平台会拒：模板不属于该店）。
+# 只覆盖这 4 个「按店不同」的键；类目/属性/SKU规格是平台级的，跨店通用，绝不能动。
+_SHOP_SCOPED_MAPPING_KEYS = (
+    "wechat_freight_template_id",   # 微信运费模板
+    "xhs_shipping_template_id",     # 小红书运费模板
+    "xhs_logistics_plan_id",        # 小红书物流方案
+    "xhs_brand_id",                 # 小红书品牌
+)
+
+
+def _job_params_of(row):
+    """取任务所属 job 的店铺参数快照。
+
+    row 由 worker 的 LEFT JOIN 查询产出；老库或同店发布时该字段可能是 NULL/空串，一律当空处理。
+    """
+    try:
+        raw = row["job_params_json"]
+    except (IndexError, KeyError):
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_job_params(mapping, job_params):
+    """把目标店的店铺私有参数覆盖到映射上。
+
+    ⚠️ 必须返回副本：mapping 取自批次缓存(get_batch_cached)，就地改写会污染缓存，
+       导致之后同一批次的「同店发布」也用上目标店的模板。
+    """
+    if not job_params:
+        return mapping
+    merged = dict(mapping)
+    for key in _SHOP_SCOPED_MAPPING_KEYS:
+        value = job_params.get(key)
+        if value:
+            merged[key] = value
+    return merged
+
+
 def _run_publish_item(row):
     shop_id = row["shop_id"]
     # 用缓存版:避免每个发布项都重新 json.loads 全量 rows + mappings(800 商品时单次近百毫秒)
     batch = get_batch_cached(row["batch_id"])
     product = next((p for p in batch["products"] if p.get("product_code") == row["product_code"]), None)
     if not product: raise RuntimeError("商品不存在")
-    mapping = batch["mappings"].get("products", {}).get(row["product_code"], {})
+    # 批次映射(来源店) + 任务参数(目标店) → 真正用于发布的映射
+    mapping = _apply_job_params(
+        batch["mappings"].get("products", {}).get(row["product_code"], {}),
+        _job_params_of(row),
+    )
     group_config = batch["mappings"].get("attr_groups", {}).get(product.get("internal_category"), {})
     if row["platform"] == "wechat":
         product = _prepare_platform_images(product, "wechat", shop_id=shop_id)
@@ -882,16 +945,21 @@ def _worker_loop(platform=None, shop_id=None):
             conn = db()
             conn.execute("BEGIN IMMEDIATE")
             # priority DESC: 分批发布(只选中几件)的项插到前面先跑, 再按 id 先到先服务
+            # JOIN 出 job 的店铺参数快照：跨店发布时用它覆盖批次里的来源店参数
             if platform:
                 item = conn.execute(
-                    "SELECT * FROM publish_items WHERE shop_id=? AND status='queued' AND platform=? "
-                    "ORDER BY priority DESC, id LIMIT 1",
+                    "SELECT i.*, j.params_json AS job_params_json FROM publish_items i "
+                    "LEFT JOIN publish_jobs j ON j.id = i.job_id "
+                    "WHERE i.shop_id=? AND i.status='queued' AND i.platform=? "
+                    "ORDER BY i.priority DESC, i.id LIMIT 1",
                     (shop_id, platform)
                 ).fetchone()
             else:
                 item = conn.execute(
-                    "SELECT * FROM publish_items WHERE shop_id=? AND status='queued' "
-                    "ORDER BY priority DESC, id LIMIT 1",
+                    "SELECT i.*, j.params_json AS job_params_json FROM publish_items i "
+                    "LEFT JOIN publish_jobs j ON j.id = i.job_id "
+                    "WHERE i.shop_id=? AND i.status='queued' "
+                    "ORDER BY i.priority DESC, i.id LIMIT 1",
                     (shop_id,)
                 ).fetchone()
             if not item:
@@ -973,6 +1041,11 @@ class MappingsBody(BaseModel):
 class PublishBody(BaseModel):
     platforms: list[str]
     product_codes: list[str] | None = None  # 不传=全量发布,传了=只发布指定商品(分批发布)
+    # 跨店发布：目标店铺（不传=当前店铺，即改造前的同店发布行为）。
+    # 任务写到目标店名下(worker 用该店凭证发布)，params 是该店的私有参数
+    # （微信运费模板 / 小红书运费模板+物流方案+品牌），执行时覆盖批次里的来源店参数。
+    target_shop_id: str | None = None
+    params: dict | None = None
 
 
 class RetryBody(BaseModel):
@@ -1887,17 +1960,28 @@ def validate(batch_id: str, request: Request):
 
 @app.post("/import/{batch_id}/publish")
 def publish(batch_id: str, body: PublishBody, request: Request):
+    # 这里有两个身份，别混淆：
+    #   来源店 = 批次所属店（由 X-Shop-Id 决定），提供平台级映射(类目/属性/SKU规格)；
+    #   目标店 = 任务写到哪家店（由 body.target_shop_id 决定），决定用谁的凭证 + 店铺参数发布。
+    # 不传 target_shop_id 时两者相同，即改造前的同店发布。
     shop_id = _current_shop_id(request)
     _verify_shop(shop_id)
     operator = _current_operator(request)
     batch = batch_or_404(batch_id, shop_id)
+    target_shop_id = (body.target_shop_id or "").strip() or shop_id
+    _verify_shop(target_shop_id)
+    cross_shop = target_shop_id != shop_id
     if batch["errors"]: raise HTTPException(400, "仍有校验错误，不能发布")
-    # 校验所选平台在该店铺下都配置了
+    # 校验所选平台在**目标店**下都配置了（凭证与店铺参数都按目标店取）
     platforms = [p for p in body.platforms if p in ("wechat", "xhs")]
     if not platforms: raise HTTPException(400, "至少选择一个发布平台")
     for p in platforms:
-        if not shop_registry.has_platform(shop_id, p):
-            raise HTTPException(400, f"当前店铺未配置 {p} 平台")
+        if not shop_registry.has_platform(target_shop_id, p):
+            raise HTTPException(400, f"目标店铺未配置 {p} 平台")
+        # 跨店复用来源店的平台级映射，所以来源店必须也是同一平台：
+        # 微信批次的类目/属性发不到小红书，硬发必被平台拒。
+        if cross_shop and not shop_registry.has_platform(shop_id, p):
+            raise HTTPException(400, f"来源店铺未配置 {p} 平台，不能跨店发布该平台")
     # 按 product_codes 过滤(分批发布);不传则全量
     products = batch["products"]
     if body.product_codes:
@@ -1912,7 +1996,8 @@ def publish(batch_id: str, body: PublishBody, request: Request):
     pending = []
     for product in products:
         for platform in platforms:
-            row = check_conn.execute("SELECT * FROM publish_items WHERE shop_id=? AND batch_id=? AND product_code=? AND platform=? ORDER BY id DESC LIMIT 1", (shop_id, batch_id, product["product_code"], platform)).fetchone()
+            # 幂等按**目标店**判断：发给 A 店成功的记录，不该阻止把同一批货发给 B 店
+            row = check_conn.execute("SELECT * FROM publish_items WHERE shop_id=? AND batch_id=? AND product_code=? AND platform=? ORDER BY id DESC LIMIT 1", (target_shop_id, batch_id, product["product_code"], platform)).fetchone()
             # deleted=核对后确认平台商品已被删除, cancelled=人工停掉: 都不算"发过", 必须放行重新发,
             # 否则运营在平台后台删完商品后, 这一批永远卡在"已有发布任务，未重复创建"。
             if row and row["status"] not in ("deleted", "cancelled"):
@@ -1925,7 +2010,7 @@ def publish(batch_id: str, body: PublishBody, request: Request):
         check_conn.close()
         status = reusable["status"]
         message = {"success": "所选商品已发布，未重复创建", "failed": "所选商品已有失败项，请使用重试失败项", "partial": "所选商品存在部分成功项，请勿重复创建"}.get(status, "所选商品已有发布任务，未重复创建")
-        return {"ok": True, "job_id": reusable["job_id"], "batch_id": batch_id, "platforms": platforms, "existing": True, "created_count": 0, "skipped_count": len(prior), "message": message}
+        return {"ok": True, "job_id": reusable["job_id"], "batch_id": batch_id, "platforms": platforms, "existing": True, "created_count": 0, "skipped_count": len(prior), "target_shop_id": target_shop_id, "cross_shop": cross_shop, "message": message}
     # Keep the write transaction open through job/item insertion.
     conn = check_conn
     job_id = uuid.uuid4().hex
@@ -1933,12 +2018,17 @@ def publish(batch_id: str, body: PublishBody, request: Request):
     # 分批发布(带了 product_codes) = 运营明确只要发这几件, 标记优先, 插到队列前面走
     partial = bool(body.product_codes)
     priority = 1 if partial else 0
-    conn.execute("INSERT INTO publish_jobs(id,shop_id,batch_id,platforms_json,status,total,operator,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (job_id, shop_id, batch_id, json.dumps(platforms), "queued", total, operator, now(), now()))
+    # 任务与任务项写到**目标店**名下（worker 据此用目标店凭证发布，图片素材也传目标店）；
+    # params_json 存该店私有参数，执行时覆盖批次里的来源店参数。
+    # 批次本身仍属来源店：状态更新按来源店，绝不改批次的 shop_id。
+    conn.execute("INSERT INTO publish_jobs(id,shop_id,batch_id,platforms_json,status,total,operator,created_at,updated_at,params_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (job_id, target_shop_id, batch_id, json.dumps(platforms), "queued", total, operator, now(), now(), json.dumps(body.params or {})))
     for product_code, platform in (pending or [(product["product_code"], platform) for product in products for platform in platforms]):
-        conn.execute("INSERT INTO publish_items(job_id,shop_id,batch_id,product_code,platform,status,priority) VALUES(?,?,?,?,?,?,?)", (job_id, shop_id, batch_id, product_code, platform, "queued", priority))
+        conn.execute("INSERT INTO publish_items(job_id,shop_id,batch_id,product_code,platform,status,priority) VALUES(?,?,?,?,?,?,?)", (job_id, target_shop_id, batch_id, product_code, platform, "queued", priority))
     conn.execute("UPDATE batches SET status=? WHERE id=? AND shop_id=?", ("发布任务已创建", batch_id, shop_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id)
     message = f"已创建发布任务({len(products)} 件商品 × {len(platforms)} 平台)" if partial else "发布任务已入队，后台将持续执行"
-    return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "message": message}
+    if cross_shop:
+        message += f"（目标店铺：{target_shop_id}）"
+    return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "target_shop_id": target_shop_id, "cross_shop": cross_shop, "message": message}
 
 
 @app.get("/publish-status")
@@ -2268,8 +2358,12 @@ def delete_alias(alias_id: int, request: Request):
 # 映射表批量导入:运营提前整理"内部类目 -> 平台类目路径"Excel,
 # 导入时按官方类目名逐级反查平台类目ID并校验,成功行存入映射表。
 # ------------------------------------------------------------------
-WECHAT_API_BASE = os.environ.get("WECHAT_API_BASE", "http://localhost:8000")
-XHS_API_BASE = os.environ.get("XHS_API_BASE", "http://localhost:8010")
+# ⚠️ 默认值必须是 127.0.0.1 而不是 localhost：Windows 下 localhost 优先解析成 IPv6 [::1]，
+#    而两个平台服务只监听 IPv4，导致每次调用都要先把 ::1 连超时才回退 IPv4
+#    （实测 worker 进程里堆着一排 SYN_SENT 到 [::1]:8000/8010，明显拖慢任务领取与图片上传）。
+#    127.0.0.1 是纯 IPv4，行为确定。
+WECHAT_API_BASE = os.environ.get("WECHAT_API_BASE", "http://127.0.0.1:8000")
+XHS_API_BASE = os.environ.get("XHS_API_BASE", "http://127.0.0.1:8010")
 
 
 def _http_get_json(url, timeout=60, shop_id=None, extra_headers=None):
