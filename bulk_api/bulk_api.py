@@ -2310,16 +2310,36 @@ def retry_job(job_id: str, body: RetryBody, request: Request):
 
 @app.get("/category-aliases")
 def list_aliases(request: Request):
-    shop_id = _current_shop_id(request)
+    """类目别名映射表（跨店铺共享读取）。
+
+    ⚠️ 这里刻意返回**所有店铺**的别名，而不是只看当前店：
+       平台类目树是全局的（同一平台下所有店铺共用同一棵树），别名表里也只存
+       类目链 / 属性默认值 / 规格映射，不含任何店铺私有参数（运费模板、物流方案、
+       品牌都不在这张表里）。原来按 shop_id 过滤，会让"4 家店卖同类珠宝"变成
+       同一套映射要配 4 遍，而实际上配一次就该全平台通用。
+
+    同内部类目可能分散在不同店铺的行里（A 店配了微信侧、B 店只配了小红书侧），
+    所以两侧各自取最近一次有值的，拼成一份完整映射返回。
+    """
     conn = db()
-    rows = conn.execute("SELECT * FROM category_aliases WHERE shop_id=? ORDER BY updated_at DESC", (shop_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM category_aliases ORDER BY updated_at DESC").fetchall()
     conn.close()
-    return {"ok": True, "result": [{
-        "id": r["id"], "internal_category": r["internal_category"],
-        "wechat": json.loads(r["wechat_json"]) if r["wechat_json"] else None,
-        "xhs": json.loads(r["xhs_json"]) if r["xhs_json"] else None,
-        "updated_at": r["updated_at"],
-    } for r in rows]}
+    merged: dict = {}
+    for r in rows:
+        key = r["internal_category"]
+        entry = merged.get(key)
+        if entry is None:
+            entry = merged[key] = {
+                "id": r["id"], "internal_category": key, "shop_id": r["shop_id"],
+                "wechat": None, "xhs": None, "updated_at": r["updated_at"],
+                "shop_ids": [],
+            }
+        entry["shop_ids"].append(r["shop_id"])
+        if entry["wechat"] is None and r["wechat_json"]:
+            entry["wechat"] = json.loads(r["wechat_json"])
+        if entry["xhs"] is None and r["xhs_json"]:
+            entry["xhs"] = json.loads(r["xhs_json"])
+    return {"ok": True, "result": list(merged.values())}
 
 
 @app.post("/category-aliases")
@@ -2349,8 +2369,18 @@ def save_alias(body: AliasBody, request: Request):
 
 @app.delete("/category-aliases/{alias_id}")
 def delete_alias(alias_id: int, request: Request):
-    shop_id = _current_shop_id(request)
-    conn = db(); conn.execute("DELETE FROM category_aliases WHERE id=? AND shop_id=?", (alias_id, shop_id)); conn.commit(); conn.close()
+    """删除一条类目映射。
+
+    ⚠️ 列表是跨店合并展示的，删除也必须按「内部类目」把所有店铺的同名行一起删掉，
+       否则会出现"删了它、切到另一个店又冒出来"的诡异现象。
+    """
+    conn = db()
+    row = conn.execute("SELECT internal_category FROM category_aliases WHERE id=?", (alias_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "类目映射不存在")
+    conn.execute("DELETE FROM category_aliases WHERE internal_category=?", (row["internal_category"],))
+    conn.commit(); conn.close()
     return {"ok": True}
 
 

@@ -43,4 +43,6 @@ export const xhsApi = {
   updateItem: (itemId, body) => http.put(`/items/${itemId}`, body),
   updateSku: (skuId, body) => http.put(`/skus/${skuId}`, body),
   setSkuAvailable: (skuId, available) => http.post(`/skus/${skuId}/available`, { available }),
+  // 删除商品(平台侧彻底删除,不可恢复)。与微信商品列表的「删除」对齐。
+  deleteItem: (itemId) => http.delete(`/items/${itemId}`),
 }

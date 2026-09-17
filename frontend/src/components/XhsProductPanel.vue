@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheck, Clock, Goods, Picture, Plus, Remove } from '@element-plus/icons-vue'
 import { xhsApi } from '../xhsApi'
 import XhsProductForm from './XhsProductForm.vue'
@@ -249,6 +249,11 @@ function statusText(item) {
   return { label: '未创建 SKU', type: 'info' }
 }
 
+// 行内按钮互斥：与「平台状态」列共用同一个判据，避免出现"标签写着售卖中、却还摆着上架按钮"的自相矛盾。
+// ⚠️ 这里只用它决定**显示哪个按钮**，不用来拦截操作：buyable 在"平台后台已上架成功"的商品上
+//    依然可能返回 false（见本文件顶部 2026-09-17 实测说明），能不能上/下最终由平台裁决。
+const isSelling = (item) => itemSkus(item).some(buyable)
+
 async function setAvailable(sku, available) {
   const id = skuId(sku)
   if (!id) return ElMessage.warning('当前商品缺少 SKU ID')
@@ -282,6 +287,33 @@ async function setItemAvailable(item, available) {
     if (!failed.length) ElMessage.success(`商品已提交${verb}（${ok} 个规格）`)
     else if (ok) ElMessage.warning(`已有 ${ok} 个规格${verb}成功，${failed.length} 个失败：${reason}`)
     else ElMessage.error(`${verb}失败：${reason}`)
+    await loadItems()
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    actionId.value = ''
+  }
+}
+
+// 删除商品(平台侧彻底删除,不可恢复)。与微信商品列表的「删除」对齐。
+// 二次确认，并把商品名带进确认框，避免看错行删错货。
+// ⚠️ 平台对不存在的 itemId 也返回「删除成功」(幂等)，所以不做"删前后条数比对"，以列表刷新结果为准。
+async function removeItem(item) {
+  const id = itemId(item)
+  if (!id) return ElMessage.warning('当前商品缺少商品 ID')
+  try {
+    await ElMessageBox.confirm(
+      `商品「${itemName(item)}」删除后不可恢复，确认继续？`,
+      '永久删除商品',
+      { confirmButtonText: '确认删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch {
+    return   // 用户取消
+  }
+  actionId.value = `${id}-del`
+  try {
+    await xhsApi.deleteItem(id)
+    ElMessage.success('商品已删除')
     await loadItems()
   } catch (error) {
     ElMessage.error(error.message)
@@ -375,7 +407,7 @@ watch(() => props.refreshTick, () => { if (serviceOnline.value) void loadItems()
         <el-table-column label="售价" width="150" show-overflow-tooltip><template #default="{ row }"><strong class="price">{{ itemPrice(row) }}</strong></template></el-table-column>
         <el-table-column label="库存" width="110" show-overflow-tooltip><template #default="{ row }">{{ itemStock(row) }}</template></el-table-column>
         <el-table-column label="平台状态" width="160" show-overflow-tooltip><template #default="{ row }"><el-tag :type="statusText(row).type" effect="light" round>{{ statusText(row).label }}</el-tag></template></el-table-column>
-        <el-table-column label="操作" width="260" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showDetail(row)">详情</el-button><el-button link type="primary" @click="openEditItem(row)">编辑</el-button><el-button link type="primary" :loading="actionId === `${itemId(row)}-1`" @click="setItemAvailable(row, 1)">上架</el-button><el-button link type="warning" :loading="actionId === `${itemId(row)}-0`" @click="setItemAvailable(row, 0)">下架</el-button></template></el-table-column>
+        <el-table-column label="操作" width="260" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showDetail(row)">详情</el-button><el-button link type="primary" @click="openEditItem(row)">编辑</el-button><el-button v-if="!isSelling(row)" link type="primary" :loading="actionId === `${itemId(row)}-1`" @click="setItemAvailable(row, 1)">上架</el-button><el-button v-else link type="warning" :loading="actionId === `${itemId(row)}-0`" @click="setItemAvailable(row, 0)">下架</el-button><el-button link type="danger" :loading="actionId === `${itemId(row)}-del`" @click="removeItem(row)">删除</el-button></template></el-table-column>
       </el-table>
       <div class="cursor-pagination">
         <el-pagination

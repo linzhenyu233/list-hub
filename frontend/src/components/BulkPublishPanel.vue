@@ -377,19 +377,29 @@ const mappingGroups = computed(() => {
 // 改成可搜索/可筛选的精简表格(内部滚动),未匹配数多的排前面,问题类目一眼可见。
 const attrGroupKeyword = ref('')
 const attrGroupFilter = ref('all')
-const attrGroupTotal = computed(() => mappingGroups.value.filter((g) => groupAttrDefs[g.internal_category]).length)
+// 类目属性概览：列出**全部**内部类目，不再要求"已加载属性定义"。
+// ⚠️ 原来只保留有属性定义的分组，而属性定义只在"平台类目已匹配"之后才会加载，
+//   于是还没匹配上类目的批次（典型：刚拆出来的小红书店）整张表直接消失，
+//   运营连"这批货有几个类目、各多少件"都看不到，只剩一屏待确认类目。
+const attrGroupTotal = computed(() => mappingGroups.value.length)
 const attrGroupRows = computed(() => {
   const keyword = attrGroupKeyword.value.trim().toLowerCase()
   return mappingGroups.value
-    .filter((group) => groupAttrDefs[group.internal_category])
     .map((group) => {
       const status = attrMatchStatus[group.internal_category]
+      const mapped = group.mapping || {}
+      // 是否已匹配到本店平台的类目：没匹配上就没有属性定义可加载，
+      // 界面要给出明确文案，别让运营误以为"加载失败"。
+      const has_category = availablePlatforms.value.includes('wechat')
+        ? !!(mapped.wechat_category_chain || []).length
+        : !!mapped.xhs_category_id
       return {
         internal_category: group.internal_category,
         product_count: group.products.length,
         matched: status?.matched || 0,
         unmatched: status?.unmatched || 0,
         has_status: !!status,
+        has_category,
       }
     })
     .filter((row) => !keyword || row.internal_category.toLowerCase().includes(keyword))
@@ -435,6 +445,16 @@ async function confirmXhsCategory(group, level, value) {
 }
 
 // 类目别名映射表:人工确认一次存表,后续批次自动命中不再重复选;后端合并微信/小红书两侧,这里只传本次确认的一侧即可
+
+// 内部类目在 Excel 里全角/半角括号混用（「耳饰(对)」vs「耳饰（对）」），
+// 直接按原字符串查别名会出现"看起来一模一样却匹配不上"的怪事，
+// 所以比对前统一括号、去掉半角与全角空白。
+function normalizeCategoryKey(value) {
+  return String(value || '')
+    .replace(/（/g, '(')
+    .replace(/）/g, ')')
+    .replace(/[\s\u3000]/g, '')
+}
 
 async function saveGroupAlias(internalCategory, payload) {
   try {
@@ -572,7 +592,7 @@ async function autoMatchWechatCategories() {
     const aliasMap = {}
     try {
       for (const alias of (await bulkApi.categoryAliases()).result || []) {
-        aliasMap[alias.internal_category.trim()] = alias
+        aliasMap[normalizeCategoryKey(alias.internal_category)] = alias
       }
     } catch { /* ignore */ }
     // 从映射表恢复属性默认值：同类目下次自动带入
@@ -604,7 +624,10 @@ async function autoMatchWechatCategories() {
       return searchCache[keyword]
     }
 
-    await Promise.all(products.value.map(async (product) => {
+    // 拆店后一家店只发一个平台：三个匹配阶段各自按本店平台门控。
+    // ⚠️ 否则纯微信店点一次「立即匹配类目」会顺带把小红书类目、品牌全查一遍
+    //   （几百次无用请求），并把 xhs_status 写进映射，界面随之冒出一整屏「小红书：xxx 读取类目」。
+    await Promise.all((availablePlatforms.value.includes('wechat') ? products.value : []).map(async (product) => {
       const internal = String(product.internal_category || '').trim()
       if (!internal) {
         mappings[product.product_code] = { ...(mappings[product.product_code] || {}), status: '缺少内部类目' }
@@ -621,7 +644,7 @@ async function autoMatchWechatCategories() {
             ? { ...current, wechat_freight_template_id: String(freightOptions[0].id || freightOptions[0].template_id || ''), wechat_freight_template: freightOptions[0].name || freightOptions[0].template_name || '' }
             : current
         // 历史映射只作为叶子类目提示，每次都用最新 cats_v2 候选刷新完整链路。
-        const alias = aliasMap[internal]
+        const alias = aliasMap[normalizeCategoryKey(internal)]
         if (alias?.wechat?.category) {
           const savedChain = alias.wechat.chain || []
           const savedLeafId = String(savedChain[savedChain.length - 1]?.cat_id || '')
@@ -660,9 +683,10 @@ async function autoMatchWechatCategories() {
     }))
     // 微信阶段完成先刷一次界面,即使小红书阶段慢也不会全程停在“待系统匹配”
     mapping.value = { ...mapping.value, products: mappings }
-    await Promise.all(products.value.map(async (product) => {
+    // 小红书类目阶段：只在当前店发小红书时执行（见上方门控说明）
+    await Promise.all((availablePlatforms.value.includes('xhs') ? products.value : []).map(async (product) => {
       try {
-        const alias = aliasMap[String(product.internal_category || '').trim()]
+        const alias = aliasMap[normalizeCategoryKey(product.internal_category)]
         if (alias?.xhs?.category_id) {
           mappings[product.product_code] = { ...(mappings[product.product_code] || {}), xhs_category: alias.xhs.category, xhs_category_chain: alias.xhs.chain || [], xhs_category_id: alias.xhs.category_id, xhs_status: '小红书类目已按映射表匹配' }
           return
@@ -670,8 +694,9 @@ async function autoMatchWechatCategories() {
         mappings[product.product_code] = await autoMatchXhsCategory(product, mappings[product.product_code] || {})
       } catch { mappings[product.product_code] = { ...(mappings[product.product_code] || {}), xhs_status: '小红书类目匹配失败' } }
     }))
+    // 小红书品牌阶段：同样只在发小红书时执行
     const xhsBrandCache = {}
-    await Promise.all(products.value.map(async (product) => {
+    await Promise.all((availablePlatforms.value.includes('xhs') ? products.value : []).map(async (product) => {
       const current = mappings[product.product_code] || {}
       const categoryId = current.xhs_category_id
       let brandId = current.xhs_brand_id || ''
@@ -1558,13 +1583,16 @@ async function publish(partial = false) {
         <el-select v-model="batchPlatformSettings.xhsLogisticsId" placeholder="选择物流方案" style="width:220px"><el-option v-for="item in platformSettings.xhsLogistics" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
       </template>
     </div>
-    <div v-if="step === 2 && mappingGroups.some((group) => group.mapping.wechat_candidates?.length > 1)" class="mapping-confirm-list">
+    <div v-if="step === 2 && availablePlatforms.includes('wechat') && mappingGroups.some((group) => group.mapping.wechat_candidates?.length > 1)" class="mapping-confirm-list">
       <div v-for="group in mappingGroups.filter((item) => item.mapping.wechat_candidates?.length > 1)" :key="group.internal_category" class="mapping-confirm-row">
         <span>{{ group.internal_category }}（{{ group.products.length }} 个商品）</span>
         <el-select placeholder="选择微信叶子类目" @change="(value) => confirmWechatCategory(group, value)"><el-option v-for="candidate in group.mapping.wechat_candidates" :key="candidate.path" :label="candidate.path" :value="candidate.path" /></el-select>
       </div>
     </div>
-    <div v-if="step === 2" class="mapping-confirm-list">
+    <!-- 小红书类目确认列表：必须限定当前店发小红书。
+         拆店后批次可能留在微信店，而 mappings_json 里仍带着拆店前算出的 xhs_status，
+         不判断平台就会在纯微信店里冒出一整屏「小红书：xxx 读取类目」，让人以为要发小红书。 -->
+    <div v-if="step === 2 && availablePlatforms.includes('xhs')" class="mapping-confirm-list">
       <div v-for="group in mappingGroups.filter((item) => item.mapping.xhs_status && !item.mapping.xhs_status.includes('已自动') && !item.mapping.xhs_status.includes('已人工') && !item.mapping.xhs_status.includes('已按映射表'))" :key="`xhs-${group.internal_category}`" class="mapping-confirm-row">
         <span>小红书：{{ group.internal_category }}（{{ group.products.length }} 个商品）</span>
         <el-button size="small" @click="loadXhsLevel(group, 0)">读取类目</el-button>
@@ -1579,8 +1607,8 @@ async function publish(partial = false) {
     <el-table v-if="step === 2 && attrGroupTotal" :data="attrGroupRows" max-height="420" size="small" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
       <el-table-column prop="internal_category" label="内部类目" min-width="260" show-overflow-tooltip />
       <el-table-column prop="product_count" label="商品数" width="90" align="center" />
-      <el-table-column label="属性匹配" width="150" align="center"><template #default="{ row }"><el-tag v-if="row.has_status" size="small" :type="row.unmatched ? 'warning' : 'success'">匹配 {{ row.matched }}✓{{ row.unmatched ? ` / ${row.unmatched}✗` : '' }}</el-tag><span v-else class="muted-copy">待加载</span></template></el-table-column>
-      <el-table-column label="操作" width="120" align="center"><template #default="{ row }"><el-button size="small" type="primary" text @click="openAttrDrawer(row.internal_category)">配置属性</el-button></template></el-table-column>
+      <el-table-column label="属性匹配" width="170" align="center"><template #default="{ row }"><el-tag v-if="row.has_status" size="small" :type="row.unmatched ? 'warning' : 'success'">匹配 {{ row.matched }}✓{{ row.unmatched ? ` / ${row.unmatched}✗` : '' }}</el-tag><span v-else-if="!row.has_category" class="muted-copy">未匹配类目</span><span v-else class="muted-copy">待加载</span></template></el-table-column>
+      <el-table-column label="操作" width="140" align="center"><template #default="{ row }"><el-button v-if="row.has_category" size="small" type="primary" text @click="openAttrDrawer(row.internal_category)">配置属性</el-button><el-tooltip v-else placement="top" content="该类目还没匹配到平台的类目，匹配完成后才会加载属性定义；请在上方「读取类目」里完成匹配"><span class="muted-copy">先匹配类目</span></el-tooltip></template></el-table-column>
     </el-table>
     <el-drawer v-model="attrDrawerVisible" append-to-body :title="`${attrDrawerGroup} · 属性配置`" size="720px">
       <template v-if="groupAttrDefs[attrDrawerGroup]">

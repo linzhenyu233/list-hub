@@ -772,6 +772,21 @@ def get_item(item_id: str, request: Request):
     return {"ok": True, "result": data}
 
 
+@app.delete("/items/{item_id}")
+def delete_item(item_id: str, request: Request):
+    """删除商品(彻底删除,不可恢复;日常建议用下架代替)。
+
+    对应平台方法 product.deleteItemV2 —— 2026-09-17 实测确认:
+      · product.deleteItemV2 可用,返回「删除成功」;
+      · 旧名 product.deleteItem 已被平台废弃,报 error_code=401「请使用商品3.0新接口」。
+    ⚠️ 平台对不存在的 itemId 也返回「删除成功」(幂等),不能靠返回值判断是否真的删掉过。
+    """
+    sid = shop_of(request)["shop_id"]
+    result = ok_or_400(lambda: _xhs_call("product.deleteItemV2", {"itemId": str(item_id)}, shop_id=sid))
+    _clear_product_cache(sid)
+    return result
+
+
 @app.put("/items/{item_id}")
 def update_item(item_id: str, request: Request, body: dict = Body(..., example={
     "item": {"name": "新标题"}, "updated_fields": ["name"]})):
