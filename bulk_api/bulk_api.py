@@ -543,7 +543,10 @@ def _latest_wechat_chain(saved_chain, shop_id=None):
     try:
         data = _http_get_json(f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(leaf_name)}", timeout=180, shop_id=shop_id)
     except Exception as exc:
-        raise RuntimeError(f"无法校验最新微信 cats_v2 类目: {exc}") from exc
+        # 原来只带一句 "HTTP Error 400: Bad Request", 既看不出是哪个店也看不出原因;
+        # 两个平台服务都是 FastAPI, 真实原因在响应体的 detail 里。
+        detail = _http_error_detail(exc) if isinstance(exc, urllib.error.HTTPError) else str(exc)
+        raise RuntimeError(f"无法校验最新微信 cats_v2 类目（店铺 {shop_id or '默认店'}）：{detail}") from exc
     candidates = [item for item in data.get("results", []) if item.get("leaf")]
     matched = [item for item in candidates if str(item.get("cat_id")) == leaf_id]
     if len(matched) != 1:
@@ -2465,7 +2468,8 @@ def resolve_wechat_path(parts, cache, shop_id=None):
         try:
             data = _http_get_json(f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(keyword)}", timeout=180, shop_id=shop_id)
         except Exception as exc:
-            raise HTTPException(502, f"微信类目服务({WECHAT_API_BASE})不可用：{exc}")
+            raise HTTPException(502, f"微信类目服务({WECHAT_API_BASE})不可用："
+                                     f"{_http_error_detail(exc) if isinstance(exc, urllib.error.HTTPError) else exc}")
         cache[keyword] = [r for r in data.get("results", []) if r.get("leaf")]
     leaves = cache[keyword]
     matched = [r for r in leaves if [str(n.get("name", "")).strip() for n in r.get("chain", [])] == parts]
@@ -2487,7 +2491,8 @@ def resolve_xhs_path(parts, cache, shop_id=None):
             try:
                 data = _http_get_json(url, timeout=60, shop_id=shop_id)
             except Exception as exc:
-                raise HTTPException(502, f"小红书类目服务({XHS_API_BASE})不可用：{exc}")
+                raise HTTPException(502, f"小红书类目服务({XHS_API_BASE})不可用："
+                                         f"{_http_error_detail(exc) if isinstance(exc, urllib.error.HTTPError) else exc}")
             result = data.get("result") or []
             cache[key] = result if isinstance(result, list) else []
         options = cache[key]
