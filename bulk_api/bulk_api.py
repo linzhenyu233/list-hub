@@ -102,6 +102,22 @@ def _within_allowed_roots(path, roots=None):
     return False
 
 
+def _allowed_roots_for(shop_id=None):
+    """当前店铺允许读图的根目录白名单：店铺 image_root + 全局兜底。
+
+    统一入口 —— 原先 4 个校验点各写一遍，其中发布读图那处漏了店铺 root，
+    导致「扫描时认可、发布时拒绝」：服务器 image_root 是 COS 挂载点 /mnt/cos/...，
+    而 DEFAULT_IMAGE_ROOT 是为 Windows 共享盘写的 UNC 路径，两者永不相等。
+    """
+    shop_root = ""
+    if shop_id:
+        try:
+            shop_root = shop_registry.image_root_for(shop_id)
+        except ValueError:
+            shop_root = ""  # 店铺已停用/不存在：退回全局兜底，由调用方给出明确报错
+    return list(dict.fromkeys(([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)))
+
+
 app = FastAPI(title="商品批量发布中台", version="0.1.0")
 _WECHAT_CATEGORY_CHAIN_CACHE = {}
 _XHS_VAR_CANDIDATES_CACHE = {}
@@ -568,7 +584,7 @@ def _platform_image(platform, source_url, shop_id=None):
     local_image = _local_image(source_url)
     if not local_image and is_share_image(source_url):
         # 共享盘图片懒拷贝: 只有真正发布到平台时才读字节(扫描阶段零磁盘)
-        local_image = fetch_share_image(source_url)
+        local_image = fetch_share_image(source_url, shop_id)
     source_hash = hashlib.sha256(local_image[1] if local_image else source_url.encode("utf-8")).hexdigest()
     cache_key = (shop_id or "", platform, source_hash)
     # 1. 内存 LRU 层
@@ -650,7 +666,7 @@ def _upload_image_uncached(platform, source_url, shop_id=None):
     """
     local_image = _local_image(source_url)
     if not local_image and is_share_image(source_url):
-        local_image = fetch_share_image(source_url)
+        local_image = fetch_share_image(source_url, shop_id)
     if not local_image:
         raise RuntimeError(f"无法读取图片: {str(source_url)[:120]}")
     payload = {"filename": os.path.basename(local_image[0]),
@@ -1233,7 +1249,7 @@ def is_share_image(source):
     return str(source or "").startswith(SHARE_PREFIX)
 
 
-def fetch_share_image(source):
+def fetch_share_image(source, shop_id=None):
     """读共享盘上的图片并落盘缓存, 返回 (本地路径, 内容)。
 
     只在真正发布时调用: 扫描 233 个商品只记路径(秒级、零磁盘),
@@ -1242,9 +1258,10 @@ def fetch_share_image(source):
 
     安全: disk: 引用会存进批次数据, 而批次数据可由客户端通过 PUT /import/{id}/items
     覆写, 因此这里必须再校验一次路径白名单, 否则可被用来读服务器任意文件并上传平台。
+    白名单必须按店铺取(见 _allowed_roots_for)，否则服务器上挂载点路径会被误拒。
     """
     path = str(source)[len(SHARE_PREFIX):]
-    if not path or not _within_allowed_roots(path):
+    if not path or not _within_allowed_roots(path, _allowed_roots_for(shop_id)):
         raise RuntimeError(f"共享盘图片路径不在允许的图片目录内：{path}")
     # 用 os.stat 而不是 os.path.isfile: 后者把"无权限 / 网络不可达"也一并吞成 False,
     # 让权限问题伪装成"文件不存在"(线上踩过: worker 以 SYSTEM 跑时整批报"不存在")。
@@ -1649,9 +1666,7 @@ def list_image_roots(request: Request = None):
     """
     shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
     shop_root = shop_registry.image_root_for(shop_id)
-    roots = list(dict.fromkeys(
-        ([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)
-    ))
+    roots = _allowed_roots_for(shop_id)
     default = shop_root or DEFAULT_IMAGE_ROOT
     return {"ok": True, "default": os.path.abspath(default),
             "roots": [{"path": os.path.abspath(root), "available": os.path.isdir(root)}
@@ -1693,9 +1708,7 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
     dry_run = bool(body.dry_run) if body else False
     # 路径收敛: root 只能取白名单内的图片根目录(见 GET /image-roots),
     # 否则该接口可被用来枚举服务器任意文件夹的商品图。
-    allowed_roots = list(dict.fromkeys(
-        [shop_image_root] if shop_image_root else []
-    )) + ALLOWED_IMAGE_ROOTS  # 兜底保留原白名单
+    allowed_roots = _allowed_roots_for(shop_id)
     if not _within_allowed_roots(root, allowed_roots) or not os.path.isdir(root):
         raise HTTPException(400, f"图片根目录不可访问或不在允许的图片目录内：{root}"
                                  f"(允许：{'、'.join(allowed_roots)})")
@@ -1839,10 +1852,7 @@ def preview_image(ref: str, shop_id: str = None, request: Request = None):
     """
     shop_id = ((shop_id or "").strip()
                or (_current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]))
-    shop_root = shop_registry.image_root_for(shop_id)
-    allowed_roots = list(dict.fromkeys(
-        ([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)
-    ))
+    allowed_roots = _allowed_roots_for(shop_id)
     source = str(ref or "").strip()
     if source.startswith("local://"):
         found = _local_image(source)
