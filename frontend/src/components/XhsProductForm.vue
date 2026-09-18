@@ -4,7 +4,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus } from '@element-plus/icons-vue'
 import { xhsApi } from '../xhsApi'
 import { currentShop } from '../shopContext'
-import MediaThumb from './MediaThumb.vue'
+import MediaGallery from './MediaGallery.vue'
+import MediaUploader from './MediaUploader.vue'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -17,7 +18,6 @@ const isEdit = computed(() => !!props.itemId)
 const formRef = ref()
 const saving = ref(false)
 const loadingOptions = ref(false)
-const uploading = ref('')
 const categoryLevels = ref([[]])
 const selectedCategories = ref([])
 const brands = ref([])
@@ -34,15 +34,6 @@ const form = reactive({
   images: [''], imageDescriptions: [''], videoUrl: '', transparentImage: '',
   skuList: [{ erpCode: '', barcode: '', specImage: '', originalPriceYuan: null, priceYuan: null, stock: 0, logisticsPlanId: '', deliveryHours: 24 }],
 })
-
-// 素材行左侧缩略图用的图片清单：只放已填地址的图片；previewIndex 返回当前这张在清单里的位置
-const imagePreviewList = computed(() => form.images.filter(Boolean))
-const descriptionPreviewList = computed(() => form.imageDescriptions.filter(Boolean))
-
-function previewIndex(list, url) {
-  const i = list.indexOf(url)
-  return i < 0 ? 0 : i
-}
 
 const listFrom = (data, keys) => {
   const result = data?.result || data || {}
@@ -149,99 +140,14 @@ function generateSkusFromVariations() {
 
 function onSpecSelectionChanged() { generateSkusFromVariations() }
 
-// ================== 素材：直接选本地图片上传 ==================
+// 素材：本地图片 → 小红书素材库。
 // 旧流程要运营先在别处拿到公网图片地址、再点「上传」；现在直接调 /materials/upload-file，
-// 由后端把本地图片传给小红书素材接口并拿回素材 URL（后端会自动放大到 ≥1200）。
-const rowFileInput = ref(null)      // 单行换图
-const batchFileInput = ref(null)    // 一次选多张
-const pendingRow = ref(null)        // { field: 'images' | 'imageDescriptions', index }
-const pendingBatchField = ref('images')
-const uploadingProgress = ref('')
-
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024
-
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '')
-    reader.onerror = () => reject(new Error('读取本地图片失败'))
-    reader.readAsDataURL(file)
-  })
-}
-
-// 本地图片 → 小红书素材库，返回可直接发品的素材 URL
-async function uploadToXhs(file) {
-  if (!file.type.startsWith('image/')) throw new Error('不是图片文件')
-  if (file.size > MAX_IMAGE_BYTES) throw new Error('图片超过 20MB')
-  const data = await xhsApi.uploadMaterialFile(file.name, await fileToBase64(file))
+// 由后端把本地图片传给小红书素材接口拿回素材 URL（后端会自动放大到 ≥1200）。
+// 选图/换图/删除的交互都在 MediaGallery 组件里，这里只负责"把一张图传上去、返回地址"。
+async function uploadXhsImage({ filename, contentBase64 }) {
+  const data = await xhsApi.uploadMaterialFile(filename, contentBase64)
   const result = data?.result || {}
-  const url = typeof result === 'string'
-    ? result
-    : (result.url || result.materialUrl || result.fileUrl)
-  if (!url) throw new Error('小红书未返回素材地址')
-  return url
-}
-
-function pickRowImage(field, index) {
-  pendingRow.value = { field, index }
-  const input = rowFileInput.value
-  if (!input) return
-  input.value = ''       // 清空后才能再次选同一张图
-  input.click()
-}
-
-function pickBatchImages(field) {
-  pendingBatchField.value = field
-  const input = batchFileInput.value
-  if (!input) return
-  input.value = ''
-  input.click()
-}
-
-async function onRowImagePicked(event) {
-  const file = event?.target?.files?.[0]
-  const target = pendingRow.value
-  pendingRow.value = null
-  if (!file || !target) return
-  uploading.value = `${target.field}-${target.index}`
-  try {
-    const url = await uploadToXhs(file)
-    form[target.field][target.index] = url
-    ElMessage.success('素材已上传到小红书')
-  } catch (error) {
-    ElMessage.error(`${file.name}：${error.message}`)
-  } finally {
-    uploading.value = ''
-  }
-}
-
-// 一次选多张：先补空行，空行填满了再往后追加；顺序即选择顺序
-async function onBatchImagesPicked(event) {
-  const files = Array.from(event?.target?.files || [])
-  const field = pendingBatchField.value
-  if (!files.length) return
-  const list = form[field]
-  uploading.value = `${field}-batch`
-  let done = 0
-  const failed = []
-  for (const [i, file] of files.entries()) {
-    uploadingProgress.value = `正在上传 ${i + 1}/${files.length}…`
-    try {
-      const url = await uploadToXhs(file)
-      const empty = list.findIndex((item) => !item)
-      if (empty >= 0) list[empty] = url
-      else list.push(url)
-      done += 1
-    } catch (error) {
-      failed.push(`${file.name}：${error.message}`)
-    }
-  }
-  uploadingProgress.value = ''
-  uploading.value = ''
-  if (done) ElMessage.success(`已上传 ${done} 张素材到小红书`)
-  if (failed.length) {
-    ElMessage.warning(`${failed.length} 张没传成功：${failed.slice(0, 3).join('；')}${failed.length > 3 ? ' …' : ''}`)
-  }
+  return typeof result === 'string' ? result : (result.url || result.materialUrl || result.fileUrl || '')
 }
 
 async function submit() {
@@ -453,10 +359,10 @@ onMounted(async () => {
 
     <section class="form-section">
       <div class="section-heading"><div><h3>小红书素材</h3><p>选择本地图片，直接上传到小红书素材库（不用再找公网地址）</p></div><span class="section-index">04</span></div>
-      <input ref="rowFileInput" type="file" accept="image/*" style="display:none" @change="onRowImagePicked" />
-      <input ref="batchFileInput" type="file" accept="image/*" multiple style="display:none" @change="onBatchImagesPicked" />
-      <div class="field-label">商品主图 <span>点击缩略图可放大</span></div><div class="url-list"><div v-for="(url, index) in form.images" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="imagePreviewList" :initial-index="previewIndex(imagePreviewList, url)" /><span class="url-hint">{{ url ? '已上传到小红书' : '未选择图片' }}</span><el-button :loading="uploading === `images-${index}`" @click="pickRowImage('images', index)">{{ url ? '换图' : '选择图片' }}</el-button><el-button text type="danger" :icon="Delete" :disabled="form.images.length === 1" @click="form.images.splice(index, 1)" /></div><div class="url-actions"><el-button text type="primary" :icon="Plus" :loading="uploading === 'images-batch'" @click="pickBatchImages('images')">选择本地图片（可多选）</el-button><span v-if="uploadingProgress" class="muted-copy">{{ uploadingProgress }}</span></div></div>
-      <div class="field-label description-label">详情图</div><div class="url-list"><div v-for="(url, index) in form.imageDescriptions" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="descriptionPreviewList" :initial-index="previewIndex(descriptionPreviewList, url)" /><span class="url-hint">{{ url ? '已上传到小红书' : '未选择图片' }}</span><el-button :loading="uploading === `imageDescriptions-${index}`" @click="pickRowImage('imageDescriptions', index)">{{ url ? '换图' : '选择图片' }}</el-button><el-button text type="danger" :icon="Delete" :disabled="form.imageDescriptions.length === 1" @click="form.imageDescriptions.splice(index, 1)" /></div><div class="url-actions"><el-button text type="primary" :icon="Plus" :loading="uploading === 'imageDescriptions-batch'" @click="pickBatchImages('imageDescriptions')">选择本地图片（可多选）</el-button><span v-if="uploadingProgress" class="muted-copy">{{ uploadingProgress }}</span></div></div>
+      <div class="field-label">商品主图 <span>至少 1 张 · 第 1 张为首图</span></div>
+      <MediaGallery v-model="form.images" :max="20" :upload="uploadXhsImage" />
+      <div class="field-label description-label">详情图</div>
+      <MediaGallery v-model="form.imageDescriptions" :max="50" :upload="uploadXhsImage" />
       <div class="form-grid form-grid-2" style="margin-top: 16px">
         <el-form-item label="商品视频链接"><el-input v-model="form.videoUrl" placeholder="https://.../video.mp4（可选）" /></el-form-item>
         <el-form-item label="透明图链接"><el-input v-model="form.transparentImage" placeholder="https://.../transparent.png（可选）" /></el-form-item>
@@ -466,7 +372,7 @@ onMounted(async () => {
     <section class="form-section">
       <div class="section-heading"><div><h3>小红书 SKU</h3><p>创建后需等待审核，审核通过才可按 SKU 上架</p></div><span class="section-index">05</span></div>
       <el-alert title="方案来源说明" description="“系统创建”表示由小红书平台自动生成，通常仅适用于虚拟商品或自动发货；普通实物商品请选择与店铺仓库、发货地址相匹配的商家物流方案。" type="info" show-icon :closable="false" class="logistics-tip" />
-      <div class="xhs-sku-list"><div v-for="(sku, index) in form.skuList" :key="index" class="xhs-sku-card"><div class="sku-card-title"><strong>SKU {{ index + 1 }}</strong><el-button text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="form.skuList.splice(index, 1)" /></div><div class="form-grid form-grid-3"><el-form-item label="商家 SKU 编码"><el-input v-model="sku.erpCode" /></el-form-item><el-form-item label="商品条码"><el-input v-model="sku.barcode" placeholder="barcode（可选，特定品类必填）" /></el-form-item><el-form-item label="原价（元）"><el-input-number v-model="sku.originalPriceYuan" :min="0.01" :precision="2" :controls="false" /></el-form-item><el-form-item label="售价（元）"><el-input-number v-model="sku.priceYuan" :min="0.01" :precision="2" :controls="false" /></el-form-item><el-form-item label="库存"><el-input-number v-model="sku.stock" :min="0" /></el-form-item><el-form-item label="发货时效（小时）"><el-input-number v-model="sku.deliveryHours" :min="1" /></el-form-item><el-form-item label="物流方案"><el-select v-model="sku.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案"><el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)"><div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div></el-option></el-select></el-form-item><el-form-item label="规格图链接"><el-input v-model="sku.specImage" placeholder="specImage（可选）" /></el-form-item></div></div></div>
+      <div class="xhs-sku-list"><div v-for="(sku, index) in form.skuList" :key="index" class="xhs-sku-card"><div class="sku-card-title"><strong>SKU {{ index + 1 }}</strong><el-button text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="form.skuList.splice(index, 1)" /></div><div class="form-grid form-grid-3"><el-form-item label="商家 SKU 编码"><el-input v-model="sku.erpCode" /></el-form-item><el-form-item label="商品条码"><el-input v-model="sku.barcode" placeholder="barcode（可选，特定品类必填）" /></el-form-item><el-form-item label="原价（元）"><el-input-number v-model="sku.originalPriceYuan" :min="0.01" :precision="2" :controls="false" /></el-form-item><el-form-item label="售价（元）"><el-input-number v-model="sku.priceYuan" :min="0.01" :precision="2" :controls="false" /></el-form-item><el-form-item label="库存"><el-input-number v-model="sku.stock" :min="0" /></el-form-item><el-form-item label="发货时效（小时）"><el-input-number v-model="sku.deliveryHours" :min="1" /></el-form-item><el-form-item label="物流方案"><el-select v-model="sku.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案"><el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)"><div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div></el-option></el-select></el-form-item><el-form-item label="规格图"><MediaUploader v-model="sku.specImage" :upload="uploadXhsImage" placeholder="选规格图" /></el-form-item></div></div></div>
       <el-button text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
     </section>
     <div class="form-actions"><el-button @click="emit('cancel')">取消</el-button><el-button type="primary" :loading="saving" :icon="Check" @click="submit">{{ isEdit ? '保存修改' : '创建小红书商品' }}</el-button></div>

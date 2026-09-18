@@ -4,7 +4,7 @@ import { ElMessage } from 'element-plus'
 import { Check, Delete, Plus, Search } from '@element-plus/icons-vue'
 import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
-import MediaThumb from './MediaThumb.vue'
+import MediaGallery from './MediaGallery.vue'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -113,15 +113,6 @@ const brandHint = computed(() => {
 
 const validHeadImages = computed(() => form.head_imgs.filter(Boolean))
 
-// 缩略图点开放大时用的图片清单：只放已填地址的图片；previewIndex 返回当前这张在清单里的位置
-const headPreviewList = computed(() => form.head_imgs.filter(Boolean))
-const descPreviewList = computed(() => form.desc_imgs.filter(Boolean))
-
-function previewIndex(list, url) {
-  const i = list.indexOf(url)
-  return i < 0 ? 0 : i
-}
-
 function responseList(data, keys) {
   const result = data?.result || data?.data || data || {}
   for (const key of keys) if (Array.isArray(result[key])) return result[key]
@@ -210,110 +201,14 @@ function removeSku(index) {
   form.skus.splice(index, 1)
 }
 
-// ================== 商品素材：直接选本地图片上传 ==================
+// 商品素材：本地图片 → 微信素材库。
 // 旧流程要运营先在别处拿到公网图片地址、再点「转存」；现在直接调微信二进制上传接口
 // (/images/upload-file)，拿回来的就是发品要填的图片地址，全程不用手写 URL。
-const rowFileInput = ref(null)      // 单行换图
-const batchFileInput = ref(null)    // 一次选多张
-const pendingRow = ref(null)        // { type: 'head' | 'desc', index }
-const pendingBatchType = ref('head')
-const uploadingSlot = ref('')       // 正在上传的槽位（按钮 loading）
-const uploadingProgress = ref('')   // 批量上传进度文案
-
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024
-
-function imagesOf(type) {
-  return type === 'head' ? form.head_imgs : form.desc_imgs
-}
-
-function maxImagesOf(type) {
-  return type === 'head' ? 9 : 50
-}
-
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '')
-    reader.onerror = () => reject(new Error('读取本地图片失败'))
-    reader.readAsDataURL(file)
-  })
-}
-
-// 本地图片 → 微信素材库，返回可直接发品的图片地址
-async function uploadToWechat(file) {
-  if (!file.type.startsWith('image/')) throw new Error('不是图片文件')
-  if (file.size > MAX_IMAGE_BYTES) throw new Error('图片超过 20MB')
-  const data = await storeApi.uploadImageFile(file.name, await fileToBase64(file))
-  const url = typeof data?.result === 'string' ? data.result : (data?.result?.img_url || data?.result?.url)
-  if (!url) throw new Error('微信未返回图片地址')
-  return url
-}
-
-function pickRowImage(type, index) {
-  pendingRow.value = { type, index }
-  const input = rowFileInput.value
-  if (!input) return
-  input.value = ''       // 清空后才能再次选同一张图
-  input.click()
-}
-
-function pickBatchImages(type) {
-  pendingBatchType.value = type
-  const input = batchFileInput.value
-  if (!input) return
-  input.value = ''
-  input.click()
-}
-
-async function onRowImagePicked(event) {
-  const file = event?.target?.files?.[0]
-  const target = pendingRow.value
-  pendingRow.value = null
-  if (!file || !target) return
-  uploadingSlot.value = `${target.type}-${target.index}`
-  try {
-    const url = await uploadToWechat(file)
-    imagesOf(target.type)[target.index] = url
-    ElMessage.success('图片已上传到微信素材库')
-  } catch (error) {
-    ElMessage.error(`${file.name}：${error.message}`)
-  } finally {
-    uploadingSlot.value = ''
-  }
-}
-
-// 一次选多张：先补空行，空行填满了再往后追加；顺序即选择顺序
-async function onBatchImagesPicked(event) {
-  const files = Array.from(event?.target?.files || [])
-  const type = pendingBatchType.value
-  if (!files.length) return
-  const list = imagesOf(type)
-  const limit = maxImagesOf(type)
-  uploadingSlot.value = `${type}-batch`
-  let done = 0
-  const failed = []
-  for (const [i, file] of files.entries()) {
-    if (list.filter(Boolean).length >= limit) {
-      failed.push(`${file.name}：已达上限 ${limit} 张`)
-      continue
-    }
-    uploadingProgress.value = `正在上传 ${i + 1}/${files.length}…`
-    try {
-      const url = await uploadToWechat(file)
-      const empty = list.findIndex((item) => !item)
-      if (empty >= 0) list[empty] = url
-      else list.push(url)
-      done += 1
-    } catch (error) {
-      failed.push(`${file.name}：${error.message}`)
-    }
-  }
-  uploadingProgress.value = ''
-  uploadingSlot.value = ''
-  if (done) ElMessage.success(`已上传 ${done} 张图片到微信素材库`)
-  if (failed.length) {
-    ElMessage.warning(`${failed.length} 张没传成功：${failed.slice(0, 3).join('；')}${failed.length > 3 ? ' …' : ''}`)
-  }
+// 选图/换图/删除的交互都在 MediaGallery 组件里，这里只负责"把一张图传上去、返回地址"。
+async function uploadWechatImage({ filename, contentBase64 }) {
+  const data = await storeApi.uploadImageFile(filename, contentBase64)
+  const result = data?.result
+  return typeof result === 'string' ? result : (result?.img_url || result?.url || '')
 }
 
 async function searchCategories() {
@@ -504,36 +399,10 @@ async function submit() {
         <div><h3>商品素材</h3><p>选择本地图片，直接上传到微信素材库（不用再找公网地址）</p></div>
         <span class="section-index">02</span>
       </div>
-      <input ref="rowFileInput" type="file" accept="image/*" style="display: none" @change="onRowImagePicked" />
-      <input ref="batchFileInput" type="file" accept="image/*" multiple style="display: none" @change="onBatchImagesPicked" />
-      <div class="field-label">商品主图 <span>至少 3 张，最多 9 张 · 点击缩略图可放大</span></div>
-      <div class="url-list">
-        <div v-for="(url, index) in form.head_imgs" :key="`head-${index}`" class="url-row">
-          <span class="url-number">{{ index + 1 }}</span>
-          <MediaThumb :src="url" :preview-list="headPreviewList" :initial-index="previewIndex(headPreviewList, url)" />
-          <span class="url-hint">{{ url ? '已上传到微信' : '未选择图片' }}</span>
-          <el-button :loading="uploadingSlot === `head-${index}`" @click="pickRowImage('head', index)">{{ url ? '换图' : '选择图片' }}</el-button>
-          <el-button v-if="form.head_imgs.length > 3" text type="danger" :icon="Delete" @click="form.head_imgs.splice(index, 1)" />
-        </div>
-        <div class="url-actions">
-          <el-button text type="primary" :icon="Plus" :loading="uploadingSlot === 'head-batch'" @click="pickBatchImages('head')">选择本地图片（可多选）</el-button>
-          <span v-if="uploadingProgress" class="muted-copy">{{ uploadingProgress }}</span>
-        </div>
-      </div>
+      <div class="field-label">商品主图 <span>至少 3 张，最多 9 张 · 第 1 张为首图</span></div>
+      <MediaGallery v-model="form.head_imgs" :max="9" :upload="uploadWechatImage" />
       <div class="field-label description-label">详情图片 <span>可选，最多 50 张</span></div>
-      <div class="url-list">
-        <div v-for="(url, index) in form.desc_imgs" :key="`desc-${index}`" class="url-row">
-          <span class="url-number">{{ index + 1 }}</span>
-          <MediaThumb :src="url" :preview-list="descPreviewList" :initial-index="previewIndex(descPreviewList, url)" />
-          <span class="url-hint">{{ url ? '已上传到微信' : '未选择图片' }}</span>
-          <el-button :loading="uploadingSlot === `desc-${index}`" @click="pickRowImage('desc', index)">{{ url ? '换图' : '选择图片' }}</el-button>
-          <el-button v-if="form.desc_imgs.length > 1" text type="danger" :icon="Delete" @click="form.desc_imgs.splice(index, 1)" />
-        </div>
-        <div class="url-actions">
-          <el-button text type="primary" :icon="Plus" :loading="uploadingSlot === 'desc-batch'" @click="pickBatchImages('desc')">选择本地图片（可多选）</el-button>
-          <span v-if="uploadingProgress" class="muted-copy">{{ uploadingProgress }}</span>
-        </div>
-      </div>
+      <MediaGallery v-model="form.desc_imgs" :max="50" :upload="uploadWechatImage" />
     </section>
 
     <section v-if="attrDefs.length" class="form-section">
