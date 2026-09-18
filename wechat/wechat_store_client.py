@@ -69,6 +69,11 @@ class WxStore:
 
     BASE = "https://api.weixin.qq.com"  # 微信所有接口的公共服务器地址
 
+    # token 失效类错误码: 微信同一个 appid 重复申请 access_token 会让旧 token 立即失效,
+    # 而本项目本地/服务器/多个进程都用同一套凭证,互顶很常见 —— 命中这些码说明"不是业务错,
+    # 是手里的 token 坏了",应强刷 token 重试一次,而不是直接把失败抛给业务层。
+    TOKEN_ERROR_CODES = {40001, 40013, 40014, 42001, 42007}
+
     def __init__(self, appid, secret, after_sale_address_id="", freight_template_id="", legacy_defaults=False):
         """初始化:记住 appid/secret,准备一个空的 token 缓存
 
@@ -192,28 +197,32 @@ class WxStore:
         注意: 如果微信返回错误码(errno不为0),直接抛异常,不用手动判断
         """
         # 每个接口都要带 access_token,自动帮你加上
-        params = {"access_token": self.get_access_token()}
+        for attempt in (0, 1):
+            params = {"access_token": self.get_access_token(force=attempt == 1)}
 
-        if is_json_body:
-            # json= 会自动把 Python 字典转成 JSON 字符串,并设置 Content-Type
-            resp = requests.post(f"{self.BASE}{path}", params=params,
-                                 json=payload or {}, timeout=15)
-        else:
-            resp = requests.post(f"{self.BASE}{path}", params=params,
-                                 data=payload or {}, timeout=15)
+            if is_json_body:
+                # json= 会自动把 Python 字典转成 JSON 字符串,并设置 Content-Type
+                resp = requests.post(f"{self.BASE}{path}", params=params,
+                                     json=payload or {}, timeout=15)
+            else:
+                resp = requests.post(f"{self.BASE}{path}", params=params,
+                                     data=payload or {}, timeout=15)
 
-        data = resp.json()  # 解析响应
+            data = resp.json()  # 解析响应
 
-        # 微信小店接口约定:返回 {"errcode": 0, "errmsg": "ok"} 表示成功
-        # errcode 不等于 0 就是失败(比如参数错、没权限、限流)
-        if data.get("errcode", 0) != 0:
+            # 微信小店接口约定:返回 {"errcode": 0, "errmsg": "ok"} 表示成功
+            # errcode 不等于 0 就是失败(比如参数错、没权限、限流)
+            errcode = data.get("errcode", 0)
+            if errcode == 0:
+                return data
+            if errcode in self.TOKEN_ERROR_CODES and attempt == 0:
+                continue  # token 被别处顶掉了,强刷一次再试
             raise RuntimeError(
-                f"[{path}] 调用失败: errcode={data.get('errcode')} "
+                f"[{path}] 调用失败: errcode={errcode} "
                 f"errmsg={data.get('errmsg')}"
                 f"{self._format_ext_info(data)}"
                 f"{self._error_hint(data)}"
             )
-        return data
 
     # =================================================================
     # 接口 1:上传图片(img_upload)
@@ -558,7 +567,21 @@ class WxStore:
         (旧实现取 data.cat_list 永远为空,是取不到类目的根源)
         返回: [{"cat_id":..., "name":..., "f_cat_id":..., "leaf":...}, ...]
         """
-        token = self.get_access_token()
+        for attempt in (0, 1):
+            # 第二轮强刷 token: 同一 appid 在别处(本地调试/其他进程)申请过新 token,
+            # 会让本进程缓存的旧 token 立即失效,表现为"两条 path 都返回错误"。
+            nodes, token_invalid = self._fetch_category_nodes(
+                self.get_access_token(force=attempt == 1))
+            if nodes:
+                return nodes
+            if not token_invalid:
+                break                      # 不是 token 的问题,再刷也没用
+        raise RuntimeError("获取类目数据失败: /channels/ec/category/all 和 "
+                           "/shop/ec/category/all 都返回错误")
+
+    def _fetch_category_nodes(self, token):
+        """用给定 token 拉一次全量类目,返回 (扁平节点列表, 是否 token 失效)。"""
+        token_invalid = False
         for path in ("/channels/ec/category/all", "/shop/ec/category/all"):
             resp = requests.get(
                 f"{self.BASE}{path}",
@@ -566,7 +589,10 @@ class WxStore:
                 timeout=30,
             )
             data = resp.json()
-            if data.get("errcode", 0) != 0:
+            errcode = data.get("errcode", 0)
+            if errcode != 0:
+                if errcode in self.TOKEN_ERROR_CODES:
+                    token_invalid = True
                 continue
             nodes = []
             self._collect_cat_nodes(data.get("cats_v2") or [], nodes)
@@ -577,9 +603,8 @@ class WxStore:
                     if cid is not None and cid not in seen:
                         seen.add(cid)
                         uniq.append(n)
-                return uniq
-        raise RuntimeError("获取类目数据失败: /channels/ec/category/all 和 "
-                           "/shop/ec/category/all 都返回错误")
+                return uniq, False
+        return [], token_invalid
 
     # -----------------------------------------------------------------
     # 发品类目归一化:根治 6600016 类目错误

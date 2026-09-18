@@ -484,8 +484,8 @@ def platform_title(product, mapping, platform):
     return fixed
 
 
-def _wechat_payload(product, mapping):
-    chain = _latest_wechat_chain(mapping.get("wechat_category_chain") or [])
+def _wechat_payload(product, mapping, shop_id=None):
+    chain = _latest_wechat_chain(mapping.get("wechat_category_chain") or [], shop_id)
     if not chain:
         raise RuntimeError("未配置微信类目")
     attrs = mapping.get("wechat_attrs") or product.get("attributes") or {}
@@ -524,7 +524,12 @@ def _wechat_payload(product, mapping):
     return item
 
 
-def _latest_wechat_chain(saved_chain):
+def _latest_wechat_chain(saved_chain, shop_id=None):
+    """用已存映射的叶子类目名, 回微信服务取最新 cats_v2 完整链路。
+
+    ⚠️ 必须带 shop_id: 微信服务的类目树/凭证按店铺隔离, 不带头会落到默认店,
+    发出品用的链路与该店实际权限可能对不上(默认店凭证异常时还会直接 400)。
+    """
     if not saved_chain:
         return []
     leaf = saved_chain[-1]
@@ -532,11 +537,11 @@ def _latest_wechat_chain(saved_chain):
     leaf_name = str(leaf.get("name") or "").strip()
     if not leaf_name:
         raise RuntimeError("微信类目映射缺少叶子类目名称，请重新确认类目")
-    cache_key = (leaf_id, leaf_name)
+    cache_key = (shop_id, leaf_id, leaf_name)
     if cache_key in _WECHAT_CATEGORY_CHAIN_CACHE:
         return _WECHAT_CATEGORY_CHAIN_CACHE[cache_key]
     try:
-        data = _http_get_json(f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(leaf_name)}", timeout=180)
+        data = _http_get_json(f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(leaf_name)}", timeout=180, shop_id=shop_id)
     except Exception as exc:
         raise RuntimeError(f"无法校验最新微信 cats_v2 类目: {exc}") from exc
     candidates = [item for item in data.get("results", []) if item.get("leaf")]
@@ -732,10 +737,10 @@ def _prepare_platform_images(product, platform, shop_id=None):
     return prepared
 
 
-def _get_xhs_var_candidates(category_id, var_id):
+def _get_xhs_var_candidates(category_id, var_id, shop_id=None):
     """拉小红书某个规格维度(如「颜色分类」)的候选值,带缓存(12h)。
     用于 SKU 规格值映射:货盘英文编码 → 平台中文 valueName + valueId。"""
-    key = (str(category_id), str(var_id))
+    key = (shop_id, str(category_id), str(var_id))
     hit = _XHS_VAR_CANDIDATES_CACHE.get(key)
     if hit and time.time() - hit["ts"] < 12 * 3600:
         return hit["data"]
@@ -743,7 +748,7 @@ def _get_xhs_var_candidates(category_id, var_id):
         url = (f"{XHS_API_BASE}/attribute-values"
                f"?category_id={urllib.parse.quote(str(category_id))}"
                f"&attribute_id={urllib.parse.quote(str(var_id))}")
-        data = _http_get_json(url, timeout=60)
+        data = _http_get_json(url, timeout=60, shop_id=shop_id)
         result = data.get("result") or {}
         cands = result.get("attributeValueV3s") or result.get("values") or []
         _XHS_VAR_CANDIDATES_CACHE[key] = {"ts": time.time(), "data": cands}
@@ -752,11 +757,11 @@ def _get_xhs_var_candidates(category_id, var_id):
         return []
 
 
-def _resolve_xhs_spec_value(source_value, var_id, category_id):
+def _resolve_xhs_spec_value(source_value, var_id, category_id, shop_id=None):
     """把货盘 SKU 规格值(可能英文)映射成小红书平台的中文 valueName + valueId。
     顺序:① 精确匹配候选值 ② 模糊匹配 ③ 别名表(英文→中文) ④ 原值兜底(不带 valueId)。"""
     sv = str(source_value).strip()
-    cands = _get_xhs_var_candidates(category_id, var_id) or []
+    cands = _get_xhs_var_candidates(category_id, var_id, shop_id) or []
     hit = next((c for c in cands if c.get("valueName") == sv), None)
     if not hit:
         hit = next((c for c in cands if sv in (c.get("valueName") or '') or (c.get("valueName") or '') in sv), None)
@@ -772,7 +777,7 @@ def _resolve_xhs_spec_value(source_value, var_id, category_id):
     return sv, ''
 
 
-def _xhs_payload(product, mapping, group_config=None):
+def _xhs_payload(product, mapping, group_config=None, shop_id=None):
     category_id = mapping.get("xhs_category_id")
     if not category_id:
         raise RuntimeError("未配置小红书类目")
@@ -822,7 +827,7 @@ def _xhs_payload(product, mapping, group_config=None):
             source_value = specs_by_name.get(source_name)
             if not source_name or not source_value: continue
             # SKU 规格值:货盘英文编码 → 平台中文 valueName + valueId(小红书后台才能显示中文)
-            value_name, value_id = _resolve_xhs_spec_value(source_value, var_id, category_id)
+            value_name, value_id = _resolve_xhs_spec_value(source_value, var_id, category_id, shop_id)
             variant = {"id": var_def.get("id"), "name": var_def.get("name"), "value": value_name}
             if value_id:
                 variant["valueId"] = value_id
@@ -897,13 +902,13 @@ def _run_publish_item(row):
     group_config = batch["mappings"].get("attr_groups", {}).get(product.get("internal_category"), {})
     if row["platform"] == "wechat":
         product = _prepare_platform_images(product, "wechat", shop_id=shop_id)
-        result = _json_post(f"{WECHAT_API_BASE}/products", _wechat_payload(product, mapping), shop_id=shop_id)
+        result = _json_post(f"{WECHAT_API_BASE}/products", _wechat_payload(product, mapping, shop_id), shop_id=shop_id)
         if result.get("ok") is False: raise RuntimeError(str(result.get("detail") or result)[:500])
         value = result.get("result")
         return {"product_id": value} if not isinstance(value, dict) else value
     if row["platform"] == "xhs":
         product = _prepare_platform_images(product, "xhs", shop_id=shop_id)
-        result = _json_post(f"{XHS_API_BASE}/items/and-sku", _xhs_payload(product, mapping, group_config), shop_id=shop_id)
+        result = _json_post(f"{XHS_API_BASE}/items/and-sku", _xhs_payload(product, mapping, group_config, shop_id), shop_id=shop_id)
         value = result.get("result") or {}
         if value.get("itemId") and (result.get("partial") or value.get("skuErrors")):
             value["partial_error"] = json.dumps(value.get("skuErrors") or [], ensure_ascii=False)
@@ -2453,12 +2458,12 @@ def parse_mapping_sheet(raw, filename):
         raise HTTPException(400, f"Excel 解析失败：{exc}")
 
 
-def resolve_wechat_path(parts, cache):
+def resolve_wechat_path(parts, cache, shop_id=None):
     """按官方名称路径整链反查微信类目,返回 (结果, 错误原因)。"""
     keyword = parts[-1]
     if keyword not in cache:
         try:
-            data = _http_get_json(f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(keyword)}", timeout=180)
+            data = _http_get_json(f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(keyword)}", timeout=180, shop_id=shop_id)
         except Exception as exc:
             raise HTTPException(502, f"微信类目服务({WECHAT_API_BASE})不可用：{exc}")
         cache[keyword] = [r for r in data.get("results", []) if r.get("leaf")]
@@ -2470,7 +2475,7 @@ def resolve_wechat_path(parts, cache):
     return None, f"未匹配到唯一微信类目（含“{keyword}”的候选：{candidates}）"
 
 
-def resolve_xhs_path(parts, cache):
+def resolve_xhs_path(parts, cache, shop_id=None):
     """按官方名称路径逐级反查小红书类目,末级必须是叶子,返回 (结果, 错误原因)。"""
     parent_id = None
     chain = []
@@ -2480,7 +2485,7 @@ def resolve_xhs_path(parts, cache):
         if key not in cache:
             url = f"{XHS_API_BASE}/categories" + (f"?category_id={urllib.parse.quote(key)}" if parent_id else "")
             try:
-                data = _http_get_json(url, timeout=60)
+                data = _http_get_json(url, timeout=60, shop_id=shop_id)
             except Exception as exc:
                 raise HTTPException(502, f"小红书类目服务({XHS_API_BASE})不可用：{exc}")
             result = data.get("result") or []
@@ -2552,10 +2557,10 @@ def import_aliases(body: AliasImportBody, request: Request):
         wechat = xhs = None
         wechat_msg = xhs_msg = "未填写"
         if wechat_path:
-            wechat, err = resolve_wechat_path(split_category_path(wechat_path), wechat_cache)
+            wechat, err = resolve_wechat_path(split_category_path(wechat_path), wechat_cache, shop_id)
             wechat_msg = "成功" if wechat else err
         if xhs_path:
-            xhs, err = resolve_xhs_path(split_category_path(xhs_path), xhs_cache)
+            xhs, err = resolve_xhs_path(split_category_path(xhs_path), xhs_cache, shop_id)
             xhs_msg = "成功" if xhs else err
         if wechat or xhs:
             imported += 1
