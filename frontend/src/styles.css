@@ -136,8 +136,15 @@ button, input { font-family: inherit; }
 .field-label span { margin-left: 6px; color: #a0a7b2; font-size: 11px; font-weight: 400; }
 .description-label { margin-top: 20px; }
 .url-list { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-.url-row { width: 100%; display: grid; grid-template-columns: 28px 1fr 68px 32px; align-items: center; gap: 8px; }
+.url-row { width: 100%; display: grid; grid-template-columns: 28px 40px 1fr 84px 32px; align-items: center; gap: 8px; }
+.url-hint { overflow: hidden; color: #9299a5; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.url-actions { display: flex; align-items: center; gap: 10px; }
 .url-number { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 4px; background: #f0f2f5; color: #737b88; font-size: 11px; }
+/* 图片地址行左侧缩略图：确认「这行是哪张图」，点击可放大；空地址/加载失败显示占位图标 */
+.media-thumb { width: 40px; height: 40px; flex: 0 0 auto; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: #f5f7fa; }
+.media-thumb__image { display: block; width: 100%; height: 100%; cursor: zoom-in; }
+.media-thumb__image .el-image__inner { width: 100%; height: 100%; }
+.media-thumb__mask { width: 100%; height: 100%; display: grid; place-items: center; color: #c3c9d2; font-size: 15px; }
 .sku-table { margin-bottom: 8px; }
 .sku-row { display: grid; grid-template-columns: 1.5fr 1fr 1fr 38px; gap: 12px; align-items: center; padding: 8px 0; }
 .sku-row-wide { grid-template-columns: 1.4fr 1.4fr 1fr 1fr 0.9fr 38px; gap: 8px; }
@@ -233,7 +240,8 @@ button, input { font-family: inherit; }
   .stat-item strong { font-size: 23px; }
   .panel-toolbar { align-items: flex-start; overflow-x: auto; }
   .form-section { padding: 18px 16px; }
-  .url-row { grid-template-columns: 24px minmax(140px, 1fr) 62px 30px; }
+  .url-row { grid-template-columns: 22px 32px minmax(110px, 1fr) 58px 28px; gap: 6px; }
+  .media-thumb { width: 32px; height: 32px; }
   .sku-row { grid-template-columns: 1fr 1fr 1fr 30px; gap: 6px; }
   .bulk-card { padding: 18px 14px; }
   .bulk-selection-bar { flex-wrap: wrap; row-gap: 8px; }

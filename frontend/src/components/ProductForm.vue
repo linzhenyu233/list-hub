@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { Check, Delete, Plus, Search } from '@element-plus/icons-vue'
 import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
+import MediaThumb from './MediaThumb.vue'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -112,6 +113,15 @@ const brandHint = computed(() => {
 })
 
 const validHeadImages = computed(() => form.head_imgs.filter(Boolean))
+
+// 缩略图点开放大时用的图片清单：只放已填地址的图片；previewIndex 返回当前这张在清单里的位置
+const headPreviewList = computed(() => form.head_imgs.filter(Boolean))
+const descPreviewList = computed(() => form.desc_imgs.filter(Boolean))
+
+function previewIndex(list, url) {
+  const i = list.indexOf(url)
+  return i < 0 ? 0 : i
+}
 
 function responseList(data, keys) {
   const result = data?.result || data?.data || data || {}
@@ -412,10 +422,11 @@ async function submit() {
         <div><h3>商品素材</h3><p>填写公网图片地址并转存至微信素材库</p></div>
         <span class="section-index">02</span>
       </div>
-      <div class="field-label">商品主图 <span>至少 3 张，最多 9 张</span></div>
+      <div class="field-label">商品主图 <span>至少 3 张，最多 9 张 · 点击缩略图可放大</span></div>
       <div class="url-list">
-        <div v-for="(_, index) in form.head_imgs" :key="`head-${index}`" class="url-row">
+        <div v-for="(url, index) in form.head_imgs" :key="`head-${index}`" class="url-row">
           <span class="url-number">{{ index + 1 }}</span>
+          <MediaThumb :src="url" :preview-list="headPreviewList" :initial-index="previewIndex(headPreviewList, url)" />
           <el-input v-model="form.head_imgs[index]" placeholder="https://example.com/product.jpg" />
           <el-button :loading="uploadingIndex === index" @click="uploadImage(index, 'head')">转存</el-button>
           <el-button v-if="form.head_imgs.length > 3" text type="danger" :icon="Delete" @click="form.head_imgs.splice(index, 1)" />
@@ -424,8 +435,9 @@ async function submit() {
       </div>
       <div class="field-label description-label">详情图片 <span>可选，最多 50 张</span></div>
       <div class="url-list">
-        <div v-for="(_, index) in form.desc_imgs" :key="`desc-${index}`" class="url-row">
+        <div v-for="(url, index) in form.desc_imgs" :key="`desc-${index}`" class="url-row">
           <span class="url-number">{{ index + 1 }}</span>
+          <MediaThumb :src="url" :preview-list="descPreviewList" :initial-index="previewIndex(descPreviewList, url)" />
           <el-input v-model="form.desc_imgs[index]" placeholder="https://example.com/detail.jpg" />
           <el-button :loading="uploadingIndex === index + 100" @click="uploadImage(index, 'desc')">转存</el-button>
           <el-button v-if="form.desc_imgs.length > 1" text type="danger" :icon="Delete" @click="form.desc_imgs.splice(index, 1)" />

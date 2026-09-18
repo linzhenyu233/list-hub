@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus } from '@element-plus/icons-vue'
 import { xhsApi } from '../xhsApi'
 import { currentShop } from '../shopContext'
+import MediaThumb from './MediaThumb.vue'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -33,6 +34,15 @@ const form = reactive({
   images: [''], imageDescriptions: [''], videoUrl: '', transparentImage: '',
   skuList: [{ erpCode: '', barcode: '', specImage: '', originalPriceYuan: null, priceYuan: null, stock: 0, logisticsPlanId: '', deliveryHours: 24 }],
 })
+
+// 素材行左侧缩略图用的图片清单：只放已填地址的图片；previewIndex 返回当前这张在清单里的位置
+const imagePreviewList = computed(() => form.images.filter(Boolean))
+const descriptionPreviewList = computed(() => form.imageDescriptions.filter(Boolean))
+
+function previewIndex(list, url) {
+  const i = list.indexOf(url)
+  return i < 0 ? 0 : i
+}
 
 const listFrom = (data, keys) => {
   const result = data?.result || data || {}
@@ -359,8 +369,8 @@ onMounted(async () => {
 
     <section class="form-section">
       <div class="section-heading"><div><h3>小红书素材</h3><p>图片通过小红书素材接口独立上传</p></div><span class="section-index">04</span></div>
-      <div class="field-label">商品主图</div><div class="url-list"><div v-for="(_, index) in form.images" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><el-input v-model="form.images[index]" placeholder="图片公网 URL" /><el-button :loading="uploading === `main-${index}`" @click="uploadImage(form.images, index, 'main')">上传</el-button><el-button text type="danger" :icon="Delete" :disabled="form.images.length === 1" @click="form.images.splice(index, 1)" /></div><el-button text type="primary" :icon="Plus" @click="form.images.push('')">添加主图</el-button></div>
-      <div class="field-label description-label">详情图</div><div class="url-list"><div v-for="(_, index) in form.imageDescriptions" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><el-input v-model="form.imageDescriptions[index]" placeholder="详情图片公网 URL" /><el-button :loading="uploading === `detail-${index}`" @click="uploadImage(form.imageDescriptions, index, 'detail')">上传</el-button><el-button text type="danger" :icon="Delete" :disabled="form.imageDescriptions.length === 1" @click="form.imageDescriptions.splice(index, 1)" /></div><el-button text type="primary" :icon="Plus" @click="form.imageDescriptions.push('')">添加详情图</el-button></div>
+      <div class="field-label">商品主图 <span>点击缩略图可放大</span></div><div class="url-list"><div v-for="(url, index) in form.images" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="imagePreviewList" :initial-index="previewIndex(imagePreviewList, url)" /><el-input v-model="form.images[index]" placeholder="图片公网 URL" /><el-button :loading="uploading === `main-${index}`" @click="uploadImage(form.images, index, 'main')">上传</el-button><el-button text type="danger" :icon="Delete" :disabled="form.images.length === 1" @click="form.images.splice(index, 1)" /></div><el-button text type="primary" :icon="Plus" @click="form.images.push('')">添加主图</el-button></div>
+      <div class="field-label description-label">详情图</div><div class="url-list"><div v-for="(url, index) in form.imageDescriptions" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="descriptionPreviewList" :initial-index="previewIndex(descriptionPreviewList, url)" /><el-input v-model="form.imageDescriptions[index]" placeholder="详情图片公网 URL" /><el-button :loading="uploading === `detail-${index}`" @click="uploadImage(form.imageDescriptions, index, 'detail')">上传</el-button><el-button text type="danger" :icon="Delete" :disabled="form.imageDescriptions.length === 1" @click="form.imageDescriptions.splice(index, 1)" /></div><el-button text type="primary" :icon="Plus" @click="form.imageDescriptions.push('')">添加详情图</el-button></div>
       <div class="form-grid form-grid-2" style="margin-top: 16px">
         <el-form-item label="商品视频链接"><el-input v-model="form.videoUrl" placeholder="https://.../video.mp4（可选）" /></el-form-item>
         <el-form-item label="透明图链接"><el-input v-model="form.transparentImage" placeholder="https://.../transparent.png（可选）" /></el-form-item>
