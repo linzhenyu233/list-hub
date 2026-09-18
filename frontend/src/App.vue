@@ -23,6 +23,7 @@ import {
 } from '@element-plus/icons-vue'
 import { storeApi } from './api'
 import { xhsApi } from './xhsApi'
+import { useIsMobile } from './useResponsive'
 // 视图级组件按需异步加载：仅当切换到对应标签时才下载并执行其代码块
 // 首屏只保留商品列表所需的 ProductSearchBar / EllipsisText 同步引入
 const ProductForm = defineAsyncComponent(() => import('./components/ProductForm.vue'))
@@ -374,6 +375,7 @@ function selectPlatform(nextPlatform) {
 // 低频页面（发布 / 类目映射 / 店铺管理 / 接口设置）收进「更多」抽屉。
 // goTo 与侧栏菜单保持同一套 platform 归属逻辑。
 // ------------------------------------------------------------------
+const isMobile = useIsMobile()
 const moreNavVisible = ref(false)
 const moreNavItems = [
   { view: 'create', label: '发布微信商品', icon: CirclePlus, platform: 'wechat' },
@@ -652,7 +654,7 @@ onMounted(async () => {
               <el-table-column label="状态" width="120" show-overflow-tooltip>
                 <template #default="{ row }"><el-tag :type="statusMap[row.status]?.type || 'info'" effect="light" round>{{ statusMap[row.status]?.label || '状态待确认' }}</el-tag></template>
               </el-table-column>
-              <el-table-column label="操作" width="250" fixed="right">
+              <el-table-column label="操作" width="250" :fixed="isMobile ? false : 'right'">
                 <template #default="{ row }">
                   <el-button link type="primary" @click="showDetail(row)">详情</el-button>
                   <el-button link type="primary" @click="openEditProduct(row)">编辑</el-button>

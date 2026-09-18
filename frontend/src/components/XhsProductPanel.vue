@@ -3,12 +3,16 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheck, Clock, Goods, Picture, Plus, Remove } from '@element-plus/icons-vue'
 import { xhsApi } from '../xhsApi'
+import { useIsMobile } from '../useResponsive'
 import XhsProductForm from './XhsProductForm.vue'
 import ProductSearchBar from './ProductSearchBar.vue'
 import ProductDetailView from './ProductDetailView.vue'
 import EllipsisText from './EllipsisText.vue'
 
 const emit = defineEmits(['create'])
+
+// 移动端取消操作列固定：操作栏随表格横向滑动，商品信息列完整显示
+const isMobile = useIsMobile()
 // 顶栏全局刷新:App.vue 递增 refreshTick 通知本页重拉列表(见文件末尾 watch)
 const props = defineProps({ refreshTick: { type: Number, default: 0 } })
 const loading = ref(false)
@@ -407,7 +411,7 @@ watch(() => props.refreshTick, () => { if (serviceOnline.value) void loadItems()
         <el-table-column label="售价" width="150" show-overflow-tooltip><template #default="{ row }"><strong class="price">{{ itemPrice(row) }}</strong></template></el-table-column>
         <el-table-column label="库存" width="110" show-overflow-tooltip><template #default="{ row }">{{ itemStock(row) }}</template></el-table-column>
         <el-table-column label="平台状态" width="160" show-overflow-tooltip><template #default="{ row }"><el-tag :type="statusText(row).type" effect="light" round>{{ statusText(row).label }}</el-tag></template></el-table-column>
-        <el-table-column label="操作" width="260" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="showDetail(row)">详情</el-button><el-button link type="primary" @click="openEditItem(row)">编辑</el-button><el-button v-if="!isSelling(row)" link type="primary" :loading="actionId === `${itemId(row)}-1`" @click="setItemAvailable(row, 1)">上架</el-button><el-button v-else link type="warning" :loading="actionId === `${itemId(row)}-0`" @click="setItemAvailable(row, 0)">下架</el-button><el-button link type="danger" :loading="actionId === `${itemId(row)}-del`" @click="removeItem(row)">删除</el-button></template></el-table-column>
+        <el-table-column label="操作" width="260" :fixed="isMobile ? false : 'right'"><template #default="{ row }"><el-button link type="primary" @click="showDetail(row)">详情</el-button><el-button link type="primary" @click="openEditItem(row)">编辑</el-button><el-button v-if="!isSelling(row)" link type="primary" :loading="actionId === `${itemId(row)}-1`" @click="setItemAvailable(row, 1)">上架</el-button><el-button v-else link type="warning" :loading="actionId === `${itemId(row)}-0`" @click="setItemAvailable(row, 0)">下架</el-button><el-button link type="danger" :loading="actionId === `${itemId(row)}-del`" @click="removeItem(row)">删除</el-button></template></el-table-column>
       </el-table>
       <div class="cursor-pagination">
         <el-pagination
