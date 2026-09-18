@@ -149,15 +149,99 @@ function generateSkusFromVariations() {
 
 function onSpecSelectionChanged() { generateSkusFromVariations() }
 
-async function uploadImage(list, index, key) {
-  if (!list[index]) return ElMessage.warning('请先填写图片公网地址')
-  uploading.value = `${key}-${index}`
+// ================== 素材：直接选本地图片上传 ==================
+// 旧流程要运营先在别处拿到公网图片地址、再点「上传」；现在直接调 /materials/upload-file，
+// 由后端把本地图片传给小红书素材接口并拿回素材 URL（后端会自动放大到 ≥1200）。
+const rowFileInput = ref(null)      // 单行换图
+const batchFileInput = ref(null)    // 一次选多张
+const pendingRow = ref(null)        // { field: 'images' | 'imageDescriptions', index }
+const pendingBatchField = ref('images')
+const uploadingProgress = ref('')
+
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '')
+    reader.onerror = () => reject(new Error('读取本地图片失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+// 本地图片 → 小红书素材库，返回可直接发品的素材 URL
+async function uploadToXhs(file) {
+  if (!file.type.startsWith('image/')) throw new Error('不是图片文件')
+  if (file.size > MAX_IMAGE_BYTES) throw new Error('图片超过 20MB')
+  const data = await xhsApi.uploadMaterialFile(file.name, await fileToBase64(file))
+  const result = data?.result || {}
+  const url = typeof result === 'string'
+    ? result
+    : (result.url || result.materialUrl || result.fileUrl)
+  if (!url) throw new Error('小红书未返回素材地址')
+  return url
+}
+
+function pickRowImage(field, index) {
+  pendingRow.value = { field, index }
+  const input = rowFileInput.value
+  if (!input) return
+  input.value = ''       // 清空后才能再次选同一张图
+  input.click()
+}
+
+function pickBatchImages(field) {
+  pendingBatchField.value = field
+  const input = batchFileInput.value
+  if (!input) return
+  input.value = ''
+  input.click()
+}
+
+async function onRowImagePicked(event) {
+  const file = event?.target?.files?.[0]
+  const target = pendingRow.value
+  pendingRow.value = null
+  if (!file || !target) return
+  uploading.value = `${target.field}-${target.index}`
   try {
-    const data = await xhsApi.uploadMaterial(list[index])
-    const result = data.result || {}
-    list[index] = result.url || result.materialUrl || result.fileUrl || result
+    const url = await uploadToXhs(file)
+    form[target.field][target.index] = url
     ElMessage.success('素材已上传到小红书')
-  } catch (error) { ElMessage.error(error.message) } finally { uploading.value = '' }
+  } catch (error) {
+    ElMessage.error(`${file.name}：${error.message}`)
+  } finally {
+    uploading.value = ''
+  }
+}
+
+// 一次选多张：先补空行，空行填满了再往后追加；顺序即选择顺序
+async function onBatchImagesPicked(event) {
+  const files = Array.from(event?.target?.files || [])
+  const field = pendingBatchField.value
+  if (!files.length) return
+  const list = form[field]
+  uploading.value = `${field}-batch`
+  let done = 0
+  const failed = []
+  for (const [i, file] of files.entries()) {
+    uploadingProgress.value = `正在上传 ${i + 1}/${files.length}…`
+    try {
+      const url = await uploadToXhs(file)
+      const empty = list.findIndex((item) => !item)
+      if (empty >= 0) list[empty] = url
+      else list.push(url)
+      done += 1
+    } catch (error) {
+      failed.push(`${file.name}：${error.message}`)
+    }
+  }
+  uploadingProgress.value = ''
+  uploading.value = ''
+  if (done) ElMessage.success(`已上传 ${done} 张素材到小红书`)
+  if (failed.length) {
+    ElMessage.warning(`${failed.length} 张没传成功：${failed.slice(0, 3).join('；')}${failed.length > 3 ? ' …' : ''}`)
+  }
 }
 
 async function submit() {
@@ -368,9 +452,11 @@ onMounted(async () => {
     </section>
 
     <section class="form-section">
-      <div class="section-heading"><div><h3>小红书素材</h3><p>图片通过小红书素材接口独立上传</p></div><span class="section-index">04</span></div>
-      <div class="field-label">商品主图 <span>点击缩略图可放大</span></div><div class="url-list"><div v-for="(url, index) in form.images" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="imagePreviewList" :initial-index="previewIndex(imagePreviewList, url)" /><el-input v-model="form.images[index]" placeholder="图片公网 URL" /><el-button :loading="uploading === `main-${index}`" @click="uploadImage(form.images, index, 'main')">上传</el-button><el-button text type="danger" :icon="Delete" :disabled="form.images.length === 1" @click="form.images.splice(index, 1)" /></div><el-button text type="primary" :icon="Plus" @click="form.images.push('')">添加主图</el-button></div>
-      <div class="field-label description-label">详情图</div><div class="url-list"><div v-for="(url, index) in form.imageDescriptions" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="descriptionPreviewList" :initial-index="previewIndex(descriptionPreviewList, url)" /><el-input v-model="form.imageDescriptions[index]" placeholder="详情图片公网 URL" /><el-button :loading="uploading === `detail-${index}`" @click="uploadImage(form.imageDescriptions, index, 'detail')">上传</el-button><el-button text type="danger" :icon="Delete" :disabled="form.imageDescriptions.length === 1" @click="form.imageDescriptions.splice(index, 1)" /></div><el-button text type="primary" :icon="Plus" @click="form.imageDescriptions.push('')">添加详情图</el-button></div>
+      <div class="section-heading"><div><h3>小红书素材</h3><p>选择本地图片，直接上传到小红书素材库（不用再找公网地址）</p></div><span class="section-index">04</span></div>
+      <input ref="rowFileInput" type="file" accept="image/*" style="display:none" @change="onRowImagePicked" />
+      <input ref="batchFileInput" type="file" accept="image/*" multiple style="display:none" @change="onBatchImagesPicked" />
+      <div class="field-label">商品主图 <span>点击缩略图可放大</span></div><div class="url-list"><div v-for="(url, index) in form.images" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="imagePreviewList" :initial-index="previewIndex(imagePreviewList, url)" /><span class="url-hint">{{ url ? '已上传到小红书' : '未选择图片' }}</span><el-button :loading="uploading === `images-${index}`" @click="pickRowImage('images', index)">{{ url ? '换图' : '选择图片' }}</el-button><el-button text type="danger" :icon="Delete" :disabled="form.images.length === 1" @click="form.images.splice(index, 1)" /></div><div class="url-actions"><el-button text type="primary" :icon="Plus" :loading="uploading === 'images-batch'" @click="pickBatchImages('images')">选择本地图片（可多选）</el-button><span v-if="uploadingProgress" class="muted-copy">{{ uploadingProgress }}</span></div></div>
+      <div class="field-label description-label">详情图</div><div class="url-list"><div v-for="(url, index) in form.imageDescriptions" :key="index" class="url-row"><span class="url-number">{{ index + 1 }}</span><MediaThumb :src="url" :preview-list="descriptionPreviewList" :initial-index="previewIndex(descriptionPreviewList, url)" /><span class="url-hint">{{ url ? '已上传到小红书' : '未选择图片' }}</span><el-button :loading="uploading === `imageDescriptions-${index}`" @click="pickRowImage('imageDescriptions', index)">{{ url ? '换图' : '选择图片' }}</el-button><el-button text type="danger" :icon="Delete" :disabled="form.imageDescriptions.length === 1" @click="form.imageDescriptions.splice(index, 1)" /></div><div class="url-actions"><el-button text type="primary" :icon="Plus" :loading="uploading === 'imageDescriptions-batch'" @click="pickBatchImages('imageDescriptions')">选择本地图片（可多选）</el-button><span v-if="uploadingProgress" class="muted-copy">{{ uploadingProgress }}</span></div></div>
       <div class="form-grid form-grid-2" style="margin-top: 16px">
         <el-form-item label="商品视频链接"><el-input v-model="form.videoUrl" placeholder="https://.../video.mp4（可选）" /></el-form-item>
         <el-form-item label="透明图链接"><el-input v-model="form.transparentImage" placeholder="https://.../transparent.png（可选）" /></el-form-item>

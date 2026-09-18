@@ -240,7 +240,7 @@ button, input { font-family: inherit; }
   .stat-item strong { font-size: 23px; }
   .panel-toolbar { align-items: flex-start; overflow-x: auto; }
   .form-section { padding: 18px 16px; }
-  .url-row { grid-template-columns: 22px 32px minmax(110px, 1fr) 58px 28px; gap: 6px; }
+  .url-row { grid-template-columns: 22px 32px minmax(70px, 1fr) 78px 28px; gap: 6px; }
   .media-thumb { width: 32px; height: 32px; }
   .sku-row { grid-template-columns: 1fr 1fr 1fr 30px; gap: 6px; }
   .bulk-card { padding: 18px 14px; }

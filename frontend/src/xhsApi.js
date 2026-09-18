@@ -39,6 +39,8 @@ export const xhsApi = {
   categoryVariations: (categoryId) => http.get('/category-variations', { params: { category_id: categoryId } }),
   attributeValues: (categoryId, attributeId) => http.get('/attribute-values', { params: { category_id: categoryId, attribute_id: attributeId } }),
   uploadMaterial: (url) => http.post('/materials/upload', { url }),
+  // 直接上传本地图片：前端读成 base64 → 小红书素材接口 → 返回素材 URL（后端会自动放大到 ≥1200）
+  uploadMaterialFile: (filename, contentBase64) => http.post('/materials/upload-file', { filename, content_base64: contentBase64 }),
   createItemAndSku: (body) => http.post('/items/and-sku', body),
   updateItem: (itemId, body) => http.put(`/items/${itemId}`, body),
   updateSku: (skuId, body) => http.put(`/skus/${skuId}`, body),
