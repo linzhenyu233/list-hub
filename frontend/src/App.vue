@@ -9,6 +9,7 @@ import {
   Connection,
   EditPen,
   Goods,
+  More,
   Picture,
   Plus,
   Refresh,
@@ -368,6 +369,29 @@ function selectPlatform(nextPlatform) {
   activeView.value = nextPlatform === 'xhs' ? 'xhs-products' : 'products'
 }
 
+// ------------------------------------------------------------------
+// 移动端导航：手机上侧栏整体隐藏，底部导航只放高频入口，
+// 低频页面（发布 / 类目映射 / 店铺管理 / 接口设置）收进「更多」抽屉。
+// goTo 与侧栏菜单保持同一套 platform 归属逻辑。
+// ------------------------------------------------------------------
+const moreNavVisible = ref(false)
+const moreNavItems = [
+  { view: 'create', label: '发布微信商品', icon: CirclePlus, platform: 'wechat' },
+  { view: 'xhs-create', label: '发布小红书商品', icon: CirclePlus, platform: 'xhs' },
+  { view: 'category-aliases', label: '类目映射', icon: Collection, platform: 'bulk' },
+  { view: 'shops', label: '店铺管理', icon: Shop },
+  { view: 'settings', label: '接口设置', icon: Setting },
+]
+const isMoreNavActive = computed(() => moreNavItems.some((item) => item.view === activeView.value))
+function goTo(view) {
+  if (view === 'products') return selectPlatform('wechat')
+  if (view === 'xhs-products') return selectPlatform('xhs')
+  if (view === 'bulk-publish' || view === 'category-aliases') platform.value = 'bulk'
+  const item = moreNavItems.find((nav) => nav.view === view)
+  if (item?.platform) platform.value = item.platform
+  activeView.value = view
+}
+
 // 拆店后一家店只属于一个平台：当前视图与店铺平台不匹配时自动跳转，免得切到小红书店后还停在微信商品页要再手动换。
 // 只管平台专属页（微信商品 / 小红书商品 / 发布小红书商品）；批量发布、类目映射、店铺管理、设置不限平台，不干预。
 // 返回 'wechat' / 'xhs'（发生了跳转）或 ''（视图本来就匹配）。
@@ -547,7 +571,7 @@ onMounted(async () => {
         </div>
         <div class="topbar-actions">
           <el-select v-model="shopIdProxy" :loading="shopSwitching" placeholder="选择店铺"
-                     style="width: 250px" :disabled="!shops.length"
+                     class="shop-select" :disabled="!shops.length"
                      :title="shopsError ? `店铺列表加载失败：${shopsError}` : '当前店铺：批次/任务/图片缓存/类目映射都按它隔离'">
             <el-option v-for="item in shops" :key="item.shop_id" :label="item.name" :value="item.shop_id">
               <div class="shop-option">
@@ -560,7 +584,7 @@ onMounted(async () => {
             </el-option>
           </el-select>
           <el-tooltip content="操作人：切换店铺/发布时记录，用于留痕">
-            <el-input v-model="operatorProxy" placeholder="操作人" clearable maxlength="20" style="width: 116px" />
+            <el-input v-model="operatorProxy" placeholder="操作人" clearable maxlength="20" class="operator-input" />
           </el-tooltip>
           <el-tooltip content="刷新服务状态与当前列表"><el-button circle :icon="Refresh" @click="globalRefresh" /></el-tooltip>
           <div class="operator"><div class="avatar">OP</div></div>
@@ -695,16 +719,30 @@ onMounted(async () => {
     </el-container>
 
     <nav class="mobile-nav" aria-label="移动端主导航">
-      <button :class="{ active: platform === 'wechat' && activeView === 'products' }" @click="selectPlatform('wechat')">
+      <button :class="{ active: activeView === 'products' }" @click="goTo('products')">
         <el-icon><Goods /></el-icon><span>微信</span>
       </button>
-      <button :class="{ active: platform === 'xhs' && activeView === 'xhs-products' }" @click="selectPlatform('xhs')">
+      <button :class="{ active: activeView === 'xhs-products' }" @click="goTo('xhs-products')">
         <el-icon><Notebook /></el-icon><span>小红书</span>
       </button>
-      <button :class="{ active: activeView === 'settings' }" @click="activeView = 'settings'">
-        <el-icon><Setting /></el-icon><span>设置</span>
+      <button :class="{ active: activeView === 'bulk-publish' }" @click="goTo('bulk-publish')">
+        <el-icon><Upload /></el-icon><span>批量</span>
+      </button>
+      <button :class="{ active: isMoreNavActive }" @click="moreNavVisible = true">
+        <el-icon><More /></el-icon><span>更多</span>
       </button>
     </nav>
+
+    <!-- 移动端「更多」导航：收纳侧栏里的低频页面 -->
+    <el-drawer v-model="moreNavVisible" direction="btt" size="auto" :with-header="false" class="more-nav-drawer">
+      <div class="more-nav-grid">
+        <button v-for="item in moreNavItems" :key="item.view" :class="{ active: activeView === item.view }"
+                @click="goTo(item.view); moreNavVisible = false">
+          <el-icon><component :is="item.icon" /></el-icon>
+          <span>{{ item.label }}</span>
+        </button>
+      </div>
+    </el-drawer>
 
     <el-drawer v-model="detailVisible" title="微信商品详情" size="760px" class="product-detail-drawer">
       <div v-loading="detailLoading" class="detail-drawer">

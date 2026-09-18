@@ -41,6 +41,8 @@ button, input { font-family: inherit; }
 .shop-option-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shop-option-tags { display: inline-flex; gap: 4px; flex-shrink: 0; }
 .operator { padding-left: 12px; border-left: 1px solid var(--border); font-size: 13px; }
+.shop-select { width: 250px; }
+.operator-input { width: 116px; }
 .avatar { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 50%; background: #e8f2ff; color: #1264c7; font-weight: 700; font-size: 12px; }
 .main-content { padding: 28px; overflow: visible; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
@@ -109,6 +111,9 @@ button, input { font-family: inherit; }
 .bulk-drop strong { margin-top: 10px; color: #1677ff; font-size: 13px; }
 .bulk-zip { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; color: #525a67; font-size: 13px; }
 .bulk-zip small { color: var(--muted); }
+/* 导入行：窄屏自动换行，服务器货盘表下拉占满剩余宽度 */
+.bulk-import-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; }
+.bulk-import-row .el-select { flex: 1 1 220px; }
 .bulk-summary { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; color: #667085; font-size: 13px; }
 .bulk-mapping-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; margin-top: 22px; }
 .bulk-card:has(.bulk-mapping-grid) .bulk-mapping-grid { display: none; }
@@ -202,7 +207,6 @@ button, input { font-family: inherit; }
 }
 
 @media (max-width: 620px) {
-  .product-detail-drawer { width: 94vw !important; }
   .operator-detail__header { grid-template-columns: 72px minmax(0, 1fr); }
   .operator-detail__header > .el-image { width: 72px; height: 72px; }
   .operator-detail__summary .el-descriptions__body .el-descriptions__table { table-layout: fixed; }
@@ -213,7 +217,15 @@ button, input { font-family: inherit; }
   .topbar, .main-content { padding-left: 16px; padding-right: 16px; }
   .main-content { padding-bottom: 82px; }
   .operator > span, .breadcrumb { display: none; }
-  .page-heading { align-items: flex-start; }
+  .topbar { height: auto; min-height: 56px; flex-wrap: wrap; row-gap: 8px; padding-top: 10px; padding-bottom: 10px; }
+  .topbar-actions { width: 100%; }
+  .shop-select { width: min(250px, calc(100vw - 180px)); }
+  .page-heading { flex-wrap: wrap; row-gap: 10px; }
+  .page-heading .el-button { flex-shrink: 0; }
+  .connection-status, .setting-row { flex-wrap: wrap; }
+  .xhs-code-row { flex-direction: column; align-items: stretch; }
+  .xhs-code-row .el-input { max-width: none; }
+  .cursor-pagination { flex-wrap: wrap; row-gap: 8px; }
   .page-heading h1 { font-size: 20px; }
   .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
   .stat-item { min-height: 92px; padding: 15px; }
@@ -222,11 +234,40 @@ button, input { font-family: inherit; }
   .form-section { padding: 18px 16px; }
   .url-row { grid-template-columns: 24px minmax(140px, 1fr) 62px 30px; }
   .sku-row { grid-template-columns: 1fr 1fr 1fr 30px; gap: 6px; }
-  .mobile-nav { position: fixed; z-index: 30; right: 12px; bottom: 10px; left: 12px; height: 58px; display: grid; grid-template-columns: repeat(3, 1fr); padding: 5px; border: 1px solid #dfe4ea; border-radius: 8px; background: rgba(255,255,255,.96); box-shadow: 0 8px 24px rgba(17,24,39,.14); backdrop-filter: blur(10px); }
+  .bulk-card { padding: 18px 14px; }
+  .bulk-selection-bar { flex-wrap: wrap; row-gap: 8px; }
+  .bulk-summary { flex-wrap: wrap; }
+  .bulk-card .el-select { width: 100% !important; }
+  .platform-picker { flex-wrap: wrap; }
+  .form-actions { flex-wrap: wrap; }
+  .form-actions > div { flex-wrap: wrap; }
+  .form-actions { bottom: 74px; }
+  .mobile-nav { position: fixed; z-index: 30; right: 12px; bottom: calc(10px + env(safe-area-inset-bottom, 0px)); left: 12px; height: 58px; display: grid; grid-template-columns: repeat(4, 1fr); padding: 5px; border: 1px solid #dfe4ea; border-radius: 8px; background: rgba(255,255,255,.96); box-shadow: 0 8px 24px rgba(17,24,39,.14); backdrop-filter: blur(10px); }
   .mobile-nav button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; border: 0; border-radius: 5px; background: transparent; color: #7c8593; font-size: 11px; }
   .mobile-nav button .el-icon { font-size: 18px; }
   .mobile-nav button.active { background: #edf5ff; color: #1677ff; font-weight: 600; }
 }
+
+/* ============ 移动端：弹层全宽与横向滚动兜底 ============ */
+@media (max-width: 620px) {
+  .el-drawer { width: 100vw !important; max-width: 100vw !important; }
+  .el-drawer__body { padding: 14px 14px 20px; }
+  .el-dialog { width: calc(100vw - 24px) !important; max-width: calc(100vw - 24px) !important; }
+  .el-message-box { width: calc(100vw - 32px) !important; max-width: calc(100vw - 32px) !important; }
+  .el-pagination { flex-wrap: wrap; row-gap: 6px; }
+  .product-table .el-table__cell { padding: 10px 6px; }
+  .product-cell strong, .product-cell span { max-width: 160px; }
+  .bulk-steps { overflow-x: auto; padding: 14px 10px; }
+  .bulk-steps .el-step { min-width: 96px; }
+  .bulk-filters .el-input { width: 100% !important; }
+  .bulk-drop__filename { max-width: 100%; }
+}
+
+/* ============ 移动端「更多」导航抽屉 ============ */
+.more-nav-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 16px 8px calc(20px + env(safe-area-inset-bottom, 0px)); }
+.more-nav-grid button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 12px 4px; border: 0; border-radius: 8px; background: transparent; color: #344054; font-size: 12px; cursor: pointer; }
+.more-nav-grid button .el-icon { font-size: 22px; }
+.more-nav-grid button.active { background: #edf5ff; color: var(--brand); font-weight: 600; }
 .bulk-filters {
   display: flex;
   align-items: center;
@@ -294,7 +335,7 @@ button, input { font-family: inherit; }
   .bulk-pagination { justify-content: center; overflow-x: auto; }
 }
 
-w/* ============ 商品搜索栏 ============ */
+/* ============ 商品搜索栏 ============ */
 .product-search-bar {
   padding: 14px 18px;
   border-bottom: 1px solid var(--border);
