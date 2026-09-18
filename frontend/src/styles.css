@@ -111,9 +111,10 @@ button, input { font-family: inherit; }
 .bulk-drop strong { margin-top: 10px; color: #1677ff; font-size: 13px; }
 .bulk-zip { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; color: #525a67; font-size: 13px; }
 .bulk-zip small { color: var(--muted); }
-/* 导入行：窄屏自动换行，服务器货盘表下拉占满剩余宽度 */
+/* 导入行：服务器货盘表下拉在桌面端保持固定宽度，不抢占整行剩余空间；
+   窄屏（700px 以下）才自动换行并撑满整行 */
 .bulk-import-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; }
-.bulk-import-row .el-select { flex: 1 1 220px; }
+.bulk-import-row .el-select { flex: 0 1 320px; min-width: 200px; }
 .bulk-summary { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; color: #667085; font-size: 13px; }
 .bulk-mapping-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; margin-top: 22px; }
 .bulk-card:has(.bulk-mapping-grid) .bulk-mapping-grid { display: none; }
@@ -333,6 +334,7 @@ button, input { font-family: inherit; }
   .bulk-filters { flex-wrap: wrap; }
   .bulk-filters .el-input { width: 100%; }
   .bulk-pagination { justify-content: center; overflow-x: auto; }
+  .bulk-import-row .el-select { flex: 1 1 100%; min-width: 0; }
 }
 
 /* ============ 商品搜索栏 ============ */
