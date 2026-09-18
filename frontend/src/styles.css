@@ -135,16 +135,38 @@ button, input { font-family: inherit; }
 .field-label { margin-bottom: 10px; color: #525a67; font-size: 13px; font-weight: 600; }
 .field-label span { margin-left: 6px; color: #a0a7b2; font-size: 11px; font-weight: 400; }
 .description-label { margin-top: 20px; }
-.url-list { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-.url-row { width: 100%; display: grid; grid-template-columns: 28px 40px 1fr 84px 32px; align-items: center; gap: 8px; }
-.url-hint { overflow: hidden; color: #9299a5; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.url-actions { display: flex; align-items: center; gap: 10px; }
-.url-number { width: 24px; height: 24px; display: grid; place-items: center; border-radius: 4px; background: #f0f2f5; color: #737b88; font-size: 11px; }
-/* 图片地址行左侧缩略图：确认「这行是哪张图」，点击可放大；空地址/加载失败显示占位图标 */
-.media-thumb { width: 40px; height: 40px; flex: 0 0 auto; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: #f5f7fa; }
-.media-thumb__image { display: block; width: 100%; height: 100%; cursor: zoom-in; }
-.media-thumb__image .el-image__inner { width: 100%; height: 100%; }
-.media-thumb__mask { width: 100%; height: 100%; display: grid; place-items: center; color: #c3c9d2; font-size: 15px; }
+/* 素材网格：缩略图卡片 + 虚线「添加图片」方块（点击图片可放大，悬停出现换图/删除） */
+.media-gallery { display: flex; flex-wrap: wrap; gap: 12px; }
+.media-card { position: relative; width: 108px; height: 108px; overflow: hidden; border: 1px solid var(--border); border-radius: 6px; background: #f5f7fa; }
+.media-card__img { display: block; width: 100%; height: 100%; cursor: zoom-in; }
+.media-card__img .el-image__inner { width: 100%; height: 100%; }
+.media-card__index { position: absolute; right: 4px; bottom: 4px; z-index: 3; min-width: 16px; padding: 0 4px; border-radius: 3px; background: rgba(17, 24, 39, .6); color: #fff; font-size: 11px; line-height: 16px; text-align: center; pointer-events: none; }
+.media-card__veil, .media-card__fallback { position: absolute; inset: 0; z-index: 2; display: grid; align-content: center; place-items: center; gap: 4px; background: rgba(255, 255, 255, .88); color: #98a0ac; font-size: 12px; }
+.media-card__fallback .el-icon { font-size: 18px; }
+/* ⚠️ 操作层不能挡住缩略图：它只是视觉覆盖，只有按钮本身接收点击，
+   其余位置穿透给图片，这样「点图放大」在悬停（以及触屏常显）时都照常可用。 */
+.media-card__veil { pointer-events: none; }
+.media-card__tools { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center; gap: 6px; background: rgba(17, 24, 39, .45); opacity: 0; pointer-events: none; transition: opacity .15s ease; }
+.media-card:hover .media-card__tools { opacity: 1; }
+.media-card__tools button { display: inline-flex; align-items: center; gap: 3px; padding: 4px 8px; border: 0; border-radius: 4px; background: rgba(255, 255, 255, .94); color: #303133; font-size: 12px; cursor: pointer; pointer-events: auto; }
+.media-card__tools button:hover { color: var(--brand); }
+.media-card__tools button.is-danger:hover { color: #d92d20; }
+.media-card--add { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; border-style: dashed; border-color: #ccd5e0; background: #fafcff; color: #667085; font-size: 12px; cursor: pointer; transition: border-color .15s ease, color .15s ease, background .15s ease; }
+.media-card--add:hover:not(:disabled) { border-color: var(--brand); background: #f4f9ff; color: var(--brand); }
+.media-card--add:disabled { border-color: #e5e9ef; background: #f7f8fa; color: #b9c0cb; cursor: not-allowed; }
+.media-card--add .el-icon { font-size: 20px; }
+.media-card__progress { color: var(--brand); font-size: 11px; }
+/* 单图卡片（SKU 规格图这类）：比素材网格小一号，操作按钮只留图标 */
+.media-gallery--small { gap: 0; }
+.media-card--small { width: 72px; height: 72px; }
+.media-card--small .media-card__fallback { font-size: 16px; }
+.media-card--small .media-card__tools { gap: 4px; }
+.media-card--small .media-card__tools button { padding: 4px 6px; }
+.media-card--small .media-card__tools button span { display: none; }
+/* 触屏没有 hover：操作按钮常显，否则运营看不到「换图/删除」 */
+@media (hover: none) {
+  .media-card__tools { opacity: 1; background: rgba(17, 24, 39, .32); }
+}
 .sku-table { margin-bottom: 8px; }
 .sku-row { display: grid; grid-template-columns: 1.5fr 1fr 1fr 38px; gap: 12px; align-items: center; padding: 8px 0; }
 .sku-row-wide { grid-template-columns: 1.4fr 1.4fr 1fr 1fr 0.9fr 38px; gap: 8px; }
@@ -240,8 +262,8 @@ button, input { font-family: inherit; }
   .stat-item strong { font-size: 23px; }
   .panel-toolbar { align-items: flex-start; overflow-x: auto; }
   .form-section { padding: 18px 16px; }
-  .url-row { grid-template-columns: 22px 32px minmax(70px, 1fr) 78px 28px; gap: 6px; }
-  .media-thumb { width: 32px; height: 32px; }
+  .media-gallery { gap: 8px; }
+  .media-card { width: 92px; height: 92px; }
   .sku-row { grid-template-columns: 1fr 1fr 1fr 30px; gap: 6px; }
   .bulk-card { padding: 18px 14px; }
   .bulk-selection-bar { flex-wrap: wrap; row-gap: 8px; }
