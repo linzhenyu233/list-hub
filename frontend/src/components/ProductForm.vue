@@ -5,6 +5,7 @@ import { Check, Delete, Plus, Search } from '@element-plus/icons-vue'
 import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
+import MediaUploader from './MediaUploader.vue'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -168,12 +169,13 @@ onMounted(async () => {
     form.skus = (d.skus || []).map((sku) => ({
       out_sku_id: sku.out_sku_id || '',
       sku_code: sku.sku_code || '',
+      thumb_img: sku.thumb_img || '',
       sale_price_yuan: sku.sale_price != null ? sku.sale_price / 100 : null,
       market_price_yuan: sku.market_price != null ? sku.market_price / 100 : null,
       stock_num: sku.stock_num || 0,
       _spec_attrs: sku.sku_attrs || [],
     }))
-    if (!form.skus.length) form.skus = [{ out_sku_id: '', sku_code: '', sale_price_yuan: null, market_price_yuan: null, stock_num: 0 }]
+    if (!form.skus.length) form.skus = [{ out_sku_id: '', sku_code: '', thumb_img: '', sale_price_yuan: null, market_price_yuan: null, stock_num: 0 }]
     // 回填属性
     if (d.attrs?.length) {
       for (const a of d.attrs) { attrValues[a.attr_key] = a.attr_value }
@@ -188,12 +190,14 @@ onMounted(async () => {
       if (d.attrs?.length) {
         for (const a of d.attrs) { attrValues[a.attr_key] = a.attr_value }
       }
+      // 再把 SKU 上的规格维度/值还原到规格区（平台只存在 sku_attrs 里）
+      restoreSpecSelection()
     }
   }
 })
 
 function addSku() {
-  form.skus.push({ out_sku_id: '', sku_code: '', sale_price_yuan: null, market_price_yuan: null, stock_num: 0 })
+  form.skus.push({ out_sku_id: '', sku_code: '', thumb_img: '', sale_price_yuan: null, market_price_yuan: null, stock_num: 0 })
 }
 
 function removeSku(index) {
@@ -220,6 +224,7 @@ async function searchCategories() {
     if (!categoryOptions.value.length) ElMessage.warning('未找到可发布的叶子类目')
     attrDefs.value = []
     specDefs.value = []
+    activeSpecNames.value = []
     Object.keys(attrValues).forEach((k) => delete attrValues[k])
     Object.keys(specValues).forEach((k) => delete specValues[k])
   } catch (error) {
@@ -234,24 +239,180 @@ watch(attrDefs, () => {
   attrDefs.value.forEach((a) => { attrValues[a.name] = a.type_v2 === 'select_many' ? [] : '' })
 })
 
+// ============ 规格维度：像微信小店后台那样自己添加/删除维度 ============
+// 平台给了该类目可用的规格定义(sale_attr_list)，运营从里面挑要用的，
+// 不再一次性把用不到的维度都铺在页面上。
+const activeSpecNames = ref([])
+
+const activeSpecDefs = computed(() => activeSpecNames.value
+  .map((name) => specDefs.value.find((d) => d.name === name))
+  .filter(Boolean))
+
+const availableSpecDefs = computed(() => specDefs.value
+  .filter((d) => !activeSpecNames.value.includes(d.name)))
+
+// SKU 表里，已填了值的规格维度各占一列
+const activeSpecDims = computed(() => activeSpecDefs.value
+  .filter((d) => (specValues[d.name] || []).length > 0))
+
+// ============ 规格值配图（对齐微信后台的「配图」） ============
+// 同一颜色的各个尺码共用一张图：在规格值上配一次，自动套到所有用到该值的 SKU。
+// 一行只允许一个维度开配图，避免"颜色图"和"尺码图"互相覆盖。
+const specValueImages = reactive({})
+const imageSpecName = ref('')
+
+function setImageSpec(name, on) {
+  imageSpecName.value = on ? name : ''
+  if (on) {
+    if (!specValueImages[name]) specValueImages[name] = {}
+    // 重新打开时把已配过的图立即套回 SKU（中间可能改过规格值）
+    for (const value of Object.keys(specValueImages[name])) applySpecValueImage(name, value)
+  }
+}
+
+function applySpecValueImage(name, value) {
+  const url = specValueImages[name]?.[value] || ''
+  for (const sku of form.skus) {
+    if (specValueOf(sku, name) === value) sku.thumb_img = url
+  }
+}
+
+// 规格值被删掉时，顺手清掉它配过的图
+function pruneSpecValueImages() {
+  for (const name of Object.keys(specValueImages)) {
+    for (const value of Object.keys(specValueImages[name])) {
+      if (!(specValues[name] || []).includes(value)) delete specValueImages[name][value]
+    }
+  }
+}
+
+// 某个 SKU 在指定规格维度上的值
+function specValueOf(sku, name) {
+  const attr = (sku._spec_attrs || []).find((a) => (a.attr_key || a.name) === name)
+  return (attr && (attr.attr_value ?? attr.value)) || '—'
+}
+
 function generateSkusFromSpecs() {
-  const dims = specDefs.value.filter((d) => (specValues[d.name] || []).length > 0)
-  if (!dims.length) return
+  const dims = activeSpecDefs.value.filter((d) => (specValues[d.name] || []).length > 0)
+  if (!dims.length) {
+    // 规格全删掉 → 只留一个默认 SKU（与后台一致），价格等沿用第一行
+    if (form.skus.length > 1) form.skus = [form.skus[0]]
+    return
+  }
   let combos = [[]]
   for (const dim of dims) {
     combos = combos.flatMap((c) => (specValues[dim.name] || []).map((v) => [...c, { attr_key: dim.name, attr_value: v }]))
   }
-  form.skus = combos.map((attrs, i) => ({
-    out_sku_id: form.skus[i]?.out_sku_id || `SKU-${String(i + 1).padStart(3, '0')}`,
-    sku_code: form.skus[i]?.sku_code || '',
-    sale_price_yuan: form.skus[i]?.sale_price_yuan || null,
-    market_price_yuan: form.skus[i]?.market_price_yuan || null,
-    stock_num: form.skus[i]?.stock_num || 0,
-    _spec_attrs: attrs,
-  }))
+  form.skus = combos.map((attrs, i) => {
+    // 开了配图的维度：按规格值取那张图；否则沿用该行原来传的图，别被重新组合清掉
+    const imageKey = imageSpecName.value
+    const imageValue = imageKey ? (attrs.find((a) => a.attr_key === imageKey)?.attr_value || '') : ''
+    const thumbImg = (imageKey && specValueImages[imageKey]?.[imageValue]) || form.skus[i]?.thumb_img || ''
+    return {
+      out_sku_id: form.skus[i]?.out_sku_id || `SKU-${String(i + 1).padStart(3, '0')}`,
+      sku_code: form.skus[i]?.sku_code || '',
+      thumb_img: thumbImg,
+      sale_price_yuan: form.skus[i]?.sale_price_yuan || null,
+      market_price_yuan: form.skus[i]?.market_price_yuan || null,
+      stock_num: form.skus[i]?.stock_num || 0,
+      _spec_attrs: attrs,
+    }
+  })
 }
 
-function onSpecValuesChanged() { generateSkusFromSpecs() }
+function onSpecValuesChanged() {
+  cleanSpecValues()
+  pruneSpecValueImages()
+  generateSkusFromSpecs()
+}
+
+// 没有候选值的规格（比如"钻石"）用输入框手填，回车加入
+function addManualSpecValue(name) {
+  const value = String(_manualSpecInput[name] || '').trim()
+  if (!value) return
+  if (!Array.isArray(specValues[name])) specValues[name] = []
+  if (!specValues[name].includes(value)) specValues[name].push(value)
+  _manualSpecInput[name] = ''
+  onSpecValuesChanged()
+}
+
+// 兜底：清掉历史误操作留下的脏值（旧代码把回车事件对象当成了规格值）
+function cleanSpecValues() {
+  for (const name of Object.keys(specValues)) {
+    const list = specValues[name]
+    if (!Array.isArray(list)) continue
+    const cleaned = list.filter((v) => typeof v === 'string' && v.trim() && !/^\[object .+\]$/.test(v.trim()))
+    if (cleaned.length !== list.length) specValues[name] = cleaned
+  }
+}
+
+function addSpecDim() {
+  const next = availableSpecDefs.value[0]
+  if (!next) return
+  if (!Array.isArray(specValues[next.name])) specValues[next.name] = []
+  activeSpecNames.value.push(next.name)
+}
+
+function removeSpecDim(name) {
+  activeSpecNames.value = activeSpecNames.value.filter((n) => n !== name)
+  delete specValues[name]
+  delete specValueImages[name]
+  if (imageSpecName.value === name) imageSpecName.value = ''
+  generateSkusFromSpecs()
+}
+
+// 换规格名：已选的值照搬过去（值本身与维度名无关，不用重填）
+function renameSpecDim(oldName, newName) {
+  if (!newName || newName === oldName || activeSpecNames.value.includes(newName)) return
+  const index = activeSpecNames.value.indexOf(oldName)
+  if (index < 0) return
+  activeSpecNames.value.splice(index, 1, newName)
+  specValues[newName] = specValues[oldName] || []
+  delete specValues[oldName]
+}
+
+// 编辑已有商品：平台只在每个 SKU 的 sku_attrs 里存规格值。
+// 不回填的话规格区是空的、SKU 表也长不出规格列，保存还会把商品的规格丢掉。
+function restoreSpecSelection() {
+  const names = []
+  const values = {}
+  for (const sku of form.skus) {
+    for (const attr of (sku._spec_attrs || [])) {
+      const key = attr.attr_key || attr.name
+      const value = attr.attr_value ?? attr.value
+      if (!key || value == null || value === '') continue
+      if (!names.includes(key)) names.push(key)
+      if (!values[key]) values[key] = []
+      if (!values[key].includes(String(value))) values[key].push(String(value))
+    }
+  }
+  if (!names.length) return
+  for (const name of names) {
+    // 老商品可能有平台规格定义里已经没有的维度，补一条定义，保证页面上仍能看到
+    if (!specDefs.value.some((d) => d.name === name)) {
+      specDefs.value.push({ name, value: [], append_allowed: true })
+    }
+    specValues[name] = values[name]
+  }
+  activeSpecNames.value = names
+
+  // 如果某个维度满足"同值同图"，说明它是当初配图的那个维度，把图和开关一起还原
+  for (const name of names) {
+    const map = {}
+    let consistent = true
+    for (const sku of form.skus) {
+      const value = specValueOf(sku, name)
+      const image = sku.thumb_img || ''
+      if (!image || value === '—') continue
+      if (map[value] && map[value] !== image) { consistent = false; break }
+      map[value] = image
+    }
+    if (consistent && Object.keys(map).length) {
+      specValueImages[name] = map
+      if (!imageSpecName.value) imageSpecName.value = name
+    }
+  }
+}
 
 async function handleCategorySelect() {
   if (!selectedCategory.value) return
@@ -264,6 +425,13 @@ async function handleCategorySelect() {
       if (!specValues[d.name]) specValues[d.name] = []
       _manualSpecInput[d.name] = ''
     })
+    // 切换类目后丢掉不属于该类目的旧维度；默认只放平台标记为必填的维度，
+    // 其余由运营点「新增规格」按需添加（编辑时会再由 restoreSpecSelection 还原实际用的维度）
+    activeSpecNames.value = activeSpecNames.value.filter((n) => specDefs.value.some((d) => d.name === n))
+    if (!activeSpecNames.value.length) {
+      activeSpecNames.value = specDefs.value.filter((d) => d.is_required).map((d) => d.name)
+    }
+    cleanSpecValues()
   } catch (error) {
     ElMessage.warning(`加载类目属性失败：${error.message}`)
   }
@@ -319,6 +487,8 @@ async function submit() {
         }
         if (sku.market_price_yuan != null && sku.market_price_yuan > 0) item.market_price = Math.round(Number(sku.market_price_yuan) * 100)
         if (sku.sku_code) item.sku_code = sku.sku_code
+        // SKU 规格图：微信只接受图片上传接口返回的 img_url(mmecimage.cn)，否则报 10020035
+        if (sku.thumb_img) item.thumb_img = sku.thumb_img
         return item
       }),
     }
@@ -423,46 +593,69 @@ async function submit() {
       </div>
     </section>
 
-    <section v-if="specDefs.length" class="form-section">
-      <div class="section-heading">
-        <div><h3>销售规格</h3><p>选择规格值后自动生成 SKU 组合，再补充编码和价格</p></div>
-        <span class="section-index">04</span>
-      </div>
-      <div v-for="dim in specDefs" :key="dim.name" class="spec-dimension">
-        <div class="field-label">{{ dim.name }} <span v-if="dim.is_required">（必填）</span></div>
-        <el-select v-if="attrOptions(dim.value).length > 0" v-model="specValues[dim.name]" multiple filterable :allow-create="dim.append_allowed" :placeholder="'选择' + dim.name + '值'" @change="onSpecValuesChanged">
-          <el-option v-for="v in attrOptions(dim.value)" :key="v" :label="v" :value="v" />
-        </el-select>
-        <div v-else class="spec-manual-tags">
-          <el-tag v-for="(v, vi) in (specValues[dim.name] || [])" :key="vi" closable @close="specValues[dim.name].splice(vi, 1); onSpecValuesChanged()">{{ v }}</el-tag>
-          <el-input v-model="_manualSpecInput[dim.name]" :placeholder="'输入后回车添加'" style="width: 160px" @keyup.enter="(_v) => { if (_v) { (specValues[dim.name] = specValues[dim.name] || []); specValues[dim.name].push(_v); _manualSpecInput[dim.name] = ''; onSpecValuesChanged() } }" />
-        </div>
-      </div>
-    </section>
-
     <section class="form-section">
       <div class="section-heading">
-        <div><h3>销售规格</h3><p>价格以元录入，提交时自动转换为分</p></div>
-        <span class="section-index">{{ specDefs.length ? '05' : '03' }}</span>
+        <div><h3>规格和库存价格</h3><p>先添加颜色、尺码等规格并填值，系统按规格组合生成对应 SKU，再逐个填价格、库存与编码</p></div>
+        <span class="section-index">{{ attrDefs.length ? '04' : '03' }}</span>
       </div>
-      <div class="sku-table">
-        <div class="sku-row sku-header sku-row-wide"><span>SKU 编码</span><span>商品条码</span><span>销售价（元）</span><span>划线价（元）</span><span>库存</span><span></span></div>
-        <div v-for="(sku, index) in form.skus" :key="index" class="sku-row sku-row-wide">
-          <el-input v-model="sku.out_sku_id" placeholder="SKU-001" />
-          <el-input v-model="sku.sku_code" placeholder="商品条码（可选）" />
-          <el-input-number v-model="sku.sale_price_yuan" :min="0.01" :precision="2" :controls="false" placeholder="0.00" />
-          <el-input-number v-model="sku.market_price_yuan" :min="0" :precision="2" :controls="false" placeholder="划线价" />
-          <el-input-number v-model="sku.stock_num" :min="0" :precision="0" controls-position="right" />
-          <el-button text type="danger" :icon="Delete" :disabled="form.skus.length === 1" @click="removeSku(index)" />
+      <div v-if="specDefs.length" class="spec-rows">
+        <div v-for="dim in activeSpecDefs" :key="dim.name" class="spec-dimension">
+          <div class="spec-dim-head">
+            <el-select class="spec-name-select" :model-value="dim.name" @change="(name) => renameSpecDim(dim.name, name)">
+              <el-option v-for="d in specDefs" :key="d.name" :label="d.name + (d.is_required ? '（必填）' : '')" :value="d.name" :disabled="activeSpecNames.includes(d.name) && d.name !== dim.name" />
+            </el-select>
+            <div class="spec-dim-tools">
+              <el-switch :model-value="imageSpecName === dim.name" @change="(on) => setImageSpec(dim.name, on)" />
+              <span title="开：按规格值配图（同色各尺码共用一张图）">配图</span>
+              <el-button text type="danger" :icon="Delete" title="删除该规格" @click="removeSpecDim(dim.name)" />
+            </div>
+          </div>
+          <el-select v-if="attrOptions(dim.value).length > 0" v-model="specValues[dim.name]" multiple filterable allow-create default-first-option :placeholder="`选择或直接输入${dim.name}值（输入后回车）`" @change="onSpecValuesChanged">
+            <el-option v-for="v in attrOptions(dim.value)" :key="v" :label="v" :value="v" />
+          </el-select>
+          <div v-else class="spec-manual-tags">
+            <el-tag v-for="(v, vi) in (specValues[dim.name] || [])" :key="vi" closable @close="specValues[dim.name].splice(vi, 1); onSpecValuesChanged()">{{ v }}</el-tag>
+            <el-input v-model="_manualSpecInput[dim.name]" placeholder="输入后回车添加" style="width: 260px" @keyup.enter="addManualSpecValue(dim.name)" />
+          </div>
+          <div v-if="imageSpecName === dim.name" class="spec-value-images">
+            <div v-for="v in (specValues[dim.name] || [])" :key="v" class="spec-value-image">
+              <MediaUploader v-model="specValueImages[dim.name][v]" :upload="uploadWechatImage" placeholder="选图" compact @update:model-value="applySpecValueImage(dim.name, v)" />
+              <span class="spec-value-image__label" :title="v">{{ v }}</span>
+            </div>
+            <span v-if="!(specValues[dim.name] || []).length" class="muted-copy">先填{{ dim.name }}的值，再逐个配图</span>
+          </div>
         </div>
+        <el-button text type="primary" :icon="Plus" :disabled="!availableSpecDefs.length" @click="addSpecDim">新增规格</el-button>
       </div>
-      <el-button text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
+      <div v-else class="muted-copy">该类目没有可选规格；不填规格将生成单个默认 SKU。</div>
+
+      <div class="field-label description-label">价格与库存</div>
+      <el-table :key="activeSpecDims.map((d) => d.name).join('-')" :data="form.skus" size="small" border empty-text="未生成 SKU" class="wx-sku-table">
+        <el-table-column v-for="dim in activeSpecDims" :key="dim.name" :label="dim.name" min-width="110" show-overflow-tooltip>
+          <template #default="{ row }"><span class="sku-spec-value">{{ specValueOf(row, dim.name) }}</span></template>
+        </el-table-column>
+        <el-table-column label="规格图" width="86" align="center">
+          <template #default="{ row }"><MediaUploader v-model="row.thumb_img" :upload="uploadWechatImage" placeholder="选图" compact /></template>
+        </el-table-column>
+        <el-table-column label="销售价（元）" width="140"><template #default="{ row }"><el-input-number v-model="row.sale_price_yuan" :min="0.01" :precision="2" :controls="false" placeholder="0.00" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="划线价（元）" width="140"><template #default="{ row }"><el-input-number v-model="row.market_price_yuan" :min="0" :precision="2" :controls="false" placeholder="划线价" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="库存" width="130"><template #default="{ row }"><el-input-number v-model="row.stock_num" :min="0" :precision="0" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="SKU 编码" width="180"><template #default="{ row }"><el-input v-model="row.out_sku_id" placeholder="SKU-001" /></template></el-table-column>
+        <el-table-column label="商品条码" width="170"><template #default="{ row }"><el-input v-model="row.sku_code" placeholder="可选" /></template></el-table-column>
+        <el-table-column label="操作" width="60" align="center" fixed="right">
+          <template #default="{ $index }"><el-button text type="danger" :icon="Delete" :disabled="form.skus.length === 1" @click="removeSku($index)" /></template>
+        </el-table-column>
+      </el-table>
+      <div class="sku-table-footer">
+        <el-button v-if="!activeSpecDims.length" text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
+        <span class="muted-copy">共 {{ form.skus.length }} 个 SKU；规格列由上面所选规格值自动生成，价格以元录入，提交时自动转换为分</span>
+      </div>
     </section>
 
     <section class="form-section compact-section">
       <div class="section-heading">
         <div><h3>履约与服务</h3><p>设置发货及售后服务</p></div>
-        <span class="section-index">{{ specDefs.length ? '06' : '04' }}</span>
+        <span class="section-index">{{ attrDefs.length ? '05' : '04' }}</span>
       </div>
       <div class="switch-list">
         <div><span>运费模板</span><el-select v-model="form.freight_template_id" :loading="loadingFreightTemplates" clearable placeholder="选择微信运费模板"><el-option v-for="item in freightTemplates" :key="optionId(item)" :label="optionName(item)" :value="String(optionId(item))" /></el-select></div>

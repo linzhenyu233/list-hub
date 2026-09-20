@@ -121,15 +121,20 @@ function generateSkusFromVariations() {
   for (const dim of dims) {
     const selectedIds = attrValues[dim.id] || []
     combos = combos.flatMap((c) => selectedIds.map((vid) => {
-      const val = (cands[dim.id] || []).find((v) => v.valueId === vid)
-      // ⚠️ 平台要的字段名是 value（批量发布那边发的也是 value）；
-      //    valueName 只留着本地显示/兜底，别只发 valueName，否则平台收不到规格值。
+      // 下拉里选的是候选值的 valueId；手输的是文本。按 valueId 或中文名都匹配一次，
+      // 这样"打字输入了候选里已有的颜色名"也会复用平台的官方 valueId，不会变成两条不同规格。
+      const text = String(vid ?? '').trim()
+      const hit = (cands[dim.id] || []).find((v) => v.valueId === vid || v.valueName === text)
+      // 平台候选里没有的值：value 就是输入文本、不带 valueId
+      // （批量发布那边找不到候选时也是这么发的，平台允许只给 value）。
+      // ⚠️ 平台要的字段名是 value，valueName 只留着本地显示/兜底。
+      const finalText = hit?.valueName || text
       return [...c, {
         id: dim.id,
         name: dim.name,
-        valueId: vid,
-        value: val?.valueName || '',
-        valueName: val?.valueName || '',
+        valueId: hit?.valueId || '',
+        value: finalText,
+        valueName: finalText,
       }]
     }))
   }
@@ -148,10 +153,51 @@ function generateSkusFromVariations() {
 
 function onSpecSelectionChanged() { generateSkusFromVariations() }
 
-// SKU 表格：已选值的规格维度各占一列（像小红书后台那样，一眼看出每行是哪个规格）
-const activeSpecDims = computed(() => varDefs.value.filter(
-  (d) => Array.isArray(attrValues[d.id]) && attrValues[d.id].length > 0,
-))
+// SKU 表格：规格维度各占一列（像小红书后台那样，一眼看出每行是哪个规格）
+const activeSpecDims = computed(() => {
+  const dims = varDefs.value
+    .filter((d) => Array.isArray(attrValues[d.id]) && attrValues[d.id].length > 0)
+    .map((d) => ({ id: d.id, name: d.name }))
+  // 兜底：类目规格没拉回来（或与商品对不上）时，用 SKU 自带的规格维度补齐，
+  // 否则编辑老商品时左边一列规格都没有，只能靠编码/图片猜这是哪个颜色。
+  for (const sku of form.skuList) {
+    for (const variant of (sku._variants || [])) {
+      if (!variant.name) continue
+      if (!dims.some((d) => d.id === variant.id || d.name === variant.name)) {
+        dims.push({ id: variant.id || variant.name, name: variant.name })
+      }
+    }
+  }
+  return dims
+})
+
+// 编辑已有商品时把 SKU 规格「还原」到界面上：
+// 平台只在每个 SKU 的 variants 里存规格值，不回填的话「销售规格」是空的、
+// 保存时 variantIds 也会变空（等于把商品的规格丢掉）。
+function restoreSpecSelection() {
+  for (const sku of form.skuList) {
+    sku._variants = (sku._variants || []).map((variant) => {
+      const dim = varDefs.value.find((d) => d.id === variant.id || d.name === variant.name)
+      const value = variant.value || variant.valueName || ''
+      const cands = (dim && candidates[dim.id]) || []
+      // 平台可能只回 value（中文名）不给 valueId，用候选值按中文名反查补上
+      const valueId = variant.valueId || cands.find((c) => c.valueName === value)?.valueId || ''
+      return { id: variant.id, name: variant.name, value, valueName: value, valueId }
+    })
+  }
+  for (const dim of varDefs.value) {
+    const picked = []
+    for (const sku of form.skuList) {
+      for (const variant of (sku._variants || [])) {
+        if (variant.id !== dim.id && variant.name !== dim.name) continue
+        // 有 valueId 用 valueId（下拉里的候选值）；没有就是自定义值，用文本本身回填
+        const key = variant.valueId || variant.value
+        if (key && !picked.includes(key)) picked.push(key)
+      }
+    }
+    attrValues[dim.id] = picked
+  }
+}
 
 function specValueOf(row, dim) {
   const variant = (row._variants || []).find((item) => item.id === dim.id || item.name === dim.name)
@@ -331,6 +377,8 @@ onMounted(async () => {
             }
           }
         }
+        // 回填 SKU 规格（商品详情只给了每个 SKU 的 variants，需要按维度聚合回来）
+        restoreSpecSelection()
       } catch { /* ignore */ }
     }
   }
@@ -373,10 +421,18 @@ onMounted(async () => {
     </section>
 
     <section v-if="varDefs.length" class="form-section">
-      <div class="section-heading"><div><h3>销售规格</h3><p>选择规格值后自动生成 SKU 组合</p></div><span class="section-index">03</span></div>
+      <div class="section-heading"><div><h3>销售规格</h3><p>选择规格值后自动生成 SKU 组合；平台候选里没有的颜色/尺寸，直接打字回车新增</p></div><span class="section-index">03</span></div>
       <div v-for="dim in varDefs" :key="dim.id" class="spec-dimension">
         <div class="field-label">{{ dim.name }}</div>
-        <el-select v-model="attrValues[dim.id]" multiple filterable :placeholder="'选择' + dim.name + '值'" @change="onSpecSelectionChanged">
+        <el-select
+          v-model="attrValues[dim.id]"
+          multiple
+          filterable
+          allow-create
+          default-first-option
+          :placeholder="`选择或直接输入${dim.name}值（输入后回车）`"
+          @change="onSpecSelectionChanged"
+        >
           <el-option v-for="v in (candidates[dim.id] || [])" :key="v.valueId" :label="v.valueName" :value="v.valueId" />
         </el-select>
       </div>

@@ -93,14 +93,29 @@ button, input { font-family: inherit; }
 .category-levels { width: 100%; display: flex; flex-wrap: wrap; gap: 10px; }
 .category-levels .el-select { min-width: 180px; flex: 1; }
 .form-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-/* 小红书 SKU 表格：规格维度各占一列，行内直接编辑价格/库存/物流方案/规格图 */
-.xhs-sku-table { width: 100%; }
-.xhs-sku-table td.el-table__cell { padding: 6px 0; vertical-align: middle; }
-.xhs-sku-table .cell { padding: 0 6px; line-height: 1.4; }
-.xhs-sku-table .el-input__wrapper { padding: 1px 8px; }
-.xhs-sku-table .el-input-number .el-input__inner { text-align: left; }
+/* SKU 表格（微信/小红书同一套）：规格维度各占一列，行内直接编辑价格/库存/编码/规格图 */
+.xhs-sku-table, .wx-sku-table { width: 100%; }
+.xhs-sku-table td.el-table__cell, .wx-sku-table td.el-table__cell { padding: 6px 0; vertical-align: middle; }
+.xhs-sku-table .cell, .wx-sku-table .cell { padding: 0 6px; line-height: 1.4; }
+.xhs-sku-table .el-input__wrapper, .wx-sku-table .el-input__wrapper { padding: 1px 8px; }
+.xhs-sku-table .el-input-number .el-input__inner, .wx-sku-table .el-input-number .el-input__inner { text-align: left; }
 .sku-spec-value { color: #303133; font-size: 13px; }
 .sku-table-footer { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+/* 规格维度行：规格名下拉 + 规格值 + 删除（对齐微信小店后台的样式） */
+/* 规格：每个维度一块——标题行（规格名 + 配图开关 + 删除），下面整行宽的值输入框 */
+.spec-rows { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; margin-bottom: 4px; width: 100%; }
+.spec-dimension { width: 100%; }
+.spec-dim-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+/* 规格名做成"标签"观感：去掉输入框边框，只留文字和箭头 */
+.spec-name-select { width: 168px; }
+.spec-name-select .el-select__wrapper { padding-left: 0; box-shadow: none; background: transparent; }
+.spec-name-select .el-select__placeholder { color: #525a67; font-size: 13px; font-weight: 600; }
+.spec-dim-tools { display: flex; align-items: center; gap: 6px; color: #525a67; font-size: 12px; white-space: nowrap; }
+.spec-manual-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* 开「配图」后，该规格每个值占一个图位（同色各尺码共用这张图） */
+.spec-value-images { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; padding: 12px 0 2px; }
+.spec-value-image { width: 72px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.spec-value-image__label { max-width: 72px; overflow: hidden; color: #667085; font-size: 11px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .logistics-tip { margin-bottom: 14px; }
 .logistics-option { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .bulk-view { width: 100%; }
@@ -177,11 +192,6 @@ button, input { font-family: inherit; }
 @media (hover: none) {
   .media-card__tools { opacity: 1; background: rgba(17, 24, 39, .32); }
 }
-.sku-table { margin-bottom: 8px; }
-.sku-row { display: grid; grid-template-columns: 1.5fr 1fr 1fr 38px; gap: 12px; align-items: center; padding: 8px 0; }
-.sku-row-wide { grid-template-columns: 1.4fr 1.4fr 1fr 1fr 0.9fr 38px; gap: 8px; }
-.sku-row .el-input-number { width: 100%; }
-.sku-header { padding: 0 0 6px; color: #667085; font-size: 12px; }
 .compact-section { padding-bottom: 16px; }
 .switch-list { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 28px; }
 .switch-list > div { display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 13px; }
@@ -274,7 +284,7 @@ button, input { font-family: inherit; }
   .form-section { padding: 18px 16px; }
   .media-gallery { gap: 8px; }
   .media-card { width: 92px; height: 92px; }
-  .sku-row { grid-template-columns: 1fr 1fr 1fr 30px; gap: 6px; }
+  .spec-name-select { width: 132px; }
   .bulk-card { padding: 18px 14px; }
   .bulk-selection-bar { flex-wrap: wrap; row-gap: 8px; }
   .bulk-summary { flex-wrap: wrap; }
