@@ -311,8 +311,7 @@ const skuColumns = computed(() => {
     { key: 'thumb', label: '规格图', type: 'thumb', width: 76 },
     { key: 'sale', label: '销售价（元）', type: 'sale', width: 130 },
     { key: 'market', label: '划线价（元）', type: 'market', width: 130 },
-    // 库存要放 −/+ 控件，宽度固定就够
-    { key: 'stock', label: '库存', type: 'stock', width: 130 },
+    { key: 'stock', label: '库存', type: 'stock', width: 150 },
     { key: 'code', label: 'SKU 编码', type: 'code', width: textWidth(longestOf(form.skus.map((sku) => sku.out_sku_id), 'SKU-001'), 120) },
     { key: 'barcode', label: '商品条码', type: 'barcode', width: textWidth(longestOf(form.skus.map((sku) => sku.sku_code), '可选'), 110) },
     { key: 'actions', label: '操作', type: 'actions', width: 60 },
@@ -806,7 +805,8 @@ async function submit() {
               <MediaUploader v-else-if="col.type === 'thumb'" v-model="row.thumb_img" :upload="uploadWechatImage" placeholder="选图" compact />
               <el-input-number v-else-if="col.type === 'sale'" v-model="row.sale_price_yuan" :min="0.01" :precision="2" :controls="false" placeholder="0.00" style="width: 100%" />
               <el-input-number v-else-if="col.type === 'market'" v-model="row.market_price_yuan" :min="0" :precision="2" :controls="false" placeholder="划线价" style="width: 100%" />
-              <el-input-number v-else-if="col.type === 'stock'" v-model="row.stock_num" :min="0" :precision="0" style="width: 100%" />
+              <!-- 加减按钮靠右常显：默认左右嵌入式布局在窄列里点不到，必须先手输才有反应 -->
+              <el-input-number v-else-if="col.type === 'stock'" v-model="row.stock_num" :min="0" :precision="0" :step="1" :value-on-clear="0" controls-position="right" style="width: 100%" />
               <el-input v-else-if="col.type === 'code'" v-model="row.out_sku_id" placeholder="SKU-001" />
               <el-input v-else-if="col.type === 'barcode'" v-model="row.sku_code" placeholder="可选" />
               <el-button v-else-if="col.type === 'actions'" text type="danger" :icon="Delete" :disabled="form.skus.length === 1" @click="removeSku($index)" />

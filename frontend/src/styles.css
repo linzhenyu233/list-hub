@@ -114,8 +114,10 @@ button, input { font-family: inherit; }
 .spec-dim-tools { display: flex; align-items: center; gap: 6px; color: #525a67; font-size: 12px; white-space: nowrap; }
 .spec-dim-tools .el-icon { color: #a0a7b2; cursor: help; }
 .spec-value-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; }
-.spec-value-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.spec-value-item .el-input, .spec-value-item .el-autocomplete { flex: 1; min-width: 0; }
+.spec-value-item { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 6px; border: 1px solid transparent; border-radius: 6px; }
+.spec-value-item .el-input, .spec-value-item .el-autocomplete, .spec-value-item .el-select { flex: 1; min-width: 0; }
+/* 选中的规格值：排序按钮作用在它身上（允许选中的值多占点地方，和后台一样一眼看出选中项） */
+.spec-value-item.is-selected { border-color: #b9d5ff; background: #f2f8ff; }
 .spec-value-item .el-input__wrapper { background: #fff; }
 .spec-value-item > .el-button { flex: 0 0 auto; padding: 4px; }
 .spec-rows-footer { display: flex; align-items: center; gap: 10px; }
@@ -123,6 +125,18 @@ button, input { font-family: inherit; }
 /* 规格维度标题行（小红书那边：规格名 + 删除） */
 .spec-dim-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .spec-dim-title { color: #525a67; font-size: 13px; font-weight: 600; }
+.spec-dim-tools-text { color: #525a67; font-size: 12px; white-space: nowrap; }
+.spec-dim-badge { padding: 1px 6px; border-radius: 3px; background: #fff3e0; color: #b26a00; font-size: 11px; font-style: normal; }
+/* 小红书：一排勾选框选规格类型（对齐后台「添加规格类型 (2/2)」） */
+.spec-type-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 18px; }
+.spec-type-bar__label { color: #525a67; font-size: 13px; font-weight: 600; }
+.spec-type-bar__label em { color: #98a2b3; font-size: 12px; font-style: normal; font-weight: 400; }
+.spec-type-bar .el-checkbox { margin-right: 0; }
+/* 规格卡片标题行：左侧一组（规格名 + 配图开关 + 配图操作），右侧一组（排序 + 删除） */
+.spec-card__head { flex-wrap: wrap; row-gap: 8px; }
+.spec-card__group { display: flex; align-items: center; gap: 8px; }
+.spec-card__group--right { margin-left: auto; gap: 2px; }
+.spec-card__head .el-button.is-text { padding: 4px 8px; }
 .logistics-tip { margin-bottom: 14px; }
 .logistics-option { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .bulk-view { width: 100%; }

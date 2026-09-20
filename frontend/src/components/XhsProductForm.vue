@@ -7,6 +7,7 @@ import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
 import MediaUploader from './MediaUploader.vue'
 import { longestOf, textWidth } from '../skuTableWidth'
+import { uploadLocalImage } from '../useMediaUpload'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -110,7 +111,13 @@ async function loadOptions() {
   } finally { loadingOptions.value = false }
 }
 
-function addSku() { form.skuList.push({ erpCode: '', barcode: '', specImage: '', originalPriceYuan: null, priceYuan: null, stock: 0, logisticsPlanId: '', deliveryHours: 24 }) }
+function addSku() {
+  form.skuList.push({
+    erpCode: '', barcode: '', specImage: '', originalPriceYuan: null, priceYuan: null, stock: 0,
+    logisticsPlanId: shippingDefaults.logisticsPlanId,
+    deliveryHours: shippingDefaults.deliveryHours || 24,
+  })
+}
 
 async function loadCandidatesFor(attrOrVarId) {
   try {
@@ -129,23 +136,200 @@ const activeVarDefs = computed(() => activeSpecIds.value
   .map((id) => varDefs.value.find((d) => d.id === id))
   .filter(Boolean))
 
-const availableVarDefs = computed(() => varDefs.value.filter((d) => !activeSpecIds.value.includes(d.id)))
-
-function addSpecDim() {
-  if (activeSpecIds.value.length >= MAX_SPEC_DIMS) {
-    ElMessage.warning(`小红书最多 ${MAX_SPEC_DIMS} 个规格维度`)
-    return
-  }
-  const next = availableVarDefs.value[0]
-  if (!next) return
-  if (!Array.isArray(attrValues[next.id])) attrValues[next.id] = []
-  activeSpecIds.value.push(next.id)
-}
-
 function removeSpecDim(id) {
   activeSpecIds.value = activeSpecIds.value.filter((x) => x !== id)
   delete attrValues[id]
+  delete specValueImages[id]
+  if (imageSpecId.value === id) imageSpecId.value = ''
+  if (selectedSpecValue.value?.id === id) selectedSpecValue.value = null
   generateSkusFromVariations()
+}
+
+// 顶部「添加规格类型」勾选框（与小红书后台一致：勾上就加、取消就删，最多 2 个）
+function toggleSpecDim(id, on) {
+  if (on) {
+    if (activeSpecIds.value.includes(id)) return
+    if (activeSpecIds.value.length >= MAX_SPEC_DIMS) {
+      ElMessage.warning(`小红书最多 ${MAX_SPEC_DIMS} 个规格类型`)
+      return
+    }
+    if (!Array.isArray(attrValues[id])) attrValues[id] = []
+    activeSpecIds.value.push(id)
+    return
+  }
+  removeSpecDim(id)
+}
+
+// ============ 规格值：一行一个值（下拉可挑候选、也能直接输入），支持增删与排序 ============
+// 物流方案 / 发货时效：平台是 SKU 级字段，但一个商品基本全店统一，
+// 所以界面上只填一次（见「物流与发货」），提交时给每个 SKU 都带上。
+const shippingDefaults = reactive({ logisticsPlanId: '', deliveryHours: 24 })
+
+const _newSpecValue = reactive({})    // 每个规格"新增值"那一行的临时输入
+const specValueInputVersion = ref(0)  // 值被还原时重建输入框
+const selectedSpecValue = ref(null)   // 当前选中的规格值 { id, index }（供上移/下移）
+
+function specValuesOf(id) {
+  return attrValues[id] || []
+}
+
+function selectSpecValue(id, index) {
+  selectedSpecValue.value = { id, index }
+}
+
+function isSelectedValue(id, index) {
+  return selectedSpecValue.value?.id === id && selectedSpecValue.value?.index === index
+}
+
+// 候选下拉统一成 { value, label }：候选值用 valueId，手输的文本本身就是值
+function specValueOptions(id) {
+  return (candidates[id] || []).map((item) => ({ value: item.valueId, label: item.valueName }))
+}
+
+// 改某个规格值：值、配图、SKU 里的规格值一起跟着走，价格库存不会错位
+function renameSpecValue(id, index, nextValue) {
+  const list = specValuesOf(id)
+  const oldValue = list[index]
+  const value = String(nextValue ?? '').trim()
+  if (!value || value === oldValue) {
+    if (!value) {
+      list[index] = oldValue
+      specValueInputVersion.value += 1
+      ElMessage.warning('规格值不能为空')
+    }
+    return
+  }
+  if (list.includes(value)) {
+    list[index] = oldValue
+    specValueInputVersion.value += 1
+    ElMessage.warning(`「${value}」已存在`)
+    return
+  }
+  list[index] = value
+  for (const sku of form.skuList) {
+    for (const variant of (sku._variants || [])) {
+      if (variant.id !== id) continue
+      if (String(variant.valueId || variant.value || '') === String(oldValue)) {
+        variant.value = variant.valueName = value
+        variant.valueId = ''
+      }
+    }
+  }
+  const images = specValueImages[id]
+  if (images && images[oldValue] !== undefined) {
+    images[value] = images[oldValue]
+    delete images[oldValue]
+  }
+  applySpecValueImage(id, value)
+  if (isSelectedValue(id, index)) selectSpecValue(id, index)
+}
+
+// 新增规格值（下拉里选中候选、或直接输入回车）
+function addSpecValue(id, value) {
+  const text = String(value ?? '').trim()
+  _newSpecValue[id] = ''
+  if (!text) return
+  if (!Array.isArray(attrValues[id])) attrValues[id] = []
+  if (attrValues[id].includes(text)) {
+    ElMessage.warning('该规格值已存在')
+    return
+  }
+  attrValues[id].push(text)
+  onSpecSelectionChanged()
+}
+
+// 删除某个规格值：用到它的 SKU 行一并删掉
+function removeSpecValue(id, index) {
+  const value = specValuesOf(id)[index]
+  specValuesOf(id).splice(index, 1)
+  if (specValueImages[id]) delete specValueImages[id][value]
+  if (isSelectedValue(id, index)) selectedSpecValue.value = null
+  form.skuList = form.skuList.filter((sku) => {
+    const variant = (sku._variants || []).find((item) => item.id === id)
+    return !variant || String(variant.valueId || variant.value || '') !== String(value)
+  })
+  generateSkusFromVariations()
+}
+
+// 上移/下移选中的规格值（后台的「规格值排序」）
+function moveSpecValue(id, offset) {
+  const selected = selectedSpecValue.value
+  if (!selected || selected.id !== id) {
+    ElMessage.warning('先点一下要排序的规格值')
+    return
+  }
+  const list = specValuesOf(id)
+  const target = selected.index + offset
+  if (target < 0 || target >= list.length) return
+  const [value] = list.splice(selected.index, 1)
+  list.splice(target, 0, value)
+  selectedSpecValue.value = { id, index: target }
+  generateSkusFromVariations()
+}
+
+// ============ 规格图：按规格值配图（对齐后台的「添加规格图」） ============
+// 同一时间只允许一个规格类型开配图，避免"颜色图"和"尺寸图"互相覆盖。
+const imageSpecId = ref('')
+const specValueImages = reactive({})   // { 规格id: { 规格值: 图片地址 } }
+const batchImageInput = ref(null)
+const pickingBatchFor = ref('')
+const uploadingBatchFor = ref('')
+
+function setSpecImage(id, on) {
+  imageSpecId.value = on ? id : ''
+  if (!on) return
+  if (!specValueImages[id]) specValueImages[id] = {}
+  // 重新打开时把已配过的图立即套回 SKU（中间可能改过规格值）
+  for (const key of Object.keys(specValueImages[id])) applySpecValueImage(id, key)
+}
+
+function applySpecValueImage(id, key) {
+  const url = specValueImages[id]?.[key] || ''
+  for (const sku of form.skuList) {
+    const variant = (sku._variants || []).find((item) => item.id === id)
+    if (!variant) continue
+    if (String(variant.valueId || variant.value || '') !== String(key)) continue
+    sku.specImage = url
+  }
+}
+
+function pickBatchSpecImages(id) {
+  pickingBatchFor.value = id
+  const input = batchImageInput.value
+  if (!input) return
+  input.value = ''
+  input.click()
+}
+
+// 批量上传规格图：一次选多张，按顺序依次套到各个规格值上（与后台的「批量上传」一致）
+async function onBatchSpecImagesPicked(event) {
+  const files = Array.from(event?.target?.files || [])
+  const id = pickingBatchFor.value
+  pickingBatchFor.value = ''
+  if (!files.length || !id) return
+  const values = specValuesOf(id)
+  if (!values.length) {
+    ElMessage.warning('先添加规格值，再批量上传规格图')
+    return
+  }
+  uploadingBatchFor.value = id
+  let done = 0
+  const failed = []
+  for (const [index, file] of files.entries()) {
+    if (index >= values.length) break     // 图比规格值多就不管了
+    try {
+      const url = await uploadLocalImage(file, uploadXhsImage)
+      if (!specValueImages[id]) specValueImages[id] = {}
+      specValueImages[id][values[index]] = url
+      applySpecValueImage(id, values[index])
+      done += 1
+    } catch (error) {
+      failed.push(`${file.name}：${error.message}`)
+    }
+  }
+  uploadingBatchFor.value = ''
+  if (done) ElMessage.success(`已按顺序上传 ${done} 张规格图`)
+  if (failed.length) ElMessage.warning(`${failed.length} 张没传成功：${failed.slice(0, 3).join('；')}`)
 }
 
 function generateSkusFromVariations() {
@@ -178,15 +362,20 @@ function generateSkusFromVariations() {
   for (const sku of form.skuList) existing.set(specComboKey(sku._variants), sku)
   form.skuList = combos.map((variants, i) => {
     const previous = existing.get(specComboKey(variants))
+    // 开了「添加规格图」的规格：按规格值取那张图（同值各组合共用）；否则沿用该行原来传的图
+    const imageId = imageSpecId.value
+    const imageVariant = imageId ? variants.find((v) => v.id === imageId) : null
+    const imageKey = imageVariant ? (imageVariant.valueId || imageVariant.value || '') : ''
+    const specImage = (imageId && specValueImages[imageId]?.[imageKey]) || previous?.specImage || ''
     return {
       erpCode: previous?.erpCode || `SKU-${String(i + 1).padStart(3, '0')}`,
       barcode: previous?.barcode || '',
-      specImage: previous?.specImage || '',
+      specImage,
       originalPriceYuan: previous?.originalPriceYuan ?? null,
       priceYuan: previous?.priceYuan ?? null,
       stock: previous?.stock || 0,
-      logisticsPlanId: previous?.logisticsPlanId || '',
-      deliveryHours: previous?.deliveryHours || 24,
+      logisticsPlanId: shippingDefaults.logisticsPlanId || previous?.logisticsPlanId || '',
+      deliveryHours: shippingDefaults.deliveryHours || previous?.deliveryHours || 24,
       _variants: variants,
     }
   })
@@ -262,6 +451,25 @@ function restoreSpecSelection() {
     attrValues[id] = picked
   }
   activeSpecIds.value = usedIds.slice(0, MAX_SPEC_DIMS)
+
+  // 如果某个规格满足"同值同图"，说明它当初开了「添加规格图」，把图和开关一起还原
+  for (const id of activeSpecIds.value) {
+    const map = {}
+    let consistent = true
+    for (const sku of form.skuList) {
+      const variant = (sku._variants || []).find((item) => item.id === id)
+      if (!variant) continue
+      const key = String(variant.valueId || variant.value || '')
+      const image = sku.specImage || ''
+      if (!key || !image) continue
+      if (map[key] && map[key] !== image) { consistent = false; break }
+      map[key] = image
+    }
+    if (consistent && Object.keys(map).length) {
+      specValueImages[id] = map
+      if (!imageSpecId.value) imageSpecId.value = id
+    }
+  }
 }
 
 function specValueOf(row, dim) {
@@ -291,9 +499,7 @@ const skuColumns = computed(() => {
     { key: 'barcode', label: '商品条码', type: 'barcode', width: textWidth(longestOf(form.skuList.map((sku) => sku.barcode), '可选'), 110) },
     { key: 'original', label: '原价（元）', type: 'original', width: 130 },
     { key: 'price', label: '售价（元）', type: 'price', width: 130 },
-    { key: 'stock', label: '库存', type: 'stock', width: 110 },
-    { key: 'delivery', label: '发货时效（小时）', type: 'delivery', width: 130 },
-    { key: 'logistics', label: '物流方案', type: 'logistics', width: 220 },
+    { key: 'stock', label: '库存', type: 'stock', width: 150 },
     { key: 'actions', label: '操作', type: 'actions', width: 60 },
   )
   return columns
@@ -316,7 +522,10 @@ async function submit() {
     await formRef.value.validate()
     if (!form.categoryId) return ElMessage.warning('请选择末级叶子类目')
     if (!form.images.some(Boolean)) return ElMessage.warning('请至少上传一张主图')
-    if (form.skuList.some((sku) => !sku.erpCode || !sku.priceYuan || !sku.logisticsPlanId)) return ElMessage.warning('请完整填写 SKU 编码、价格和物流方案')
+    if (form.skuList.some((sku) => !sku.erpCode || !sku.priceYuan)) return ElMessage.warning('请完整填写 SKU 编码和价格')
+    if (!shippingDefaults.logisticsPlanId && !form.skuList.some((sku) => sku.logisticsPlanId)) {
+      return ElMessage.warning('请选择物流方案')
+    }
     saving.value = true
     const attributes = []
     for (const a of attrDefs.value) {
@@ -340,6 +549,16 @@ async function submit() {
     }
     if (form.subName) item.subName = form.subName
     if (form.transparentImage) item.transparentImage = form.transparentImage
+    // 开了「添加规格图」= 启用规格大图：平台要求每个规格值都有图，缺图直接拦住
+    // （与批量发布那边一致：enableMainSpecImage 只能在创建时带，编辑时改不动）
+    if (imageSpecId.value) {
+      const id = imageSpecId.value
+      const missing = (attrValues[id] || []).filter((value) => !specValueImages[id]?.[value])
+      if (missing.length) {
+        return ElMessage.warning(`已开启「添加规格图」，还有 ${missing.length} 个规格值没配图，补齐后再提交`)
+      }
+      item.enableMainSpecImage = true
+    }
     const details = form.imageDescriptions.filter(Boolean)
     if (details.length) item.imageDescriptions = details
 
@@ -352,7 +571,12 @@ async function submit() {
       for (const sku of form.skuList) {
         if (sku._skuId) {
           await xhsApi.updateSku(sku._skuId, {
-            sku: { price: Math.round(Number(sku.priceYuan) * 100), originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100), stock: Number(sku.stock), logisticsPlanId: sku.logisticsPlanId },
+            sku: {
+              price: Math.round(Number(sku.priceYuan) * 100),
+              originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100),
+              stock: Number(sku.stock),
+              logisticsPlanId: sku.logisticsPlanId || shippingDefaults.logisticsPlanId,
+            },
             updated_fields: ['price', 'originalPrice', 'stock', 'logisticsPlanId'],
           })
         }
@@ -364,8 +588,8 @@ async function submit() {
         const s = {
           ipq: 1, originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100),
           price: Math.round(Number(sku.priceYuan) * 100), stock: Number(sku.stock),
-          logisticsPlanId: sku.logisticsPlanId, erpCode: sku.erpCode, variants: sku._variants || [],
-          deliveryTime: { time: String(sku.deliveryHours), type: 'RELATIVE_TIME_NEW' },
+          logisticsPlanId: sku.logisticsPlanId || shippingDefaults.logisticsPlanId, erpCode: sku.erpCode, variants: sku._variants || [],
+          deliveryTime: { time: String(sku.deliveryHours || shippingDefaults.deliveryHours || 24), type: 'RELATIVE_TIME_NEW' },
         }
         if (sku.barcode) s.barcode = sku.barcode
         if (sku.specImage) s.specImage = sku.specImage
@@ -439,6 +663,11 @@ onMounted(async () => {
         deliveryHours: sku.deliveryTime?.time ? Number(sku.deliveryTime.time) : 24,
         _variants: sku.variants || [],
       }))
+      // 物流方案/发货时效是商品级统一设置：从平台上取一个非空值回填
+      const plan = form.skuList.find((sku) => sku.logisticsPlanId)
+      if (plan) shippingDefaults.logisticsPlanId = plan.logisticsPlanId
+      const hours = form.skuList.find((sku) => sku.deliveryHours)?.deliveryHours
+      if (hours) shippingDefaults.deliveryHours = hours
     }
     // 加载类目属性和规格
     if (form.categoryId) {
@@ -511,38 +740,61 @@ onMounted(async () => {
     </section>
 
     <section v-if="varDefs.length" class="form-section">
-      <div class="section-heading"><div><h3>销售规格</h3><p>小红书最多 2 个规格维度；从类目给的规格里挑要用的，平台候选没有的值可直接打字回车新增</p></div><span class="section-index">03</span></div>
+      <div class="section-heading"><div><h3>商品规格</h3><p>小红书最多 2 个规格类型；规格值可取平台候选，也能直接输入</p></div><span class="section-index">03</span></div>
+      <input ref="batchImageInput" type="file" accept="image/*" multiple style="display: none" @change="onBatchSpecImagesPicked" />
+      <!-- 添加规格类型：勾选即添加（对齐小红书后台） -->
+      <div class="spec-type-bar">
+        <span class="spec-type-bar__label">添加规格类型 <em>({{ activeSpecIds.length }}/{{ MAX_SPEC_DIMS }})</em></span>
+        <el-checkbox
+          v-for="d in varDefs"
+          :key="d.id"
+          :model-value="activeSpecIds.includes(d.id)"
+          :disabled="!activeSpecIds.includes(d.id) && activeSpecIds.length >= MAX_SPEC_DIMS"
+          @change="(on) => toggleSpecDim(d.id, on)"
+        >{{ d.name }}</el-checkbox>
+      </div>
+
       <div class="spec-rows">
-        <div v-for="dim in activeVarDefs" :key="dim.id" class="spec-dimension">
-          <div class="spec-dim-head">
-            <span class="spec-dim-title">{{ dim.name }}<span v-if="dim.isRequired">（必填）</span></span>
-            <el-button text type="danger" :icon="Delete" title="删除该规格" @click="removeSpecDim(dim.id)" />
+        <div v-for="dim in activeVarDefs" :key="dim.id" class="spec-card">
+          <div class="spec-card__head">
+            <div class="spec-card__group">
+              <span class="spec-dim-title">{{ dim.name }}</span>
+              <el-switch :model-value="imageSpecId === dim.id" @change="(on) => setSpecImage(dim.id, on)" />
+              <span class="spec-dim-tools-text">{{ imageSpecId === dim.id ? '添加规格图' : '不添加规格图' }}</span>
+              <template v-if="imageSpecId === dim.id">
+                <em class="spec-dim-badge" title="平台要求：开启规格图后，每个规格值都要有图">必配齐</em>
+                <el-button text type="primary" size="small" :loading="uploadingBatchFor === dim.id" @click="pickBatchSpecImages(dim.id)">批量上传规格图</el-button>
+              </template>
+            </div>
+            <div class="spec-card__group spec-card__group--right">
+              <span class="muted-copy">规格值排序</span>
+              <el-button text size="small" :disabled="selectedSpecValue?.id !== dim.id || selectedSpecValue.index === 0" @click="moveSpecValue(dim.id, -1)">上移</el-button>
+              <el-button text size="small" :disabled="selectedSpecValue?.id !== dim.id || selectedSpecValue.index >= (attrValues[dim.id] || []).length - 1" @click="moveSpecValue(dim.id, 1)">下移</el-button>
+              <el-button text type="danger" :icon="Delete" title="删除该规格" @click="removeSpecDim(dim.id)" />
+            </div>
           </div>
-          <el-select
-            v-model="attrValues[dim.id]"
-            multiple
-            filterable
-            allow-create
-            default-first-option
-            :placeholder="`选择或直接输入${dim.name}值（输入后回车）`"
-            @change="onSpecSelectionChanged"
-          >
-            <el-option v-for="v in (candidates[dim.id] || [])" :key="v.valueId" :label="v.valueName" :value="v.valueId" />
-          </el-select>
+          <div class="spec-value-list">
+            <div
+              v-for="(v, vi) in specValuesOf(dim.id)"
+              :key="`${vi}-${specValueInputVersion}`"
+              class="spec-value-item"
+              :class="{ 'is-selected': isSelectedValue(dim.id, vi) }"
+              @click="selectSpecValue(dim.id, vi)"
+            >
+              <el-select :model-value="v" filterable allow-create default-first-option placeholder="请选择或输入规格值" @change="(val) => renameSpecValue(dim.id, vi, val)">
+                <el-option v-for="c in (candidates[dim.id] || [])" :key="c.valueId" :label="c.valueName" :value="c.valueId" />
+              </el-select>
+              <MediaUploader v-if="imageSpecId === dim.id" v-model="specValueImages[dim.id][v]" :upload="uploadXhsImage" placeholder="选图" mini @update:model-value="applySpecValueImage(dim.id, v)" />
+              <el-button text type="danger" :icon="Delete" title="删除该规格值" @click.stop="removeSpecValue(dim.id, vi)" />
+            </div>
+            <div class="spec-value-item spec-value-item--new">
+              <el-select :model-value="_newSpecValue[dim.id]" filterable allow-create default-first-option placeholder="请选择或输入规格值" @change="(val) => addSpecValue(dim.id, val)">
+                <el-option v-for="c in (candidates[dim.id] || [])" :key="c.valueId" :label="c.valueName" :value="c.valueId" />
+              </el-select>
+            </div>
+          </div>
         </div>
-        <div class="spec-rows-footer">
-          <el-tooltip :disabled="activeSpecIds.length < MAX_SPEC_DIMS" content="小红书最多 2 个规格维度" placement="top">
-            <span class="spec-add-wrap">
-              <el-button text type="primary" :icon="Plus" :disabled="activeSpecIds.length >= MAX_SPEC_DIMS || !availableVarDefs.length" @click="addSpecDim">
-                {{ availableVarDefs.length ? `添加规格（${availableVarDefs[0].name}）` : '规格已全部添加' }}
-              </el-button>
-            </span>
-          </el-tooltip>
-          <span class="muted-copy">
-            <template v-if="activeSpecIds.length">已添加 {{ activeSpecIds.length }}/{{ MAX_SPEC_DIMS }} 个规格；不填值会生成单个默认 SKU</template>
-            <template v-else>不添加规格将生成单个默认 SKU</template>
-          </span>
-        </div>
+        <span v-if="!activeVarDefs.length" class="muted-copy">上面勾选规格类型后，这里逐个添加规格值；不添加规格将生成单个默认 SKU</span>
       </div>
     </section>
 
@@ -561,6 +813,19 @@ onMounted(async () => {
     <section class="form-section">
       <div class="section-heading"><div><h3>小红书 SKU</h3><p>创建后需等待审核，审核通过才可按 SKU 上架</p></div><span class="section-index">05</span></div>
       <el-alert title="方案来源说明" description="“系统创建”表示由小红书平台自动生成，通常仅适用于虚拟商品或自动发货；普通实物商品请选择与店铺仓库、发货地址相匹配的商家物流方案。" type="info" show-icon :closable="false" class="logistics-tip" />
+      <!-- 物流方案/发货时效：平台是 SKU 级字段，但同一商品全店统一，所以只填一次，提交时带给每个 SKU -->
+      <div class="form-grid form-grid-2">
+        <el-form-item label="物流方案（本商品所有 SKU 统一使用）" required>
+          <el-select v-model="shippingDefaults.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案">
+            <el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)">
+              <div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        <el-form-item label="发货时效（小时）">
+          <el-input-number v-model="shippingDefaults.deliveryHours" :min="1" style="width: 160px" />
+        </el-form-item>
+      </div>
       <div class="sku-table-wrap">
         <el-table
           :key="activeSpecDims.map((d) => d.id).join('-')"
@@ -579,13 +844,8 @@ onMounted(async () => {
               <el-input v-else-if="col.type === 'barcode'" v-model="row.barcode" placeholder="可选" />
               <el-input-number v-else-if="col.type === 'original'" v-model="row.originalPriceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" />
               <el-input-number v-else-if="col.type === 'price'" v-model="row.priceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" />
-              <el-input-number v-else-if="col.type === 'stock'" v-model="row.stock" :min="0" style="width: 100%" />
-              <el-input-number v-else-if="col.type === 'delivery'" v-model="row.deliveryHours" :min="1" style="width: 100%" />
-              <el-select v-else-if="col.type === 'logistics'" v-model="row.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案" style="width: 100%">
-                <el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)">
-                  <div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div>
-                </el-option>
-              </el-select>
+              <!-- 加减按钮靠右常显：默认左右嵌入式布局在窄列里点不到，必须先手输才有反应 -->
+              <el-input-number v-else-if="col.type === 'stock'" v-model="row.stock" :min="0" :precision="0" :step="1" :value-on-clear="0" controls-position="right" style="width: 100%" />
               <el-button v-else-if="col.type === 'actions'" text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="removeSku($index)" />
             </template>
           </el-table-column>
