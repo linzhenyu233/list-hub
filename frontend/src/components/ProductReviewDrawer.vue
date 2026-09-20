@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { bulkApi } from '../bulkApi'
+import { fileToBase64 } from '../useMediaUpload'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -9,6 +10,8 @@ const props = defineProps({
   productMapping: { type: Object, default: () => ({}) },
   groupConfig: { type: Object, default: null },
   platforms: { type: Array, default: () => ['wechat', 'xhs'] },
+  // 补规格图要落到批次上（与第 2 步表格里的「缺图」同一套上传逻辑）
+  batchId: { type: [String, Number], default: '' },
 })
 const emit = defineEmits(['update:visible', 'save'])
 
@@ -94,8 +97,16 @@ function renameSpecDim(di, name) {
     if (sku.specs?.[di]) sku.specs[di].name = name
   }
 }
+// 规格维度上限：小红书只有 2 个（微信 4 个），两个平台都要发时按最小的算
+const maxSpecDims = computed(() => (props.platforms.includes('xhs') ? 2 : 4))
+const specPlatformLabel = computed(() => (maxSpecDims.value === 2 ? '小红书' : '微信'))
+
 // 新增一个规格维度列（名称待填），每个 SKU 补一个空值
 function addSpecDim() {
+  if (specDims.value.length >= maxSpecDims.value) {
+    ElMessage.warning(`${specPlatformLabel.value}最多 ${maxSpecDims.value} 个规格维度；要加"白色"这种规格值请用「+ 添加 SKU」`)
+    return
+  }
   specDims.value.push('')
   for (const sku of editForm.skus) {
     if (!Array.isArray(sku.specs)) sku.specs = []
@@ -108,6 +119,60 @@ function removeSpecDim(di) {
   for (const sku of editForm.skus) {
     if (Array.isArray(sku.specs)) sku.specs.splice(di, 1)
   }
+}
+
+// 规格图：点「缺图/换图」选本地图片 → 后端落盘 → 写回该行的 sku_image
+// （复用第 2 步表格里补图的那条链路，发布时再由后端上传到平台）
+const skuImageInput = ref(null)
+const pendingImageIndex = ref(-1)
+const uploadingImageIndex = ref(-1)
+
+function pickSkuImage(index) {
+  if (!props.batchId) {
+    ElMessage.warning('缺少批次信息，无法上传规格图')
+    return
+  }
+  pendingImageIndex.value = index
+  const input = skuImageInput.value
+  if (!input) return
+  input.value = ''
+  input.click()
+}
+
+async function onSkuImagePicked(event) {
+  const file = event?.target?.files?.[0]
+  const index = pendingImageIndex.value
+  pendingImageIndex.value = -1
+  if (!file || index < 0) return
+  uploadingImageIndex.value = index
+  try {
+    const contentBase64 = await fileToBase64(file)
+    const data = await bulkApi.uploadSkuImage(props.batchId, { filename: file.name, content_base64: contentBase64 })
+    const ref = data?.result?.ref || data?.ref
+    if (!ref) throw new Error('上传未返回图片引用')
+    editForm.skus[index].sku_image = ref
+    ElMessage.success('规格图已上传')
+  } catch (error) {
+    ElMessage.error(`${file.name}：${error.message}`)
+  } finally {
+    uploadingImageIndex.value = -1
+  }
+}
+
+// 新增一个 SKU 行（规格值待填）：审核时想临时加个"白色"就是加这一行
+function addSkuRow() {
+  editForm.skus.push({
+    sku_code: '',
+    sku_image: '',
+    price: null,
+    stock: 0,
+    specs: specDims.value.map((name) => ({ name, value: '' })),
+  })
+}
+
+function removeSkuRow(index) {
+  if (editForm.skus.length <= 1) return
+  editForm.skus.splice(index, 1)
 }
 
 // 微信 API 的 attr.value 可能是字符串或逗号/分号分隔字符串，需规范化为数组
@@ -170,10 +235,14 @@ function handleSave() {
     ElMessage.warning('存在未命名的规格维度，请填写名称或删除该列')
     return
   }
-  // SKU 行内编辑校验：售价必须 > 0，库存不能为负
+  // SKU 行内编辑校验：编码必填，售价必须 > 0，库存不能为负
   for (const sku of editForm.skus) {
     const price = Number(sku.price)
     const stock = Number(sku.stock)
+    if (!String(sku.sku_code || '').trim()) {
+      ElMessage.warning('有 SKU 还没填 SKU 编码（发布时要作为平台商家编码，必填）')
+      return
+    }
     if (!Number.isFinite(price) || price <= 0) {
       ElMessage.warning(`SKU ${sku.sku_code || ''} 的售价必须大于 0`)
       return
@@ -281,14 +350,32 @@ function handleSave() {
       <section v-if="editForm.skus.length" class="review-section">
         <div class="sku-section-head">
           <h4>SKU 信息（{{ editForm.skus.length }} 个）<small class="muted-copy">　售价/库存/规格值可直接修改，仅影响当前 SKU</small></h4>
-          <el-button size="small" @click="addSpecDim">+ 添加规格维度</el-button>
+          <div class="sku-section-actions">
+            <el-button size="small" type="primary" plain @click="addSkuRow">+ 添加 SKU</el-button>
+            <el-tooltip
+              :disabled="specDims.length < maxSpecDims"
+              :content="`${specPlatformLabel}最多 ${maxSpecDims} 个规格维度；想加「白色」这种规格值请用「+ 添加 SKU」`"
+              placement="top"
+            >
+              <span>
+                <el-button size="small" :disabled="specDims.length >= maxSpecDims" @click="addSpecDim">+ 添加规格维度</el-button>
+              </span>
+            </el-tooltip>
+          </div>
         </div>
         <el-table :data="editForm.skus" size="small" max-height="320" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
-          <el-table-column prop="sku_code" label="SKU编码" width="130" show-overflow-tooltip />
-          <el-table-column label="规格图" width="78" align="center">
-            <template #default="{ row }">
-              <el-image v-if="row.sku_image" :src="bulkApi.imagePreviewUrl(row.sku_image)" :preview-src-list="[bulkApi.imagePreviewUrl(row.sku_image)]" preview-teleported fit="cover" style="width:48px;height:48px;border-radius:4px" />
-              <el-tag v-else type="warning" size="small">缺图</el-tag>
+          <el-table-column label="SKU编码" width="150">
+            <template #default="{ row, $index }">
+              <el-input :model-value="row.sku_code" size="small" placeholder="必填" @update:model-value="(v) => updateSkuField($index, 'sku_code', v)" />
+            </template>
+          </el-table-column>
+          <el-table-column label="规格图" width="92" align="center">
+            <template #default="{ row, $index }">
+              <div class="sku-image-cell">
+                <el-image v-if="row.sku_image" :src="bulkApi.imagePreviewUrl(row.sku_image)" :preview-src-list="[bulkApi.imagePreviewUrl(row.sku_image)]" preview-teleported fit="cover" class="sku-image-thumb" />
+                <el-button v-else size="small" type="warning" plain :loading="uploadingImageIndex === $index" @click.stop="pickSkuImage($index)">缺图·上传</el-button>
+                <el-button v-if="row.sku_image" size="small" text type="primary" :loading="uploadingImageIndex === $index" @click.stop="pickSkuImage($index)">换图</el-button>
+              </div>
             </template>
           </el-table-column>
           <el-table-column v-for="(dim, di) in specDims" :key="di" width="180">
@@ -312,8 +399,14 @@ function handleSave() {
               <el-input-number :model-value="Number(row.stock) || 0" size="small" :min="0" :precision="0" :controls="false" class="sku-num" @update:model-value="(v) => updateSkuField($index, 'stock', v)" />
             </template>
           </el-table-column>
+          <el-table-column label="操作" width="70" align="center" fixed="right">
+            <template #default="{ $index }">
+              <el-button size="small" text type="danger" :disabled="editForm.skus.length === 1" @click="removeSkuRow($index)">删除</el-button>
+            </template>
+          </el-table-column>
         </el-table>
         <p class="muted-copy sku-dim-hint">规格名称：{{ specDimensionHint }}</p>
+        <input ref="skuImageInput" type="file" accept="image/*" style="display: none" @change="onSkuImagePicked" />
       </section>
 
       <div class="form-actions">
@@ -335,8 +428,11 @@ function handleSave() {
 .spu-hint { margin: -6px 0 12px; font-size: 12px; line-height: 1.5; }
 .sku-dim-hint { margin: 8px 0 0; font-size: 12px; }
 .sku-num { width: 100%; }
+.sku-image-cell { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.sku-image-thumb { width: 48px; height: 48px; border-radius: 4px; cursor: zoom-in; }
 .sku-section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .sku-section-head h4 { margin: 0; }
+.sku-section-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .spec-dim-head { display: flex; align-items: center; gap: 4px; }
 .attr-collapse { border-top: none; }
 .attr-collapse :deep(.el-collapse-item__header) { font-size: 15px; }

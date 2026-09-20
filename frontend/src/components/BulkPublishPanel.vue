@@ -1665,7 +1665,7 @@ async function publish(partial = false) {
         <el-table-column label="操作" width="90" fixed="right"><template #default="{ row }"><el-button v-if="row.status === 'failed'" link type="primary" :loading="retrying" @click="retryFailedItems([row.id])">重试</el-button><span v-else class="muted-copy">--</span></template></el-table-column>
       </el-table>
     </section>
-    <ProductReviewDrawer v-model:visible="reviewVisible" :product="reviewProduct" :product-mapping="mapping.products?.[reviewProduct?.product_code] || {}" :group-config="getReviewGroupConfig(reviewProduct)" :platforms="platforms" @save="handleReviewSave" />
+    <ProductReviewDrawer v-model:visible="reviewVisible" :product="reviewProduct" :product-mapping="mapping.products?.[reviewProduct?.product_code] || {}" :group-config="getReviewGroupConfig(reviewProduct)" :platforms="platforms" :batch-id="batch?.id || ''" @save="handleReviewSave" />
     <div v-if="step === 1" class="bulk-pagination"><el-pagination v-model:current-page="itemPage" v-model:page-size="itemPageSize" :page-sizes="[20, 50, 100]" layout="total, sizes, prev, pager, next, jumper" :total="filteredItems.length" /></div>
     <div v-if="step === 2" class="bulk-pagination"><el-pagination v-model:current-page="mappingPage" v-model:page-size="mappingPageSize" :page-sizes="[20, 50, 100]" layout="total, sizes, prev, pager, next, jumper" :total="mappingRows.length" /></div>
     <div v-if="step === 3" class="bulk-pagination"><el-pagination v-model:current-page="productPage" v-model:page-size="productPageSize" :page-sizes="[50, 100, 200]" layout="total, sizes, prev, pager, next, jumper" :total="filteredProducts.length" /></div>
