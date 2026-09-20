@@ -1588,13 +1588,16 @@ async function writebackHuopaiIds() {
       .map(([platform, count]) => `${platform === 'wechat' ? '微信' : '小红书'} ${count} 个商品ID`)
     const ambiguous = Object.values(info.ambiguous || {}).flat()
     const html = [
-      '把已发布商品的平台商品ID/规格ID直接写入货盘表原文件，之后不用再手工登记：',
-      `· 待写入 <b>${info.filled || 0}</b> 个单元格（产品id ${info.filled_product || 0} + 规格id ${info.filled_sku || 0}）：${escapeHtml(sheetLines.join('；') || '无')}`,
-      `· 已有人工填值的单元格 <b>${info.existing || 0}</b> 个（保持不动，不覆盖）`,
+      '把已发布商品的平台ID直接写入货盘表原文件，两种ID各写一列，之后不用再手工登记：',
+      `· 「小红书产品id」「微信小店」= <b>商品ID</b>（款级，后台商品列表里那个，可直接搜索）`,
+      `· 「小红书规格id」「微信规格id」= <b>规格ID</b>（行级，后台商品规格列表里那个，一行一个）`,
+      `· 待写入 <b>${info.filled || 0}</b> 个单元格（商品ID ${info.filled_product || 0} + 规格ID ${info.filled_sku || 0}）：${escapeHtml(sheetLines.join('；') || '无')}`,
+      `· 会覆盖 <b>${info.overwritten || 0}</b> 个原来填错的ID单元格（之前把规格ID填进商品ID列、或反之，这次纠正过来）`,
+      `· 人工填的其它内容 <b>${info.existing || 0}</b> 个不动（中文备注等不会覆盖）`,
       `· 货盘表里对不上的行 <b>${info.mismatch || 0}</b> 个（跳过，宁可不写也不写错行）`,
-      `· 可用商品ID：${escapeHtml(platformLines.join('、') || '无')}；规格id 是按行回平台查商品详情得到的（同款不同规格ID不同）`,
+      `· 可用商品ID：${escapeHtml(platformLines.join('、') || '无')}；规格ID 是按行回平台查商品详情得到的（同款不同规格ID不同）`,
       info.sku_missing
-        ? `· ⚠️ 有 ${info.sku_missing} 行没查到对应规格id（平台上该规格可能已被删，或编码不一致）`
+        ? `· ⚠️ 有 ${info.sku_missing} 行没查到对应规格ID（平台上该规格可能已被删，或编码不一致）`
         : '',
       Object.values(info.gone || {}).flat().length
         ? `· ⚠️ 这些商品在平台上已不存在（后台删过），本次不写它们的ID：${escapeHtml(Object.values(info.gone || {}).flat().slice(0, 8).join('、'))}；建议先点「核对发布状态」把本地记录更新掉`
@@ -1606,6 +1609,7 @@ async function writebackHuopaiIds() {
         ? `· ⚠️ 这些商品在平台上有多个ID，已取最近一次：${escapeHtml(ambiguous.join('、'))}`
         : '',
       '· 写入的ID列会自动取消隐藏并加宽（货盘表的「小红书产品id」「微信小店」原本是隐藏列，宽度只有6个字符，ID会溢出到相邻列上）',
+      '· 缺「小红书规格id」「微信规格id」列时会自动补在表尾；写入前会自动备份原文件，可回退',
       `<br>文件：${escapeHtml(info.path || '')}`,
       '写入前会自动备份原文件；请先确认货盘表没有被 Excel/WPS 打开。',
     ].filter(Boolean).join('<br>')

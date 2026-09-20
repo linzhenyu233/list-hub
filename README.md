@@ -101,3 +101,19 @@ npm run dev        # http://localhost:5173，已配置 /api、/xhs-api、/bulk-a
 - 运行时数据（`*.sqlite3`、`images/`、`uploaded_images.*`）与密钥（`.env`）均已在
   `.gitignore` 中忽略，不会进入版本库。
 - `wechat/diagnostics/` 内为历史一次性调试脚本，归档保留，不属于服务运行链路。
+
+## 运行时数据的自动清理（保留策略）
+
+没有独立的定时任务：**每次导入商品时顺手清一遍，数据库维护每天最多一次**，
+避免批次数据、图片缓存、货盘表备份无限累积。各项都可按需调整：
+
+| 数据 | 默认保留 | 环境变量 | 说明 |
+| --- | --- | --- | --- |
+| 数据库里的批次（`batches.rows_json/mappings_json`，库里最大的一块） | 14 天 | `BULK_BATCH_TTL_DAYS` | 只删"没有排队/执行中发布项"的旧批次；**发布记录 `publish_items` 永久保留**（"已发布/未发布"按商品编码跨批次统计，删了会导致重复发品） |
+| 数据库空间回收（`VACUUM`） | 每天最多一次 | — | 删过批次或空闲页 >8MB 才执行；拿不到锁就跳过 |
+| 货盘表备份 `bulk_api/_sources/huopai_backups/`（每份 60MB+） | 1 份 / 14 天 | `BULK_MAX_HUOPAI_BACKUPS`、`BULK_HUOPAI_BACKUP_TTL_DAYS` | 只兜"刚写错一次"，够用 |
+| 批次来源记录 `bulk_api/_sources/*.json` | 14 天 | `BULK_SOURCE_INFO_TTL_DAYS` | 与批次对齐：批次删了它也没用（回填ID需要批次里的源行信息） |
+| 共享盘图片懒拷贝 `images/_share/` | 30 天 | `BULK_IMAGE_TTL_DAYS`（0=关闭） | 按内容哈希命名，删了会在下次发布时自动从共享盘重取；**浏览器上传/Excel 内嵌图不自动清**（删了那批就发不出去） |
+
+> 清得太早的影响：更早的批次在界面上打不开（404）、也不能再回填商品ID/规格ID；
+> 需要时重新导入货盘表即可，不影响已发布到平台的商品和发布记录。

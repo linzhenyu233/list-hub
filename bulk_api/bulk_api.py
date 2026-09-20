@@ -20,7 +20,7 @@ import uuid
 import zipfile
 import time
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -77,6 +77,12 @@ BULK_API_PORT = int(os.environ.get("BULK_API_PORT", "8020"))
 # 共享盘图片"懒拷贝"的保留天数(0=不清理): 发品时把共享盘图片按内容哈希拷进 IMAGE_DIR/_share/,
 # 内容随时能从共享盘重取, 所以可以安全按时间清; 不清的话这个目录只会越来越大(实测 10 天 147MB)。
 IMAGE_TTL_DAYS = int(os.environ.get("BULK_IMAGE_TTL_DAYS", "30"))
+# 批次数据保留天数: 批次的 rows_json + mappings_json 是库里最大的两块(实测占 160MB+),
+# 而运营每次发品都是重新导入货盘表, "已发布/未发布"是按商品编码跨批次统计的(不依赖批次本身),
+# 所以只留最近这些天, 更早的批次连行数据一起清。
+# ⚠️ 发布记录 publish_items / publish_jobs 永久保留 —— 删了会让已发过的商品重新显示"未发布",
+#    诱使运营重复发品(平台以"标题重复"拒)。
+BATCH_TTL_DAYS = int(os.environ.get("BULK_BATCH_TTL_DAYS", "14"))
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
 
@@ -1746,16 +1752,21 @@ def import_huopai(body: HuopaiImportBody | None = None, request: Request = None)
 #   - 逐行用导入时记下的商家编码核对, 货盘表被改过/重排过的行不写(宁可不写, 不写错行)。
 SOURCE_INFO_DIR = os.path.join(BASE_DIR, "_sources")
 BACKUP_DIR = os.path.join(SOURCE_INFO_DIR, "huopai_backups")
-# 货盘表备份保留份数(每份 60MB+): 默认 3 份, 可用环境变量调小(如 BULK_MAX_HUOPAI_BACKUPS=1)
-MAX_BACKUPS = int(os.environ.get("BULK_MAX_HUOPAI_BACKUPS", "3"))
+# 货盘表备份保留份数(每份 60MB+): 默认 1 份(只兜"刚写错一次"这种场景), 可用环境变量调大
+MAX_BACKUPS = int(os.environ.get("BULK_MAX_HUOPAI_BACKUPS", "1"))
+# 备份保留天数: 超过就删(份数之外的兜底, 免得旧的 60MB 文件一直躺在磁盘上)
+BACKUP_TTL_DAYS = int(os.environ.get("BULK_HUOPAI_BACKUP_TTL_DAYS", "14"))
 # 批次来源记录保留天数: 每导入一次记一条, 不清会无限累积(每条约 180 字节, 量小但没必要永久留)。
-# 过期只会影响"很旧的批次还能不能回填ID", 其它功能不受影响。
-SOURCE_INFO_TTL_DAYS = int(os.environ.get("BULK_SOURCE_INFO_TTL_DAYS", "90"))
+# 与批次数据(下面 BATCH_TTL_DAYS)对齐: 批次被清掉后来源记录也没用了(回填ID需要批次里的源行信息)。
+SOURCE_INFO_TTL_DAYS = int(os.environ.get("BULK_SOURCE_INFO_TTL_DAYS", "14"))
 
 # 货盘表各 sheet 的表头所在行；ID列可能叫的名字（都不匹配就追加到表尾）
 HUOPAI_SHEETS = {"培育钻": 2, "天然钻": 1}
-# 货盘表一行 = 一个 SKU(商家编码)，而平台商品ID是"款"级的(同款各规格都一样)，
-# 所以除了「产品id」，还要回填每行自己的「规格id」(平台 SKU ID)。
+# 两种ID各归各位(运营核对时在后台都能直接找到):
+#   「小红书产品id」「微信小店」   = 款级商品ID(后台商品列表里的"商品ID", 同款各规格一样, 可搜索)
+#   「小红书规格id」「微信规格id」 = 行级规格ID(后台商品规格列表里的"规格ID", 一行一个)
+# 以前只填一种: 只填商品ID则每行都一样、定位不到具体规格; 只填规格ID则跟后台商品ID对不上,
+# 运营拿这个值在后台搜不到商品。所以两种都填, 缺哪列就追加哪列。
 HUOPAI_ID_HEADERS = {
     "wechat": ("微信小店", "微信商品id", "微信小店商品id", "微信产品id"),
     "xhs": ("小红书产品id", "小红书商品id"),
@@ -1808,12 +1819,113 @@ def save_source_info(batch_id, path, filename):
         print(f"[source-info] 记录来源失败: {exc}")
 
 
+def prune_old_batches(days=BATCH_TTL_DAYS):
+    """删掉 N 天前的批次(含它们最大的 rows/mappings), 返回 (批次数, 释放字节数)。
+
+    安全性:
+      - 还有 queued/running 发布项的批次绝不删(worker 正在读它的行数据发品);
+      - 发布记录(publish_items/publish_jobs)不动 —— 它是"哪些商品已经发过"的依据;
+      - 影响: 更早的批次在界面上打不开(404)、也不能再回填ID, 需要时重新导入货盘表即可。
+    """
+    if days <= 0:
+        return 0, 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT id, COALESCE(LENGTH(rows_json),0)+COALESCE(LENGTH(mappings_json),0) size FROM batches "
+            "WHERE created_at < ? AND id NOT IN "
+            "(SELECT DISTINCT batch_id FROM publish_items WHERE status IN ('queued','running'))",
+            (cutoff,)).fetchall()
+        if not rows:
+            return 0, 0
+        freed = sum(row["size"] for row in rows)
+        conn.executemany("DELETE FROM batches WHERE id=?", [(row["id"],) for row in rows])
+        conn.commit()
+    finally:
+        conn.close()
+    for row in rows:                      # 批次没了, 来源记录也一起收掉
+        try:
+            os.remove(_source_info_path(row["id"]))
+        except OSError:
+            pass
+    return len(rows), freed
+
+
+def prune_old_backups(days=BACKUP_TTL_DAYS):
+    """删掉超过保留期(或超出份数)的货盘表备份, 返回 (删除数, 释放字节数)。"""
+    if not os.path.isdir(BACKUP_DIR):
+        return 0, 0
+    cutoff = time.time() - days * 86400
+    entries = []
+    for name in os.listdir(BACKUP_DIR):
+        target = os.path.join(BACKUP_DIR, name)
+        if os.path.isfile(target):
+            entries.append((os.path.getmtime(target), target))
+    entries.sort(reverse=True)
+    removed = freed = 0
+    for index, (stamp, target) in enumerate(entries):
+        if index < MAX_BACKUPS and stamp >= cutoff:
+            continue                       # 保留: 份数以内且没过期
+        try:
+            size = os.path.getsize(target)
+            os.remove(target)
+            removed += 1
+            freed += size
+        except OSError:
+            pass
+    return removed, freed
+
+
+def maintain_database():
+    """每天做一次库维护: 清过期批次 + 回收空间(VACUUM)。
+
+    没有定时任务, 就用"导入时顺手跑、每天最多一次"的方式:
+      - VACUUM 会重写整个库文件, 必须没有并发写入; 中台/worker 在跑时可能拿不到锁,
+        拿不到就跳过(下次再说), 绝不让它影响导入本身。
+    """
+    conn = db()
+    try:
+        last = _meta_get(conn, "last_db_maintenance", "")
+        today = datetime.now(timezone.utc).date().isoformat()
+        if last == today:
+            return
+    finally:
+        conn.close()
+    removed = 0
+    try:
+        removed, freed = prune_old_batches()
+        if removed:
+            print(f"[db] 已清理 {removed} 个过期批次（>{BATCH_TTL_DAYS} 天，约 {freed / 1024 / 1024:.1f} MB）")
+    except Exception as exc:
+        print(f"[db] 清理过期批次失败: {exc}")
+    conn = db()
+    try:
+        free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        _meta_set(conn, "last_db_maintenance", datetime.now(timezone.utc).date().isoformat())
+        conn.commit()
+        # 刚删过批次(产生了空闲页) 或空闲超过 8MB 才重写整个库 —— 白跑一次要几秒 + 临时翻倍磁盘
+        if removed or free_pages * page_size > 8 * 1024 * 1024:
+            before = os.path.getsize(DB_FILE)
+            conn.execute("VACUUM")
+            print(f"[db] VACUUM 完成: {before / 1024 / 1024:.1f} MB → {os.path.getsize(DB_FILE) / 1024 / 1024:.1f} MB")
+    except sqlite3.OperationalError as exc:               # 有人在写库, 这次不做
+        print(f"[db] VACUUM 跳过（库正被占用）: {exc}")
+    except Exception as exc:
+        print(f"[db] VACUUM 失败: {exc}")
+    finally:
+        conn.close()
+
+
 def after_import_housekeeping(batch_id, path, filename):
     """导入收尾: 记来源 + 清理过期运行时文件。
 
-    没有定时任务, 就用"每次导入顺手清一遍"的方式, 避免这些目录无限累积:
-      - _sources/<批次ID>.json  批次来源记录(默认留 90 天)
+    没有定时任务, 就用"每次导入顺手清一遍"的方式, 避免这些目录/数据无限累积:
+      - _sources/<批次ID>.json  批次来源记录(默认留 14 天, 与批次数据对齐)
+      - _sources/huopai_backups 货盘表备份(默认只留 1 份, 且最多 14 天)
       - images/_share/*         共享盘图片懒拷贝(默认留 30 天, 可重取)
+      - 数据库里过期批次的 rows/mappings(默认留 14 天) + 每天一次 VACUUM
     """
     save_source_info(batch_id, path, filename)
     try:
@@ -1828,6 +1940,16 @@ def after_import_housekeeping(batch_id, path, filename):
             print(f"[image-cache] 已清理 {removed} 个过期图片懒拷贝（{freed / 1024 / 1024:.1f} MB，>{IMAGE_TTL_DAYS} 天）")
     except Exception as exc:
         print(f"[image-cache] 清理过期图片失败: {exc}")
+    try:
+        removed, freed = prune_old_backups()
+        if removed:
+            print(f"[backup] 已清理 {removed} 个过期货盘表备份（{freed / 1024 / 1024:.1f} MB）")
+    except Exception as exc:
+        print(f"[backup] 清理过期备份失败: {exc}")
+    try:
+        maintain_database()
+    except Exception as exc:
+        print(f"[db] 维护失败: {exc}")
 
 
 def load_source_info(batch_id):
@@ -2038,9 +2160,10 @@ def _verify_written(path, sheet_name, updates):
 
 
 def _huopai_id_columns(sheet_name, sheet):
-    """(表头行, 表头内容, {字段: 列字母}, 需要追加的表头{字段: 名称})。
+    """(表头行, 表头内容, {字段: [列字母...]}, 需要追加的表头{字段: 名称})。
 
-    字段有 4 个: wechat/xhs = 款级「产品id」列, wechat_sku/xhs_sku = 行级「规格id」列。
+    字段 4 个: wechat/xhs = 款级商品ID列, wechat_sku/xhs_sku = 行级规格ID列。
+    同一字段命中多列就都写(避免运营看的那一列还是旧值); 一列都没命中才追加新列。
     """
     header_row = HUOPAI_SHEETS[sheet_name]
     headers = []
@@ -2051,12 +2174,12 @@ def _huopai_id_columns(sheet_name, sheet):
     columns, appended = {}, {}
     for field, names in HUOPAI_ID_HEADERS.items():
         wanted = {re.sub(r"[\s()（）]+", "", name).lower() for name in names}
-        index = next((i for i, name in enumerate(normalized) if name in wanted), None)
-        if index is None:
+        indexes = [i for i, name in enumerate(normalized) if name in wanted]
+        if not indexes:
             next_index += 1
-            index = next_index - 1
+            indexes = [next_index - 1]
             appended[field] = HUOPAI_PLATFORM_LABEL[field]
-        columns[field] = _col_letter(index + 1)
+        columns[field] = [_col_letter(i + 1) for i in indexes]
     return header_row, headers, columns, appended
 
 
@@ -2064,17 +2187,30 @@ def _sku_key(value):
     return re.sub(r"\s+", "", str(value or "")).upper()
 
 
+def _looks_like_platform_id(value):
+    """判断单元格里是不是平台ID(而不是人工写的备注): 纯数字/字母数字且够长。"""
+    text = str(value or "").strip()
+    return len(text) >= 10 and re.fullmatch(r"[A-Za-z0-9_-]+", text) is not None
+
+
 def build_huopai_updates(source_path, rows, ids, sku_ids=None):
     """算出要写进货盘表的单元格: ({sheet: {行: {列: 值}}}, 统计)。
 
-    - 产品id(款级): 同一款所有行一样, 来自发布记录(ids)；
-    - 规格id(行级): 每个 SKU 一行不一样, 来自平台商品详情(sku_ids = {平台: {商品编码: {商家编码: 规格id}}})。
-    只写"当前为空"的单元格；已有值的行只统计不动(人工填过的不覆盖)；
+    - 款级「产品id」(ids, 来自发布记录): 写到「小红书产品id」「微信小店」列 —— 同款各规格一样,
+      但它是后台商品列表里的"商品ID", 直接能搜到商品;
+    - 行级「规格id」(sku_ids, 现查平台商品详情): 写到「小红书规格id」「微信规格id」列 —— 一行一个,
+      对应后台商品规格列表里的"规格ID"。
+
+    单元格取值规则:
+      - 空 → 写新值；
+      - 已有值等于新值 → 不动, 计入 existing；
+      - 已有值是别的平台ID(之前填错的产品id/规格id) → 覆盖, 计入 overwritten；
+      - 已有值是人工写的备注(中文等, 不像ID) → 不动, 计入 existing。
     导入后货盘表被改过(商家编码对不上)的行直接跳过, 宁可不写也不写错行。
     """
     import openpyxl
     sku_ids = sku_ids or {}
-    updates, stats = {}, {"filled": 0, "existing": 0, "mismatch": 0, "sku_missing": 0,
+    updates, stats = {}, {"filled": 0, "overwritten": 0, "existing": 0, "mismatch": 0, "sku_missing": 0,
                           "filled_product": 0, "filled_sku": 0, "sheets": {}}
     workbook = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
     try:
@@ -2095,29 +2231,34 @@ def build_huopai_updates(source_path, rows, ids, sku_ids=None):
                 if line <= header_row:
                     continue
                 cells = wanted.setdefault(line, {})
-                for field, letter in columns.items():
+                for field, letters in columns.items():
                     platform = HUOPAI_FIELD_PLATFORM[field]
                     if field.endswith("_sku"):
                         # 规格id按"这一行的商家编码"取: 优先用发品时真正提交的 SKU编码,
-                        # 再退回原表里的原始编码(老数据/清洗过的编码靠它兜底)
+                        # 再退回原表里的原始编码(清洗过的编码靠它兜底)
                         variants = sku_ids.get(platform, {}).get(row.get("product_code"), {})
                         value = None
                         for key in (row.get("sku_code"), row.get("_源码")):
                             value = variants.get(_sku_key(key))
                             if value:
                                 break
-                        if not value and (ids.get(platform) or {}).get(row.get("product_code")):
-                            stats["sku_missing"] += 1
+                        if not value:
+                            if (ids.get(platform) or {}).get(row.get("product_code")):
+                                stats["sku_missing"] += 1
+                            continue
                     else:
                         value = (ids.get(platform) or {}).get(row.get("product_code"))
-                    if value:
+                        if not value:
+                            continue
+                    for letter in letters:
                         cells[letter] = str(value)
+                        cells.setdefault("__kind", {})[letter] = field
                 if cells:
                     cells["__code"] = str(row.get("_源码") or "")
             if appended:
                 header_cells = wanted.setdefault(header_row, {})
                 for field, label in appended.items():
-                    header_cells[columns[field]] = label
+                    header_cells[columns[field][0]] = label
             if not wanted:
                 continue
             last_line = max(wanted)
@@ -2126,6 +2267,7 @@ def build_huopai_updates(source_path, rows, ids, sku_ids=None):
                 cells = wanted.get(index)
                 if not cells:
                     continue
+                kind = cells.pop("__kind", {})
                 if index == header_row:
                     sheet_updates[index] = dict(cells)
                     continue
@@ -2137,12 +2279,16 @@ def build_huopai_updates(source_path, rows, ids, sku_ids=None):
                 for letter, value in list(cells.items()):
                     position = _col_index(letter) - 1
                     current = str(values[position] or "").strip() if position < len(values) else ""
-                    if current:
+                    if current == str(value).strip():
                         stats["existing"] += 1
                         cells.pop(letter)
                         continue
-                    stats["filled"] += 1
-                    if _field_of_column(columns, letter).endswith("_sku"):
+                    if current and not _looks_like_platform_id(current):
+                        stats["existing"] += 1        # 人工写的备注, 绝不动
+                        cells.pop(letter)
+                        continue
+                    stats["overwritten" if current else "filled"] += 1
+                    if kind.get(letter, "").endswith("_sku"):
                         stats["filled_sku"] += 1
                     else:
                         stats["filled_product"] += 1
@@ -2152,15 +2298,12 @@ def build_huopai_updates(source_path, rows, ids, sku_ids=None):
                 updates[sheet_name] = sheet_updates
                 stats["sheets"][sheet_name] = {
                     "rows": len([line for line in sheet_updates if line != header_row]),
-                    "columns": columns, "appended": appended,
+                    "columns": {field: "、".join(letters) for field, letters in columns.items()},
+                    "appended": appended,
                 }
     finally:
         workbook.close()
     return updates, stats
-
-
-def _field_of_column(columns, letter):
-    return next((field for field, value in columns.items() if value == letter), "")
 
 
 def latest_platform_ids(shop_id=None):
@@ -2241,10 +2384,12 @@ class WritebackBody(BaseModel):
 
 @app.post("/jobs/{job_id}/writeback-huopai")
 def writeback_huopai(job_id: str, body: WritebackBody | None = None, request: Request = None):
-    """【回填商品ID】把平台商品ID/规格ID写进货盘表原文件。
+    """【回填ID】把平台商品ID/规格ID写进货盘表原文件, 两种各归各位。
 
-    - 「微信小店」「小红书产品id」= 款级商品ID(同款各规格一样)；
-    - 「微信规格id」「小红书规格id」= 行级规格ID, 现查平台商品详情拿(同款不同规格ID不同)；
+    - 「小红书产品id」「微信小店」= 款级商品ID(后台商品列表里的"商品ID", 直接能搜到商品);
+    - 「小红书规格id」「微信规格id」= 行级规格ID(后台商品规格列表里的"规格ID", 一行一个);
+    缺列会自动追加。以前只填一种: 只填商品ID则每行都一样、定位不到具体规格; 只填规格ID则
+    在后台商品列表里搜不到、跟"商品ID"对不上。两种都填, 核对时两边都能对上。
     dry_run=true 只统计将要写哪些行(不落盘), 前端据此弹确认框；
     正式写入前备份原文件, 写完自检通过才替换, 失败则原文件保持不动。
     """
@@ -2308,8 +2453,8 @@ def writeback_huopai(job_id: str, body: WritebackBody | None = None, request: Re
     result = {
         "path": source_path, "filename": source.get("filename") or batch["filename"],
         "filled": stats["filled"], "existing": stats["existing"], "mismatch": stats["mismatch"],
+        "overwritten": stats["overwritten"], "sku_missing": stats["sku_missing"],
         "filled_product": stats["filled_product"], "filled_sku": stats["filled_sku"],
-        "sku_missing": stats["sku_missing"],
         "sheets": stats["sheets"],
         "platform_ids": {platform: len(mapping) for platform, mapping in ids.items()},
         "ambiguous": {platform: list(codes)[:20] for platform, codes in ambiguous.items()},
