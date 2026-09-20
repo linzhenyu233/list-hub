@@ -6,6 +6,7 @@ import { xhsApi } from '../xhsApi'
 import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
 import MediaUploader from './MediaUploader.vue'
+import { longestOf, textWidth } from '../skuTableWidth'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -83,6 +84,11 @@ async function selectCategory(value, level) {
       varDefs.value = listFrom(varData, ['variations'])
       Object.keys(attrValues).forEach((k) => delete attrValues[k])
       attrDefs.value.forEach((a) => { attrValues[a.id] = a.isMulti ? [] : '' })
+      // 默认只放平台标记必填的规格维度（最多 2 个），其余由运营点「添加规格」自己挑
+      activeSpecIds.value = varDefs.value
+        .filter((d) => d.isRequired)
+        .slice(0, MAX_SPEC_DIMS)
+        .map((d) => d.id)
       await Promise.all([...attrDefs.value, ...varDefs.value].map((a) => loadCandidatesFor(a.id)))
     } catch (error) { ElMessage.warning(`属性/规格加载失败：${error.message}`) }
   } else {
@@ -113,8 +119,37 @@ async function loadCandidatesFor(attrOrVarId) {
   } catch (e) { candidates[attrOrVarId] = [] }
 }
 
+// ============ 规格维度：自己添加，最多 2 个 ============
+// 小红书只支持 2 个规格维度，类目却会返回十几个（颜色分类/尺寸/款式/长度/规格/钻石净度/圈口…），
+// 全部铺出来既乱又没用，所以改成从类目给的里面挑，最多挑 2 个。
+const MAX_SPEC_DIMS = 2
+const activeSpecIds = ref([])
+
+const activeVarDefs = computed(() => activeSpecIds.value
+  .map((id) => varDefs.value.find((d) => d.id === id))
+  .filter(Boolean))
+
+const availableVarDefs = computed(() => varDefs.value.filter((d) => !activeSpecIds.value.includes(d.id)))
+
+function addSpecDim() {
+  if (activeSpecIds.value.length >= MAX_SPEC_DIMS) {
+    ElMessage.warning(`小红书最多 ${MAX_SPEC_DIMS} 个规格维度`)
+    return
+  }
+  const next = availableVarDefs.value[0]
+  if (!next) return
+  if (!Array.isArray(attrValues[next.id])) attrValues[next.id] = []
+  activeSpecIds.value.push(next.id)
+}
+
+function removeSpecDim(id) {
+  activeSpecIds.value = activeSpecIds.value.filter((x) => x !== id)
+  delete attrValues[id]
+  generateSkusFromVariations()
+}
+
 function generateSkusFromVariations() {
-  const dims = varDefs.value.filter((d) => (Array.isArray(attrValues[d.id]) ? attrValues[d.id].length > 0 : false))
+  const dims = activeVarDefs.value.filter((d) => (Array.isArray(attrValues[d.id]) ? attrValues[d.id].length > 0 : false))
   if (!dims.length) return
   const cands = candidates
   let combos = [[]]
@@ -138,24 +173,38 @@ function generateSkusFromVariations() {
       }]
     }))
   }
-  form.skuList = combos.map((variants, i) => ({
-    erpCode: form.skuList[i]?.erpCode || `SKU-${String(i + 1).padStart(3, '0')}`,
-    barcode: form.skuList[i]?.barcode || '',
-    specImage: form.skuList[i]?.specImage || '',
-    originalPriceYuan: form.skuList[i]?.originalPriceYuan || null,
-    priceYuan: form.skuList[i]?.priceYuan || null,
-    stock: form.skuList[i]?.stock || 0,
-    logisticsPlanId: form.skuList[i]?.logisticsPlanId || '',
-    deliveryHours: form.skuList[i]?.deliveryHours || 24,
-    _variants: variants,
-  }))
+  // 按规格组合匹配旧行（不是按下标）：改/删某个规格值时，剩下的行仍能对上自己那份价格与库存
+  const existing = new Map()
+  for (const sku of form.skuList) existing.set(specComboKey(sku._variants), sku)
+  form.skuList = combos.map((variants, i) => {
+    const previous = existing.get(specComboKey(variants))
+    return {
+      erpCode: previous?.erpCode || `SKU-${String(i + 1).padStart(3, '0')}`,
+      barcode: previous?.barcode || '',
+      specImage: previous?.specImage || '',
+      originalPriceYuan: previous?.originalPriceYuan ?? null,
+      priceYuan: previous?.priceYuan ?? null,
+      stock: previous?.stock || 0,
+      logisticsPlanId: previous?.logisticsPlanId || '',
+      deliveryHours: previous?.deliveryHours || 24,
+      _variants: variants,
+    }
+  })
+}
+
+// 规格组合指纹：把"规格名=值"排序拼接，用来把已填的价格/库存对应回同一组合
+function specComboKey(variants) {
+  return (variants || [])
+    .map((v) => `${v.id || v.name}=${v.value || v.valueName || ''}`)
+    .sort()
+    .join('|')
 }
 
 function onSpecSelectionChanged() { generateSkusFromVariations() }
 
-// SKU 表格：规格维度各占一列（像小红书后台那样，一眼看出每行是哪个规格）
+// SKU 表格：已添加且有值的规格维度各占一列（像小红书后台那样，一眼看出每行是哪个规格）
 const activeSpecDims = computed(() => {
-  const dims = varDefs.value
+  const dims = activeVarDefs.value
     .filter((d) => Array.isArray(attrValues[d.id]) && attrValues[d.id].length > 0)
     .map((d) => ({ id: d.id, name: d.name }))
   // 兜底：类目规格没拉回来（或与商品对不上）时，用 SKU 自带的规格维度补齐，
@@ -185,18 +234,34 @@ function restoreSpecSelection() {
       return { id: variant.id, name: variant.name, value, valueName: value, valueId }
     })
   }
-  for (const dim of varDefs.value) {
+  // 还原因商品实际用到的规格维度（只放这些，不要把类目返回的十几个规格全摆出来）
+  const usedNames = {}
+  const usedIds = []
+  for (const sku of form.skuList) {
+    for (const variant of (sku._variants || [])) {
+      const id = variant.id || variant.name
+      if (!id) continue
+      if (!usedNames[id]) usedNames[id] = variant.name || String(id)
+      if (!usedIds.includes(id)) usedIds.push(id)
+    }
+  }
+  for (const id of usedIds) {
+    // 老商品可能有平台规格定义里已经没有的维度，补一条定义，保证页面上仍能看到
+    if (!varDefs.value.some((d) => d.id === id)) {
+      varDefs.value.push({ id, name: usedNames[id] })
+    }
     const picked = []
     for (const sku of form.skuList) {
       for (const variant of (sku._variants || [])) {
-        if (variant.id !== dim.id && variant.name !== dim.name) continue
+        if ((variant.id || variant.name) !== id) continue
         // 有 valueId 用 valueId（下拉里的候选值）；没有就是自定义值，用文本本身回填
         const key = variant.valueId || variant.value
         if (key && !picked.includes(key)) picked.push(key)
       }
     }
-    attrValues[dim.id] = picked
+    attrValues[id] = picked
   }
+  activeSpecIds.value = usedIds.slice(0, MAX_SPEC_DIMS)
 }
 
 function specValueOf(row, dim) {
@@ -210,6 +275,31 @@ function removeSku(index) {
   if (form.skuList.length <= 1) return
   form.skuList.splice(index, 1)
 }
+
+// ============ SKU 表列宽：按字段长度自由调节（见 skuTableWidth.js） ============
+const skuColumns = computed(() => {
+  const columns = activeSpecDims.value.map((dim) => ({
+    key: `spec:${dim.id}`,
+    label: dim.name,
+    type: 'spec',
+    dim,
+    width: textWidth(longestOf(form.skuList.map((sku) => specValueOf(sku, dim)), dim.name), 96),
+  }))
+  columns.push(
+    { key: 'image', label: '规格图', type: 'image', width: 76 },
+    { key: 'code', label: '商家 SKU 编码', type: 'code', width: textWidth(longestOf(form.skuList.map((sku) => sku.erpCode), 'SKU-001'), 120) },
+    { key: 'barcode', label: '商品条码', type: 'barcode', width: textWidth(longestOf(form.skuList.map((sku) => sku.barcode), '可选'), 110) },
+    { key: 'original', label: '原价（元）', type: 'original', width: 130 },
+    { key: 'price', label: '售价（元）', type: 'price', width: 130 },
+    { key: 'stock', label: '库存', type: 'stock', width: 110 },
+    { key: 'delivery', label: '发货时效（小时）', type: 'delivery', width: 130 },
+    { key: 'logistics', label: '物流方案', type: 'logistics', width: 220 },
+    { key: 'actions', label: '操作', type: 'actions', width: 60 },
+  )
+  return columns
+})
+
+const skuTableWidth = computed(() => skuColumns.value.reduce((sum, column) => sum + column.width, 0))
 
 // 素材：本地图片 → 小红书素材库。
 // 旧流程要运营先在别处拿到公网图片地址、再点「上传」；现在直接调 /materials/upload-file，
@@ -421,20 +511,38 @@ onMounted(async () => {
     </section>
 
     <section v-if="varDefs.length" class="form-section">
-      <div class="section-heading"><div><h3>销售规格</h3><p>选择规格值后自动生成 SKU 组合；平台候选里没有的颜色/尺寸，直接打字回车新增</p></div><span class="section-index">03</span></div>
-      <div v-for="dim in varDefs" :key="dim.id" class="spec-dimension">
-        <div class="field-label">{{ dim.name }}</div>
-        <el-select
-          v-model="attrValues[dim.id]"
-          multiple
-          filterable
-          allow-create
-          default-first-option
-          :placeholder="`选择或直接输入${dim.name}值（输入后回车）`"
-          @change="onSpecSelectionChanged"
-        >
-          <el-option v-for="v in (candidates[dim.id] || [])" :key="v.valueId" :label="v.valueName" :value="v.valueId" />
-        </el-select>
+      <div class="section-heading"><div><h3>销售规格</h3><p>小红书最多 2 个规格维度；从类目给的规格里挑要用的，平台候选没有的值可直接打字回车新增</p></div><span class="section-index">03</span></div>
+      <div class="spec-rows">
+        <div v-for="dim in activeVarDefs" :key="dim.id" class="spec-dimension">
+          <div class="spec-dim-head">
+            <span class="spec-dim-title">{{ dim.name }}<span v-if="dim.isRequired">（必填）</span></span>
+            <el-button text type="danger" :icon="Delete" title="删除该规格" @click="removeSpecDim(dim.id)" />
+          </div>
+          <el-select
+            v-model="attrValues[dim.id]"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            :placeholder="`选择或直接输入${dim.name}值（输入后回车）`"
+            @change="onSpecSelectionChanged"
+          >
+            <el-option v-for="v in (candidates[dim.id] || [])" :key="v.valueId" :label="v.valueName" :value="v.valueId" />
+          </el-select>
+        </div>
+        <div class="spec-rows-footer">
+          <el-tooltip :disabled="activeSpecIds.length < MAX_SPEC_DIMS" content="小红书最多 2 个规格维度" placement="top">
+            <span class="spec-add-wrap">
+              <el-button text type="primary" :icon="Plus" :disabled="activeSpecIds.length >= MAX_SPEC_DIMS || !availableVarDefs.length" @click="addSpecDim">
+                {{ availableVarDefs.length ? `添加规格（${availableVarDefs[0].name}）` : '规格已全部添加' }}
+              </el-button>
+            </span>
+          </el-tooltip>
+          <span class="muted-copy">
+            <template v-if="activeSpecIds.length">已添加 {{ activeSpecIds.length }}/{{ MAX_SPEC_DIMS }} 个规格；不填值会生成单个默认 SKU</template>
+            <template v-else>不添加规格将生成单个默认 SKU</template>
+          </span>
+        </div>
       </div>
     </section>
 
@@ -453,30 +561,36 @@ onMounted(async () => {
     <section class="form-section">
       <div class="section-heading"><div><h3>小红书 SKU</h3><p>创建后需等待审核，审核通过才可按 SKU 上架</p></div><span class="section-index">05</span></div>
       <el-alert title="方案来源说明" description="“系统创建”表示由小红书平台自动生成，通常仅适用于虚拟商品或自动发货；普通实物商品请选择与店铺仓库、发货地址相匹配的商家物流方案。" type="info" show-icon :closable="false" class="logistics-tip" />
-      <el-table :key="activeSpecDims.map((d) => d.id).join('-')" :data="form.skuList" size="small" border empty-text="未生成 SKU" class="xhs-sku-table">
-        <el-table-column v-for="dim in activeSpecDims" :key="dim.id" :label="dim.name" min-width="110" show-overflow-tooltip>
-          <template #default="{ row }"><span class="sku-spec-value">{{ specValueOf(row, dim) }}</span></template>
-        </el-table-column>
-        <el-table-column label="规格图" width="86" align="center">
-          <template #default="{ row }"><MediaUploader v-model="row.specImage" :upload="uploadXhsImage" placeholder="选图" compact /></template>
-        </el-table-column>
-        <el-table-column label="商家 SKU 编码" width="180"><template #default="{ row }"><el-input v-model="row.erpCode" placeholder="必填" /></template></el-table-column>
-        <el-table-column label="商品条码" width="170"><template #default="{ row }"><el-input v-model="row.barcode" placeholder="可选" /></template></el-table-column>
-        <el-table-column label="原价（元）" width="130"><template #default="{ row }"><el-input-number v-model="row.originalPriceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="售价（元）" width="130"><template #default="{ row }"><el-input-number v-model="row.priceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="库存" width="120"><template #default="{ row }"><el-input-number v-model="row.stock" :min="0" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="发货时效（小时）" width="130"><template #default="{ row }"><el-input-number v-model="row.deliveryHours" :min="1" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="物流方案" width="230"><template #default="{ row }">
-          <el-select v-model="row.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案" style="width: 100%">
-            <el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)">
-              <div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div>
-            </el-option>
-          </el-select>
-        </template></el-table-column>
-        <el-table-column label="操作" width="60" align="center" fixed="right">
-          <template #default="{ $index }"><el-button text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="removeSku($index)" /></template>
-        </el-table-column>
-      </el-table>
+      <div class="sku-table-wrap">
+        <el-table
+          :key="activeSpecDims.map((d) => d.id).join('-')"
+          :data="form.skuList"
+          :style="{ width: `${skuTableWidth}px` }"
+          size="small"
+          border
+          empty-text="未生成 SKU"
+          class="xhs-sku-table"
+        >
+          <el-table-column v-for="col in skuColumns" :key="col.key" :label="col.label" :width="col.width" :align="col.type === 'image' || col.type === 'actions' ? 'center' : 'left'">
+            <template #default="{ row, $index }">
+              <span v-if="col.type === 'spec'" class="sku-spec-value" :title="specValueOf(row, col.dim)">{{ specValueOf(row, col.dim) }}</span>
+              <MediaUploader v-else-if="col.type === 'image'" v-model="row.specImage" :upload="uploadXhsImage" placeholder="选图" compact />
+              <el-input v-else-if="col.type === 'code'" v-model="row.erpCode" placeholder="必填" />
+              <el-input v-else-if="col.type === 'barcode'" v-model="row.barcode" placeholder="可选" />
+              <el-input-number v-else-if="col.type === 'original'" v-model="row.originalPriceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" />
+              <el-input-number v-else-if="col.type === 'price'" v-model="row.priceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" />
+              <el-input-number v-else-if="col.type === 'stock'" v-model="row.stock" :min="0" style="width: 100%" />
+              <el-input-number v-else-if="col.type === 'delivery'" v-model="row.deliveryHours" :min="1" style="width: 100%" />
+              <el-select v-else-if="col.type === 'logistics'" v-model="row.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案" style="width: 100%">
+                <el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)">
+                  <div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div>
+                </el-option>
+              </el-select>
+              <el-button v-else-if="col.type === 'actions'" text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="removeSku($index)" />
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
       <div class="sku-table-footer">
         <el-button text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
         <span class="muted-copy">共 {{ form.skuList.length }} 个 SKU；规格列由上面「销售规格」所选值自动生成</span>

@@ -93,8 +93,9 @@ button, input { font-family: inherit; }
 .category-levels { width: 100%; display: flex; flex-wrap: wrap; gap: 10px; }
 .category-levels .el-select { min-width: 180px; flex: 1; }
 .form-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-/* SKU 表格（微信/小红书同一套）：规格维度各占一列，行内直接编辑价格/库存/编码/规格图 */
-.xhs-sku-table, .wx-sku-table { width: 100%; }
+/* SKU 表格（微信/小红书同一套）：规格维度各占一列，行内直接编辑价格/库存/编码/规格图。
+   表格宽度由各列宽度之和决定（skuTableWidth.js 按字段长度估算），装不下时这里横向滚动 */
+.sku-table-wrap { width: 100%; overflow-x: auto; }
 .xhs-sku-table td.el-table__cell, .wx-sku-table td.el-table__cell { padding: 6px 0; vertical-align: middle; }
 .xhs-sku-table .cell, .wx-sku-table .cell { padding: 0 6px; line-height: 1.4; }
 .xhs-sku-table .el-input__wrapper, .wx-sku-table .el-input__wrapper { padding: 1px 8px; }
@@ -116,10 +117,12 @@ button, input { font-family: inherit; }
 .spec-value-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .spec-value-item .el-input, .spec-value-item .el-autocomplete { flex: 1; min-width: 0; }
 .spec-value-item .el-input__wrapper { background: #fff; }
-.spec-value-item__holder { width: 40px; flex: 0 0 auto; }
 .spec-value-item > .el-button { flex: 0 0 auto; padding: 4px; }
 .spec-rows-footer { display: flex; align-items: center; gap: 10px; }
 .spec-add-wrap { display: inline-flex; }   /* 按钮禁用后 el-tooltip 仍能有 hover 目标 */
+/* 规格维度标题行（小红书那边：规格名 + 删除） */
+.spec-dim-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.spec-dim-title { color: #525a67; font-size: 13px; font-weight: 600; }
 .logistics-tip { margin-bottom: 14px; }
 .logistics-option { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .bulk-view { width: 100%; }

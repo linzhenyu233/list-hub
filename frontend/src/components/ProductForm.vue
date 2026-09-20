@@ -6,6 +6,7 @@ import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
 import MediaUploader from './MediaUploader.vue'
+import { longestOf, textWidth } from '../skuTableWidth'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -296,6 +297,30 @@ function specValueOf(sku, name) {
   const attr = (sku._spec_attrs || []).find((a) => (a.attr_key || a.name) === name)
   return (attr && (attr.attr_value ?? attr.value)) || '—'
 }
+
+// ============ SKU 表列宽：按字段长度自由调节（见 skuTableWidth.js） ============
+const skuColumns = computed(() => {
+  const columns = activeSpecDims.value.map((dim) => ({
+    key: `spec:${dim.name}`,
+    label: dim.name,
+    type: 'spec',
+    dim,
+    width: textWidth(longestOf(specValues[dim.name] || [], dim.name), 96),
+  }))
+  columns.push(
+    { key: 'thumb', label: '规格图', type: 'thumb', width: 76 },
+    { key: 'sale', label: '销售价（元）', type: 'sale', width: 130 },
+    { key: 'market', label: '划线价（元）', type: 'market', width: 130 },
+    // 库存要放 −/+ 控件，宽度固定就够
+    { key: 'stock', label: '库存', type: 'stock', width: 130 },
+    { key: 'code', label: 'SKU 编码', type: 'code', width: textWidth(longestOf(form.skus.map((sku) => sku.out_sku_id), 'SKU-001'), 120) },
+    { key: 'barcode', label: '商品条码', type: 'barcode', width: textWidth(longestOf(form.skus.map((sku) => sku.sku_code), '可选'), 110) },
+    { key: 'actions', label: '操作', type: 'actions', width: 60 },
+  )
+  return columns
+})
+
+const skuTableWidth = computed(() => skuColumns.value.reduce((sum, column) => sum + column.width, 0))
 
 // SKU 组合的指纹：按"规格名=值"排序拼接，用来把已填的价格/库存/编码对应回同一组合
 function specComboKey(attrs) {
@@ -735,8 +760,8 @@ async function submit() {
               <el-input :model-value="v" :placeholder="`请输入${dim.name}`" @change="(val) => renameSpecValue(dim.name, vi, val)" />
               <el-button text type="danger" :icon="Delete" title="删除该规格值" @click="removeSpecValue(dim.name, vi)" />
             </div>
-            <div class="spec-value-item">
-              <span v-if="imageSpecName === dim.name" class="spec-value-item__holder" />
+            <!-- 新增值的输入框顶格排：不再按配图图位缩进，和值输入框同一列起始位置 -->
+            <div class="spec-value-item spec-value-item--new">
               <el-autocomplete
                 class="spec-value-new"
                 :model-value="_manualSpecInput[dim.name]"
@@ -765,22 +790,30 @@ async function submit() {
       </div>
 
       <div class="field-label description-label">价格与库存</div>
-      <el-table :key="activeSpecDims.map((d) => d.name).join('-')" :data="form.skus" size="small" border empty-text="未生成 SKU" class="wx-sku-table">
-        <el-table-column v-for="dim in activeSpecDims" :key="dim.name" :label="dim.name" min-width="110" show-overflow-tooltip>
-          <template #default="{ row }"><span class="sku-spec-value">{{ specValueOf(row, dim.name) }}</span></template>
-        </el-table-column>
-        <el-table-column label="规格图" width="86" align="center">
-          <template #default="{ row }"><MediaUploader v-model="row.thumb_img" :upload="uploadWechatImage" placeholder="选图" compact /></template>
-        </el-table-column>
-        <el-table-column label="销售价（元）" width="140"><template #default="{ row }"><el-input-number v-model="row.sale_price_yuan" :min="0.01" :precision="2" :controls="false" placeholder="0.00" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="划线价（元）" width="140"><template #default="{ row }"><el-input-number v-model="row.market_price_yuan" :min="0" :precision="2" :controls="false" placeholder="划线价" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="库存" width="130"><template #default="{ row }"><el-input-number v-model="row.stock_num" :min="0" :precision="0" style="width: 100%" /></template></el-table-column>
-        <el-table-column label="SKU 编码" width="180"><template #default="{ row }"><el-input v-model="row.out_sku_id" placeholder="SKU-001" /></template></el-table-column>
-        <el-table-column label="商品条码" width="170"><template #default="{ row }"><el-input v-model="row.sku_code" placeholder="可选" /></template></el-table-column>
-        <el-table-column label="操作" width="60" align="center" fixed="right">
-          <template #default="{ $index }"><el-button text type="danger" :icon="Delete" :disabled="form.skus.length === 1" @click="removeSku($index)" /></template>
-        </el-table-column>
-      </el-table>
+      <div class="sku-table-wrap">
+        <el-table
+          :key="activeSpecDims.map((d) => d.name).join('-')"
+          :data="form.skus"
+          :style="{ width: `${skuTableWidth}px` }"
+          size="small"
+          border
+          empty-text="未生成 SKU"
+          class="wx-sku-table"
+        >
+          <el-table-column v-for="col in skuColumns" :key="col.key" :label="col.label" :width="col.width" :align="col.type === 'thumb' || col.type === 'actions' ? 'center' : 'left'">
+            <template #default="{ row, $index }">
+              <span v-if="col.type === 'spec'" class="sku-spec-value" :title="specValueOf(row, col.dim.name)">{{ specValueOf(row, col.dim.name) }}</span>
+              <MediaUploader v-else-if="col.type === 'thumb'" v-model="row.thumb_img" :upload="uploadWechatImage" placeholder="选图" compact />
+              <el-input-number v-else-if="col.type === 'sale'" v-model="row.sale_price_yuan" :min="0.01" :precision="2" :controls="false" placeholder="0.00" style="width: 100%" />
+              <el-input-number v-else-if="col.type === 'market'" v-model="row.market_price_yuan" :min="0" :precision="2" :controls="false" placeholder="划线价" style="width: 100%" />
+              <el-input-number v-else-if="col.type === 'stock'" v-model="row.stock_num" :min="0" :precision="0" style="width: 100%" />
+              <el-input v-else-if="col.type === 'code'" v-model="row.out_sku_id" placeholder="SKU-001" />
+              <el-input v-else-if="col.type === 'barcode'" v-model="row.sku_code" placeholder="可选" />
+              <el-button v-else-if="col.type === 'actions'" text type="danger" :icon="Delete" :disabled="form.skus.length === 1" @click="removeSku($index)" />
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
       <div class="sku-table-footer">
         <el-button v-if="!activeSpecDims.length" text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
         <span class="muted-copy">共 {{ form.skus.length }} 个 SKU；规格列由上面所选规格值自动生成，价格以元录入，提交时自动转换为分</span>

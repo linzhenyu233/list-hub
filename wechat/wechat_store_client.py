@@ -32,6 +32,7 @@
 import os      # 用来读环境变量(把密钥放环境变量比写死在代码里安全)
 import sys
 import struct
+import threading  # 并发上传图片时串行化"换 token",避免多个线程抢着换、互相顶掉
 import time    # 用来算 token 过期时间、测试时等待
 import requests  # 发 HTTP 请求的库(微信接口都是 HTTP 接口)
 from concurrent.futures import ThreadPoolExecutor  # 列表要逐个查详情,并发拉缩短耗时
@@ -91,6 +92,9 @@ class WxStore:
         self.legacy_defaults = bool(legacy_defaults)
         self._token = None            # 缓存 access_token,避免每次都重新换
         self._token_expire_at = 0     # token 的过期时间戳(Unix时间)
+        # 批量发布是多线程并发上传图片(一次 10 路),若同时发现 token 过期、
+        # 各自去换一次新 token,后换的会把先换的顶掉 —— 加锁串行化,一次只换一个。
+        self._token_lock = threading.Lock()
         self._cat_cache = None        # 类目树缓存(发品归一化类目用,避免每次拉15000+节点)
         self._cat_cache_ts = 0.0
         self._qua_cache = {}          # 类目资质缓存 {leaf_cat_id: product_qua_list}
@@ -109,20 +113,51 @@ class WxStore:
         返回: access_token 字符串
         """
         # 如果缓存里有 token,而且还没到过期时间(提前60秒当过期),就直接返回
-        if not force and self._token and time.time() < self._token_expire_at - 60:
+        if self._token_valid() and not force:
             return self._token
 
-        # 向微信申请新 token:调 GET 接口,带上 appid 和 secret 两个参数
-        resp = requests.get(
-            f"{self.BASE}/cgi-bin/token",          # 接口地址
-            params={                                # 查询参数
-                "grant_type": "client_credential",  # 固定写法:"客户端凭证"模式
-                "appid": self.appid,                # 你的应用ID
-                "secret": self.secret,              # 你的应用密钥
-            },
-            timeout=10,                             # 10秒超时,防止卡死
-        )
-        data = resp.json()  # 把返回的 JSON 文本转成 Python 字典
+        with self._token_lock:
+            # 双检:等锁这段时间别的线程可能已经把 token 换好了
+            if self._token_valid() and not force:
+                return self._token
+            return self._refresh_access_token(force)
+
+    def _token_valid(self):
+        return bool(self._token) and time.time() < self._token_expire_at - 60
+
+    def _refresh_access_token(self, force=False):
+        # 优先用"稳定版"接口 /cgi-bin/stable_token：
+        # 它默认不重新签发(force_refresh=false 且 token 没过期时直接返回同一个),
+        # 所以本地/服务器/多个进程共用同一套凭证时不会互相把对方的 token 顶掉
+        # —— errcode 40001「access_token is invalid or not latest」就是这么来的。
+        data = {}
+        try:
+            resp = requests.post(
+                f"{self.BASE}/cgi-bin/stable_token",
+                json={
+                    "grant_type": "client_credential",
+                    "appid": self.appid,
+                    "secret": self.secret,
+                    "force_refresh": bool(force),
+                },
+                timeout=10,
+            )
+            data = resp.json() or {}
+        except Exception:
+            data = {}
+
+        if "access_token" not in data:
+            # 少数老账号不支持 stable_token 时回退老接口
+            resp = requests.get(
+                f"{self.BASE}/cgi-bin/token",          # 接口地址
+                params={                                # 查询参数
+                    "grant_type": "client_credential",  # 固定写法:"客户端凭证"模式
+                    "appid": self.appid,                # 你的应用ID
+                    "secret": self.secret,              # 你的应用密钥
+                },
+                timeout=10,                             # 10秒超时,防止卡死
+            )
+            data = resp.json()  # 把返回的 JSON 文本转成 Python 字典
 
         # 微信返回 {"access_token": "xxx", "expires_in": 7200}
         # 如果里面没有 access_token,说明出错了(比如 appid/secret 填错)
@@ -236,20 +271,26 @@ class WxStore:
         返回: img_url 字符串(注意:resp_type=1 返回的是图片URL,不是media_id)
         注意: 这个接口不走 _post,因为它的参数在 URL 上而不是 JSON 里
         """
-        params = {
-            "access_token": self.get_access_token(),  # 通行证
-            "upload_type": 1,   # 1=传图片URL(推荐); 0=传二进制文件流
-            "resp_type": 1,     # 1=返回图片URL(发商品head_imgs要填它); 0=返回media_id
-        }
-        # 请求体里放图片地址,微信去这个地址把图片拉过来转存
-        resp = requests.post(
-            f"{self.BASE}/shop/ec/basics/img/upload",
-            params=params,
-            json={"img_url": img_url},
-            timeout=15,
-        )
-        data = resp.json()
-        if data.get("errcode", 0) != 0:
+        # 每个接口都要带 access_token：token 被别处顶掉时强刷一次再传（与 _post 同策略）
+        for attempt in (0, 1):
+            params = {
+                "access_token": self.get_access_token(force=attempt == 1),  # 通行证
+                "upload_type": 1,   # 1=传图片URL(推荐); 0=传二进制文件流
+                "resp_type": 1,     # 1=返回图片URL(发商品head_imgs要填它); 0=返回media_id
+            }
+            # 请求体里放图片地址,微信去这个地址把图片拉过来转存
+            resp = requests.post(
+                f"{self.BASE}/shop/ec/basics/img/upload",
+                params=params,
+                json={"img_url": img_url},
+                timeout=15,
+            )
+            data = resp.json()
+            errcode = data.get("errcode", 0)
+            if errcode == 0:
+                break
+            if errcode in self.TOKEN_ERROR_CODES and attempt == 0:
+                continue          # 手里的 token 坏了,强刷一次再试
             raise RuntimeError(f"[img_upload] 失败: {data}")
 
         # 图片地址可能在顶层 img_url/url,也可能在 pic_file.img_url 里(实测是这里)
@@ -282,23 +323,33 @@ class WxStore:
         return 0, 0
 
     def upload_image_bytes(self, content, filename="image.jpg"):
-        """使用微信二进制模式上传 Excel 内嵌图片。"""
+        """使用微信二进制模式上传 Excel 内嵌图片 / 浏览器直传的本地图片。
+
+        token 失效会自动强刷重试:同一个 appid 在别的进程(微信服务、发布 worker、
+        本地脚本)申请过新 token,会让本进程缓存的旧 token 立即失效,
+        表现为 errcode 40001 —— 这属于"手里的通行证过期",不是业务错误,重试一次即可。
+        """
         width, height = self._image_size(content)
-        params = {
-            "access_token": self.get_access_token(),
-            "upload_type": 0,
-            "resp_type": 1,
-            "width": width,
-            "height": height,
-        }
-        response = requests.post(
-            f"{self.BASE}/shop/ec/basics/img/upload",
-            params=params,
-            files={"media": (os.path.basename(filename), content)},
-            timeout=120,
-        )
-        data = response.json()
-        if data.get("errcode", 0) != 0:
+        for attempt in (0, 1):
+            params = {
+                "access_token": self.get_access_token(force=attempt == 1),
+                "upload_type": 0,
+                "resp_type": 1,
+                "width": width,
+                "height": height,
+            }
+            response = requests.post(
+                f"{self.BASE}/shop/ec/basics/img/upload",
+                params=params,
+                files={"media": (os.path.basename(filename), content)},
+                timeout=120,
+            )
+            data = response.json()
+            errcode = data.get("errcode", 0)
+            if errcode == 0:
+                break
+            if errcode in self.TOKEN_ERROR_CODES and attempt == 0:
+                continue          # 强刷 token 再传一次
             raise RuntimeError(f"[img_upload_file] 失败: {data}")
         picture = data.get("pic_file") or {}
         image_url = (data.get("img_url") or data.get("url")
