@@ -14,6 +14,8 @@ const props = defineProps({
   placeholder: { type: String, default: '选择图片' },
   // 紧凑模式：给表格单元格用（56px，空态只显示一个 +）
   compact: { type: Boolean, default: false },
+  // 迷你模式：给「规格值配图」那种跟输入框同高的小图位用（40px）
+  mini: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:modelValue'])
 
@@ -43,7 +45,10 @@ async function onPicked(event) {
 </script>
 
 <template>
-  <div class="media-gallery media-gallery--small" :class="{ 'media-gallery--cell': props.compact }">
+  <div
+    class="media-gallery media-gallery--small"
+    :class="{ 'media-gallery--cell': props.compact, 'media-gallery--mini': props.mini }"
+  >
     <div v-if="modelValue" class="media-card media-card--small" :title="'点击可放大'">
       <el-image
         class="media-card__img"

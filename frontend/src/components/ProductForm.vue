@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Check, Delete, Plus, Search } from '@element-plus/icons-vue'
+import { Check, Delete, Plus, QuestionFilled, Search } from '@element-plus/icons-vue'
 import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
@@ -263,6 +263,8 @@ const activeSpecDims = computed(() => activeSpecDefs.value
 // 一行只允许一个维度开配图，避免"颜色图"和"尺码图"互相覆盖。
 const specValueImages = reactive({})
 const imageSpecName = ref('')
+// 值被还原（清空/重名）时靠它强制重建输入框，否则框里还留着被拒绝的内容
+const specValueInputVersion = ref(0)
 
 function setImageSpec(name, on) {
   imageSpecName.value = on ? name : ''
@@ -295,6 +297,14 @@ function specValueOf(sku, name) {
   return (attr && (attr.attr_value ?? attr.value)) || '—'
 }
 
+// SKU 组合的指纹：按"规格名=值"排序拼接，用来把已填的价格/库存/编码对应回同一组合
+function specComboKey(attrs) {
+  return (attrs || [])
+    .map((a) => `${a.attr_key || a.name}=${a.attr_value ?? a.value ?? ''}`)
+    .sort()
+    .join('|')
+}
+
 function generateSkusFromSpecs() {
   const dims = activeSpecDefs.value.filter((d) => (specValues[d.name] || []).length > 0)
   if (!dims.length) {
@@ -306,18 +316,22 @@ function generateSkusFromSpecs() {
   for (const dim of dims) {
     combos = combos.flatMap((c) => (specValues[dim.name] || []).map((v) => [...c, { attr_key: dim.name, attr_value: v }]))
   }
+  // ⚠️ 按组合匹配旧行（不是按下标）：改/删某个规格值时，剩下的行仍能对上自己那份价格与库存
+  const existing = new Map()
+  for (const sku of form.skus) existing.set(specComboKey(sku._spec_attrs), sku)
   form.skus = combos.map((attrs, i) => {
+    const previous = existing.get(specComboKey(attrs))
     // 开了配图的维度：按规格值取那张图；否则沿用该行原来传的图，别被重新组合清掉
     const imageKey = imageSpecName.value
     const imageValue = imageKey ? (attrs.find((a) => a.attr_key === imageKey)?.attr_value || '') : ''
-    const thumbImg = (imageKey && specValueImages[imageKey]?.[imageValue]) || form.skus[i]?.thumb_img || ''
+    const thumbImg = (imageKey && specValueImages[imageKey]?.[imageValue]) || previous?.thumb_img || ''
     return {
-      out_sku_id: form.skus[i]?.out_sku_id || `SKU-${String(i + 1).padStart(3, '0')}`,
-      sku_code: form.skus[i]?.sku_code || '',
+      out_sku_id: previous?.out_sku_id || `SKU-${String(i + 1).padStart(3, '0')}`,
+      sku_code: previous?.sku_code || '',
       thumb_img: thumbImg,
-      sale_price_yuan: form.skus[i]?.sale_price_yuan || null,
-      market_price_yuan: form.skus[i]?.market_price_yuan || null,
-      stock_num: form.skus[i]?.stock_num || 0,
+      sale_price_yuan: previous?.sale_price_yuan ?? null,
+      market_price_yuan: previous?.market_price_yuan ?? null,
+      stock_num: previous?.stock_num || 0,
       _spec_attrs: attrs,
     }
   })
@@ -329,14 +343,70 @@ function onSpecValuesChanged() {
   generateSkusFromSpecs()
 }
 
-// 没有候选值的规格（比如"钻石"）用输入框手填，回车加入
-function addManualSpecValue(name) {
-  const value = String(_manualSpecInput[name] || '').trim()
+// 规格值直接改字：值、配图、SKU 里已填的规格值一起跟着走，价格库存不会错位
+function renameSpecValue(name, index, nextValue) {
+  const list = specValues[name] || []
+  const oldValue = list[index]
+  const value = String(nextValue ?? '').trim()
+  if (value === oldValue) return
+  if (!value || list.includes(value)) {
+    list[index] = oldValue
+    specValueInputVersion.value += 1   // 输入框里已是新内容，版本号一变就重建回原值
+    ElMessage.warning(!value ? '规格值不能为空' : `「${value}」已存在`)
+    return
+  }
+  list[index] = value
+  for (const sku of form.skus) {
+    for (const attr of (sku._spec_attrs || [])) {
+      if ((attr.attr_key || attr.name) === name && attr.attr_value === oldValue) attr.attr_value = value
+    }
+  }
+  const images = specValueImages[name]
+  if (images && images[oldValue] !== undefined) {
+    images[value] = images[oldValue]
+    delete images[oldValue]
+  }
+  applySpecValueImage(name, value)
+}
+
+// 删掉某个规格值：用到它的 SKU 行一并删掉（与后台一致），其余行数据保持
+function removeSpecValue(name, index) {
+  const list = specValues[name] || []
+  const value = list[index]
+  list.splice(index, 1)
+  if (specValueImages[name]) delete specValueImages[name][value]
+  form.skus = form.skus.filter((sku) => specValueOf(sku, name) !== value)
+  generateSkusFromSpecs()
+}
+
+// 新增规格值（输入框回车、或从候选里选）
+function addSpecValueByText(name, text) {
+  const value = String(text ?? '').trim()
   if (!value) return
   if (!Array.isArray(specValues[name])) specValues[name] = []
-  if (!specValues[name].includes(value)) specValues[name].push(value)
+  if (specValues[name].includes(value)) {
+    ElMessage.warning(`「${value}」已存在`)
+    return
+  }
+  specValues[name].push(value)
   _manualSpecInput[name] = ''
   onSpecValuesChanged()
+}
+
+function addManualSpecValue(name) {
+  addSpecValueByText(name, _manualSpecInput[name])
+}
+
+// 新增值的输入框给候选建议：类目候选值里挑还没加过的
+function suggestSpecValues(name, query, cb) {
+  const used = specValues[name] || []
+  const text = String(query || '').trim()
+  const dim = specDefs.value.find((d) => d.name === name)
+  const list = attrOptions(dim?.value)
+    .filter((v) => !used.includes(v) && (!text || v.includes(text)))
+    .slice(0, 20)
+    .map((v) => ({ value: v }))
+  cb(list)
 }
 
 // 兜底：清掉历史误操作留下的脏值（旧代码把回车事件对象当成了规格值）
@@ -638,30 +708,45 @@ async function submit() {
         <span class="section-index">{{ attrDefs.length ? '04' : '03' }}</span>
       </div>
       <div class="spec-rows">
-        <div v-for="dim in activeSpecDefs" :key="dim.name" class="spec-dimension">
-          <div class="spec-dim-head">
+        <div v-for="dim in activeSpecDefs" :key="dim.name" class="spec-card">
+          <div class="spec-card__head">
             <el-select class="spec-name-select" :model-value="dim.name" @change="(name) => renameSpecDim(dim.name, name)">
               <el-option v-for="d in specDefs" :key="d.name" :label="d.name + (d.is_required ? '（必填）' : '')" :value="d.name" :disabled="activeSpecNames.includes(d.name) && d.name !== dim.name" />
             </el-select>
             <div class="spec-dim-tools">
               <el-switch :model-value="imageSpecName === dim.name" @change="(on) => setImageSpec(dim.name, on)" />
-              <span title="开：按规格值配图（同色各尺码共用一张图）">配图</span>
-              <el-button text type="danger" :icon="Delete" title="删除该规格" @click="removeSpecDim(dim.name)" />
+              <span>{{ imageSpecName === dim.name ? '配图' : '不配图' }}</span>
+              <el-tooltip placement="top" content="开启后：这个规格的每个值都能配一张图，用到该值的 SKU 共用这张图；关闭则只填规格值">
+                <el-icon><QuestionFilled /></el-icon>
+              </el-tooltip>
             </div>
+            <el-button text type="danger" :icon="Delete" title="删除该规格" @click="removeSpecDim(dim.name)" />
           </div>
-          <el-select v-if="attrOptions(dim.value).length > 0" v-model="specValues[dim.name]" multiple filterable allow-create default-first-option :placeholder="`选择或直接输入${dim.name}值（输入后回车）`" @change="onSpecValuesChanged">
-            <el-option v-for="v in attrOptions(dim.value)" :key="v" :label="v" :value="v" />
-          </el-select>
-          <div v-else class="spec-manual-tags">
-            <el-tag v-for="(v, vi) in (specValues[dim.name] || [])" :key="vi" closable @close="specValues[dim.name].splice(vi, 1); onSpecValuesChanged()">{{ v }}</el-tag>
-            <el-input v-model="_manualSpecInput[dim.name]" placeholder="输入后回车添加" style="width: 260px" @keyup.enter="addManualSpecValue(dim.name)" />
-          </div>
-          <div v-if="imageSpecName === dim.name" class="spec-value-images">
-            <div v-for="v in (specValues[dim.name] || [])" :key="v" class="spec-value-image">
-              <MediaUploader v-model="specValueImages[dim.name][v]" :upload="uploadWechatImage" placeholder="选图" compact @update:model-value="applySpecValueImage(dim.name, v)" />
-              <span class="spec-value-image__label" :title="v">{{ v }}</span>
+          <div class="spec-value-list">
+            <div v-for="(v, vi) in (specValues[dim.name] || [])" :key="`${vi}-${specValueInputVersion}`" class="spec-value-item">
+              <MediaUploader
+                v-if="imageSpecName === dim.name"
+                v-model="specValueImages[dim.name][v]"
+                :upload="uploadWechatImage"
+                placeholder="选图"
+                mini
+                @update:model-value="applySpecValueImage(dim.name, v)"
+              />
+              <el-input :model-value="v" :placeholder="`请输入${dim.name}`" @change="(val) => renameSpecValue(dim.name, vi, val)" />
+              <el-button text type="danger" :icon="Delete" title="删除该规格值" @click="removeSpecValue(dim.name, vi)" />
             </div>
-            <span v-if="!(specValues[dim.name] || []).length" class="muted-copy">先填{{ dim.name }}的值，再逐个配图</span>
+            <div class="spec-value-item">
+              <span v-if="imageSpecName === dim.name" class="spec-value-item__holder" />
+              <el-autocomplete
+                class="spec-value-new"
+                :model-value="_manualSpecInput[dim.name]"
+                :fetch-suggestions="(query, cb) => suggestSpecValues(dim.name, query, cb)"
+                :placeholder="`请输入${dim.name}`"
+                @update:model-value="(val) => (_manualSpecInput[dim.name] = val)"
+                @select="(item) => addSpecValueByText(dim.name, item.value)"
+                @keyup.enter="addManualSpecValue(dim.name)"
+              />
+            </div>
           </div>
         </div>
         <div class="spec-rows-footer">

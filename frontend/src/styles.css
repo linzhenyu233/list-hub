@@ -102,22 +102,24 @@ button, input { font-family: inherit; }
 .sku-spec-value { color: #303133; font-size: 13px; }
 .sku-table-footer { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 /* 规格维度行：规格名下拉 + 规格值 + 删除（对齐微信小店后台的样式） */
-/* 规格：每个维度一块——标题行（规格名 + 配图开关 + 删除），下面整行宽的值输入框 */
+/* 规格：一个规格一张浅灰卡片（对齐微信小店后台）——标题行（规格名 + 配图开关 + 删除），
+   下面每个规格值一个输入框（开了配图就多一个小图位），末尾是新增值的输入框 */
 .spec-rows { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; margin-bottom: 4px; width: 100%; }
-.spec-dimension { width: 100%; }
-.spec-dim-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
-/* 规格名做成"标签"观感：去掉输入框边框，只留文字和箭头 */
-.spec-name-select { width: 168px; }
-.spec-name-select .el-select__wrapper { padding-left: 0; box-shadow: none; background: transparent; }
-.spec-name-select .el-select__placeholder { color: #525a67; font-size: 13px; font-weight: 600; }
+.spec-card { width: 100%; padding: 14px 16px; border-radius: 8px; background: #f7f8fa; }
+.spec-card__head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+.spec-card__head > .el-button { margin-left: auto; }
+.spec-name-select { width: 200px; }
+.spec-name-select .el-select__wrapper { background: #fff; }
 .spec-dim-tools { display: flex; align-items: center; gap: 6px; color: #525a67; font-size: 12px; white-space: nowrap; }
-.spec-manual-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.spec-dim-tools .el-icon { color: #a0a7b2; cursor: help; }
+.spec-value-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; }
+.spec-value-item { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.spec-value-item .el-input, .spec-value-item .el-autocomplete { flex: 1; min-width: 0; }
+.spec-value-item .el-input__wrapper { background: #fff; }
+.spec-value-item__holder { width: 40px; flex: 0 0 auto; }
+.spec-value-item > .el-button { flex: 0 0 auto; padding: 4px; }
 .spec-rows-footer { display: flex; align-items: center; gap: 10px; }
 .spec-add-wrap { display: inline-flex; }   /* 按钮禁用后 el-tooltip 仍能有 hover 目标 */
-/* 开「配图」后，该规格每个值占一个图位（同色各尺码共用这张图） */
-.spec-value-images { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; padding: 12px 0 2px; }
-.spec-value-image { width: 72px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
-.spec-value-image__label { max-width: 72px; overflow: hidden; color: #667085; font-size: 11px; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
 .logistics-tip { margin-bottom: 14px; }
 .logistics-option { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .bulk-view { width: 100%; }
@@ -190,6 +192,12 @@ button, input { font-family: inherit; }
 .media-gallery--cell .media-card { width: 56px; height: 56px; }
 .media-gallery--cell .media-card--add { gap: 0; }
 .media-gallery--cell .media-card--add span { display: none; }
+/* 规格值配图那种跟输入框同高的小图位 */
+.media-gallery--mini .media-card { width: 40px; height: 40px; }
+.media-gallery--mini .media-card__tools { gap: 2px; }
+.media-gallery--mini .media-card__tools button { padding: 3px 5px; }
+.media-gallery--mini .media-card--add { gap: 0; }
+.media-gallery--mini .media-card--add span { display: none; }
 /* 触屏没有 hover：操作按钮常显，否则运营看不到「换图/删除」 */
 @media (hover: none) {
   .media-card__tools { opacity: 1; background: rgba(17, 24, 39, .32); }
@@ -287,6 +295,8 @@ button, input { font-family: inherit; }
   .media-gallery { gap: 8px; }
   .media-card { width: 92px; height: 92px; }
   .spec-name-select { width: 132px; }
+  .spec-value-list { grid-template-columns: 1fr; }
+  .spec-card { padding: 12px; }
   .bulk-card { padding: 18px 14px; }
   .bulk-selection-bar { flex-wrap: wrap; row-gap: 8px; }
   .bulk-summary { flex-wrap: wrap; }
