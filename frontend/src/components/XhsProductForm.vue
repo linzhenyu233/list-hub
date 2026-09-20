@@ -122,7 +122,15 @@ function generateSkusFromVariations() {
     const selectedIds = attrValues[dim.id] || []
     combos = combos.flatMap((c) => selectedIds.map((vid) => {
       const val = (cands[dim.id] || []).find((v) => v.valueId === vid)
-      return [...c, { id: dim.id, name: dim.name, value: val?.valueName || '', valueId: vid }]
+      // ⚠️ 平台要的字段名是 value（批量发布那边发的也是 value）；
+      //    valueName 只留着本地显示/兜底，别只发 valueName，否则平台收不到规格值。
+      return [...c, {
+        id: dim.id,
+        name: dim.name,
+        valueId: vid,
+        value: val?.valueName || '',
+        valueName: val?.valueName || '',
+      }]
     }))
   }
   form.skuList = combos.map((variants, i) => ({
@@ -139,6 +147,23 @@ function generateSkusFromVariations() {
 }
 
 function onSpecSelectionChanged() { generateSkusFromVariations() }
+
+// SKU 表格：已选值的规格维度各占一列（像小红书后台那样，一眼看出每行是哪个规格）
+const activeSpecDims = computed(() => varDefs.value.filter(
+  (d) => Array.isArray(attrValues[d.id]) && attrValues[d.id].length > 0,
+))
+
+function specValueOf(row, dim) {
+  const variant = (row._variants || []).find((item) => item.id === dim.id || item.name === dim.name)
+  // 平台回填的规格值字段名不统一，valueName / value / valueId 三选一
+  const value = variant ? (variant.valueName || variant.value || '') : ''
+  return value || '—'
+}
+
+function removeSku(index) {
+  if (form.skuList.length <= 1) return
+  form.skuList.splice(index, 1)
+}
 
 // 素材：本地图片 → 小红书素材库。
 // 旧流程要运营先在别处拿到公网图片地址、再点「上传」；现在直接调 /materials/upload-file，
@@ -372,8 +397,34 @@ onMounted(async () => {
     <section class="form-section">
       <div class="section-heading"><div><h3>小红书 SKU</h3><p>创建后需等待审核，审核通过才可按 SKU 上架</p></div><span class="section-index">05</span></div>
       <el-alert title="方案来源说明" description="“系统创建”表示由小红书平台自动生成，通常仅适用于虚拟商品或自动发货；普通实物商品请选择与店铺仓库、发货地址相匹配的商家物流方案。" type="info" show-icon :closable="false" class="logistics-tip" />
-      <div class="xhs-sku-list"><div v-for="(sku, index) in form.skuList" :key="index" class="xhs-sku-card"><div class="sku-card-title"><strong>SKU {{ index + 1 }}</strong><el-button text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="form.skuList.splice(index, 1)" /></div><div class="form-grid form-grid-3"><el-form-item label="商家 SKU 编码"><el-input v-model="sku.erpCode" /></el-form-item><el-form-item label="商品条码"><el-input v-model="sku.barcode" placeholder="barcode（可选，特定品类必填）" /></el-form-item><el-form-item label="原价（元）"><el-input-number v-model="sku.originalPriceYuan" :min="0.01" :precision="2" :controls="false" /></el-form-item><el-form-item label="售价（元）"><el-input-number v-model="sku.priceYuan" :min="0.01" :precision="2" :controls="false" /></el-form-item><el-form-item label="库存"><el-input-number v-model="sku.stock" :min="0" /></el-form-item><el-form-item label="发货时效（小时）"><el-input-number v-model="sku.deliveryHours" :min="1" /></el-form-item><el-form-item label="物流方案"><el-select v-model="sku.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案"><el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)"><div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div></el-option></el-select></el-form-item><el-form-item label="规格图"><MediaUploader v-model="sku.specImage" :upload="uploadXhsImage" placeholder="选规格图" /></el-form-item></div></div></div>
-      <el-button text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
+      <el-table :key="activeSpecDims.map((d) => d.id).join('-')" :data="form.skuList" size="small" border empty-text="未生成 SKU" class="xhs-sku-table">
+        <el-table-column v-for="dim in activeSpecDims" :key="dim.id" :label="dim.name" min-width="110" show-overflow-tooltip>
+          <template #default="{ row }"><span class="sku-spec-value">{{ specValueOf(row, dim) }}</span></template>
+        </el-table-column>
+        <el-table-column label="规格图" width="86" align="center">
+          <template #default="{ row }"><MediaUploader v-model="row.specImage" :upload="uploadXhsImage" placeholder="选图" compact /></template>
+        </el-table-column>
+        <el-table-column label="商家 SKU 编码" width="180"><template #default="{ row }"><el-input v-model="row.erpCode" placeholder="必填" /></template></el-table-column>
+        <el-table-column label="商品条码" width="170"><template #default="{ row }"><el-input v-model="row.barcode" placeholder="可选" /></template></el-table-column>
+        <el-table-column label="原价（元）" width="130"><template #default="{ row }"><el-input-number v-model="row.originalPriceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="售价（元）" width="130"><template #default="{ row }"><el-input-number v-model="row.priceYuan" :min="0.01" :precision="2" :controls="false" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="库存" width="120"><template #default="{ row }"><el-input-number v-model="row.stock" :min="0" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="发货时效（小时）" width="130"><template #default="{ row }"><el-input-number v-model="row.deliveryHours" :min="1" style="width: 100%" /></template></el-table-column>
+        <el-table-column label="物流方案" width="230"><template #default="{ row }">
+          <el-select v-model="row.logisticsPlanId" :loading="loadingOptions" filterable placeholder="请选择普通实物物流方案" style="width: 100%">
+            <el-option v-for="item in logisticsPlans" :key="optionId(item)" :label="logisticsPlanLabel(item)" :value="optionId(item)" :disabled="isVirtualSystemPlan(item)">
+              <div class="logistics-option"><span>{{ optionName(item) }}</span><el-tag size="small" :type="isSystemPlan(item) ? 'info' : 'primary'">{{ isSystemPlan(item) ? '系统创建' : '商家创建' }}</el-tag></div>
+            </el-option>
+          </el-select>
+        </template></el-table-column>
+        <el-table-column label="操作" width="60" align="center" fixed="right">
+          <template #default="{ $index }"><el-button text type="danger" :icon="Delete" :disabled="form.skuList.length === 1" @click="removeSku($index)" /></template>
+        </el-table-column>
+      </el-table>
+      <div class="sku-table-footer">
+        <el-button text type="primary" :icon="Plus" @click="addSku">添加 SKU</el-button>
+        <span class="muted-copy">共 {{ form.skuList.length }} 个 SKU；规格列由上面「销售规格」所选值自动生成</span>
+      </div>
     </section>
     <div class="form-actions"><el-button @click="emit('cancel')">取消</el-button><el-button type="primary" :loading="saving" :icon="Check" @click="submit">{{ isEdit ? '保存修改' : '创建小红书商品' }}</el-button></div>
   </el-form>

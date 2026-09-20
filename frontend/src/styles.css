@@ -93,8 +93,14 @@ button, input { font-family: inherit; }
 .category-levels { width: 100%; display: flex; flex-wrap: wrap; gap: 10px; }
 .category-levels .el-select { min-width: 180px; flex: 1; }
 .form-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.xhs-sku-card { margin-bottom: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 6px; background: #fafbfc; }
-.sku-card-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+/* 小红书 SKU 表格：规格维度各占一列，行内直接编辑价格/库存/物流方案/规格图 */
+.xhs-sku-table { width: 100%; }
+.xhs-sku-table td.el-table__cell { padding: 6px 0; vertical-align: middle; }
+.xhs-sku-table .cell { padding: 0 6px; line-height: 1.4; }
+.xhs-sku-table .el-input__wrapper { padding: 1px 8px; }
+.xhs-sku-table .el-input-number .el-input__inner { text-align: left; }
+.sku-spec-value { color: #303133; font-size: 13px; }
+.sku-table-footer { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
 .logistics-tip { margin-bottom: 14px; }
 .logistics-option { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .bulk-view { width: 100%; }
@@ -163,6 +169,10 @@ button, input { font-family: inherit; }
 .media-card--small .media-card__tools { gap: 4px; }
 .media-card--small .media-card__tools button { padding: 4px 6px; }
 .media-card--small .media-card__tools button span { display: none; }
+/* 表格单元格里的规格图：再小一号，空态只留一个 + */
+.media-gallery--cell .media-card { width: 56px; height: 56px; }
+.media-gallery--cell .media-card--add { gap: 0; }
+.media-gallery--cell .media-card--add span { display: none; }
 /* 触屏没有 hover：操作按钮常显，否则运营看不到「换图/删除」 */
 @media (hover: none) {
   .media-card__tools { opacity: 1; background: rgba(17, 24, 39, .32); }
