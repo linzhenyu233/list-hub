@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Delete, Plus, Search } from '@element-plus/icons-vue'
 import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
@@ -346,11 +346,43 @@ function cleanSpecValues() {
   }
 }
 
+// 新增规格：优先用类目还没用上的规格名；平台给的都用完了就允许自己起名字。
+// 微信的 sku_attrs.attr_key 是自由文本，所以自定义规格名能发出去；
+// 但平台对类目规格有校验，万一提交被拒，换成类目提供的规格名即可。
 function addSpecDim() {
   const next = availableSpecDefs.value[0]
-  if (!next) return
-  if (!Array.isArray(specValues[next.name])) specValues[next.name] = []
-  activeSpecNames.value.push(next.name)
+  if (next) {
+    if (!Array.isArray(specValues[next.name])) specValues[next.name] = []
+    activeSpecNames.value.push(next.name)
+    return
+  }
+  void promptCustomSpecDim()
+}
+
+async function promptCustomSpecDim() {
+  let name = ''
+  try {
+    const { value } = await ElMessageBox.prompt('输入规格名，例如：颜色、尺寸', '自定义规格', {
+      confirmButtonText: '添加',
+      cancelButtonText: '取消',
+      inputPlaceholder: '规格名（最多 40 个字符）',
+      inputValidator: (text) => {
+        const trimmed = String(text || '').trim()
+        if (!trimmed) return '请填写规格名'
+        if (trimmed.length > 40) return '规格名最多 40 个字符'
+        if (specDefs.value.some((d) => d.name === trimmed)) return '该规格名已存在'
+        return true
+      },
+    })
+    name = String(value || '').trim()
+  } catch {
+    return
+  }
+  if (!name) return
+  specDefs.value.push({ name, value: [], append_allowed: true })
+  specValues[name] = []
+  _manualSpecInput[name] = ''
+  activeSpecNames.value.push(name)
 }
 
 function removeSpecDim(name) {
@@ -598,7 +630,7 @@ async function submit() {
         <div><h3>规格和库存价格</h3><p>先添加颜色、尺码等规格并填值，系统按规格组合生成对应 SKU，再逐个填价格、库存与编码</p></div>
         <span class="section-index">{{ attrDefs.length ? '04' : '03' }}</span>
       </div>
-      <div v-if="specDefs.length" class="spec-rows">
+      <div class="spec-rows">
         <div v-for="dim in activeSpecDefs" :key="dim.name" class="spec-dimension">
           <div class="spec-dim-head">
             <el-select class="spec-name-select" :model-value="dim.name" @change="(name) => renameSpecDim(dim.name, name)">
@@ -625,9 +657,15 @@ async function submit() {
             <span v-if="!(specValues[dim.name] || []).length" class="muted-copy">先填{{ dim.name }}的值，再逐个配图</span>
           </div>
         </div>
-        <el-button text type="primary" :icon="Plus" :disabled="!availableSpecDefs.length" @click="addSpecDim">新增规格</el-button>
+        <div class="spec-rows-footer">
+          <el-button text type="primary" :icon="Plus" @click="addSpecDim">
+            {{ availableSpecDefs.length ? `新增规格（${availableSpecDefs[0].name}）` : '自定义规格' }}
+          </el-button>
+          <span v-if="!activeSpecNames.length" class="muted-copy">
+            {{ specDefs.length ? '不添加规格将生成单个默认 SKU' : '该类目没有预置规格，可点「自定义规格」自己加' }}
+          </span>
+        </div>
       </div>
-      <div v-else class="muted-copy">该类目没有可选规格；不填规格将生成单个默认 SKU。</div>
 
       <div class="field-label description-label">价格与库存</div>
       <el-table :key="activeSpecDims.map((d) => d.name).join('-')" :data="form.skus" size="small" border empty-text="未生成 SKU" class="wx-sku-table">
