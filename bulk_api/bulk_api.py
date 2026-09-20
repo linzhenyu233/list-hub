@@ -74,7 +74,35 @@ DB_FILE = os.environ.get("BULK_DB_FILE", os.path.join(BASE_DIR, "bulk_catalog.sq
 IMAGE_DIR = os.environ.get("BULK_IMAGE_DIR", os.path.join(BASE_DIR, "../images"))
 BULK_API_HOST = os.environ.get("BULK_API_HOST", "0.0.0.0")
 BULK_API_PORT = int(os.environ.get("BULK_API_PORT", "8020"))
+# 共享盘图片"懒拷贝"的保留天数(0=不清理): 发品时把共享盘图片按内容哈希拷进 IMAGE_DIR/_share/,
+# 内容随时能从共享盘重取, 所以可以安全按时间清; 不清的话这个目录只会越来越大(实测 10 天 147MB)。
+IMAGE_TTL_DAYS = int(os.environ.get("BULK_IMAGE_TTL_DAYS", "30"))
 os.makedirs(IMAGE_DIR, exist_ok=True)
+
+
+def prune_old_images(days=IMAGE_TTL_DAYS):
+    """清理 N 天前的共享盘图片懒拷贝, 返回 (删除数, 释放字节数)。
+
+    只动 IMAGE_DIR/_share/(内容哈希命名、可重取); 浏览器上传和 Excel 内嵌图落在
+    IMAGE_DIR/<批次ID>/ 下 —— 那些源图删了就再也发不出去, 所以这里故意不碰。
+    """
+    share_dir = os.path.join(IMAGE_DIR, "_share")
+    if days <= 0 or not os.path.isdir(share_dir):
+        return 0, 0
+    cutoff = time.time() - days * 86400
+    removed = freed = 0
+    for name in os.listdir(share_dir):
+        target = os.path.join(share_dir, name)
+        try:
+            if not os.path.isfile(target) or os.path.getmtime(target) >= cutoff:
+                continue
+            size = os.path.getsize(target)
+            os.remove(target)
+            removed += 1
+            freed += size
+        except OSError:
+            pass
+    return removed, freed
 
 # 图片根目录默认值(网络共享, 服务端可直读):图片直读扫描的默认根目录
 DEFAULT_IMAGE_ROOT = r"\\192.168.10.250\电子商务部\网销部共享\SHINING HOUSE培育钻"
@@ -1584,7 +1612,7 @@ def import_batch(body: ImportBody, request: Request):
                  (batch_id, shop_id, body.filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), operator, json.dumps(rows, ensure_ascii=False)))
     conn.commit(); conn.close()
     # 浏览器上传的 Excel 在服务器上没有原文件, 记一条空路径(回填ID到货盘表时会提示不支持)
-    save_source_info(batch_id, "", body.filename)
+    after_import_housekeeping(batch_id, "", body.filename)
     products = group_products(rows)
     product_errors = sum(bool(product["errors"]) for product in products)
     return {"ok": True, "batch_id": batch_id, "total": len(rows), "product_count": len(products), "valid": len(rows) - errors, "errors": errors, "product_errors": product_errors}
@@ -1699,7 +1727,7 @@ def import_huopai(body: HuopaiImportBody | None = None, request: Request = None)
                  (batch_id, shop_id, filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), operator, json.dumps(rows, ensure_ascii=False)))
     conn.commit(); conn.close()
     # 记住货盘表原文件位置: 发布完「回填商品ID」直接改这个文件
-    save_source_info(batch_id, path, filename)
+    after_import_housekeeping(batch_id, path, filename)
     products = group_products(rows)
     return {"ok": True, "batch_id": batch_id, "filename": filename, "total": len(rows),
             "product_count": len(products), "valid": len(rows) - errors, "errors": errors,
@@ -1718,7 +1746,11 @@ def import_huopai(body: HuopaiImportBody | None = None, request: Request = None)
 #   - 逐行用导入时记下的商家编码核对, 货盘表被改过/重排过的行不写(宁可不写, 不写错行)。
 SOURCE_INFO_DIR = os.path.join(BASE_DIR, "_sources")
 BACKUP_DIR = os.path.join(SOURCE_INFO_DIR, "huopai_backups")
-MAX_BACKUPS = 3
+# 货盘表备份保留份数(每份 60MB+): 默认 3 份, 可用环境变量调小(如 BULK_MAX_HUOPAI_BACKUPS=1)
+MAX_BACKUPS = int(os.environ.get("BULK_MAX_HUOPAI_BACKUPS", "3"))
+# 批次来源记录保留天数: 每导入一次记一条, 不清会无限累积(每条约 180 字节, 量小但没必要永久留)。
+# 过期只会影响"很旧的批次还能不能回填ID", 其它功能不受影响。
+SOURCE_INFO_TTL_DAYS = int(os.environ.get("BULK_SOURCE_INFO_TTL_DAYS", "90"))
 
 # 货盘表各 sheet 的表头所在行；ID列可能叫的名字（都不匹配就追加到表尾）
 HUOPAI_SHEETS = {"培育钻": 2, "天然钻": 1}
@@ -1742,6 +1774,29 @@ def _source_info_path(batch_id):
     return os.path.join(SOURCE_INFO_DIR, f"{batch_id}.json")
 
 
+def prune_source_info(days=SOURCE_INFO_TTL_DAYS):
+    """清掉过期的批次来源记录, 避免 _sources 目录无限累积。
+
+    只删 .json(不动 huopai_backups 里的备份, 备份由 _backup_source 按 MAX_BACKUPS 控制);
+    删早了也只是那批不能再回填ID, 发布数据/批次本身都不受影响。
+    """
+    if not os.path.isdir(SOURCE_INFO_DIR):
+        return 0
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for name in os.listdir(SOURCE_INFO_DIR):
+        if not name.endswith(".json"):
+            continue
+        target = os.path.join(SOURCE_INFO_DIR, name)
+        try:
+            if os.path.getmtime(target) < cutoff:
+                os.remove(target)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def save_source_info(batch_id, path, filename):
     """记下批次的来源文件(只有货盘直读才有 path), 供「回填ID到货盘表」定位原文件。"""
     try:
@@ -1751,6 +1806,28 @@ def save_source_info(batch_id, path, filename):
                       handle, ensure_ascii=False)
     except Exception as exc:      # 记不下来不影响导入
         print(f"[source-info] 记录来源失败: {exc}")
+
+
+def after_import_housekeeping(batch_id, path, filename):
+    """导入收尾: 记来源 + 清理过期运行时文件。
+
+    没有定时任务, 就用"每次导入顺手清一遍"的方式, 避免这些目录无限累积:
+      - _sources/<批次ID>.json  批次来源记录(默认留 90 天)
+      - images/_share/*         共享盘图片懒拷贝(默认留 30 天, 可重取)
+    """
+    save_source_info(batch_id, path, filename)
+    try:
+        removed = prune_source_info()
+        if removed:
+            print(f"[source-info] 已清理 {removed} 条过期批次来源记录（>{SOURCE_INFO_TTL_DAYS} 天）")
+    except Exception as exc:
+        print(f"[source-info] 清理过期记录失败: {exc}")
+    try:
+        removed, freed = prune_old_images()
+        if removed:
+            print(f"[image-cache] 已清理 {removed} 个过期图片懒拷贝（{freed / 1024 / 1024:.1f} MB，>{IMAGE_TTL_DAYS} 天）")
+    except Exception as exc:
+        print(f"[image-cache] 清理过期图片失败: {exc}")
 
 
 def load_source_info(batch_id):

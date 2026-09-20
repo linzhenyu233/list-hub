@@ -42,6 +42,8 @@ uploaded_images_*.txt
 # 批量导入的图片缓存目录（bulk_api.py 的 IMAGE_DIR）
 images/
 **/images/
+# 批次来源记录 + 货盘表备份（bulk_api/_sources）：运行时数据、含本机绝对路径，不应进仓库
+bulk_api/_sources/
 # 管易云同步产物（含平台 SKU 绑定映射，敏感）
 **/guanyi_xhs_mapping.json
 **/guanyi_sync_state.json
