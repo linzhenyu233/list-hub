@@ -523,7 +523,7 @@ def parse_peiyuzuan(sheet, images):
     rows = list(sheet.iter_rows(values_only=True))
     data = rows[2:]
     result = []
-    for r in data:
+    for row_index, r in enumerate(data, start=3):   # 1-based 行号（表头占 2 行）
         shangjia = clean_base(s(r[9]))  # 商家编码
         if not shangjia:
             continue
@@ -559,6 +559,11 @@ def parse_peiyuzuan(sheet, images):
         # 原始「系列」字段(如 'Shining系列-EASE·真我')供标题生成用:
         # 标准列里没有它, 而 split_series 只留 '·' 后的中文, 会把 'EASE' 丢掉
         row["_系列原文"] = s(r[19])
+        # 来源定位：发布完要把平台商品ID回填进货盘表原文件, 必须记住这一行来自哪张表哪一行,
+        # 以及当时的商家编码(回填前用它核对, 防止货盘表被改过/重排序导致写错行)
+        row["_源表"] = sheet.title
+        row["_源行"] = row_index
+        row["_源码"] = s(r[9])   # 原表里的原始商家编码(未清洗), 回填前用它核对行没被改动
         result.append(row)
     return result
 
@@ -568,7 +573,7 @@ def parse_tianranzuan(sheet, images):
     rows = list(sheet.iter_rows(values_only=True))
     data = rows[1:]
     result = []
-    for r in data:
+    for row_index, r in enumerate(data, start=2):   # 1-based 行号（表头占 1 行）
         shangjia = clean_base(s(r[4]))
         if not shangjia:
             continue
@@ -593,6 +598,10 @@ def parse_tianranzuan(sheet, images):
             imgs, "主钻分数", main_ct, "戒托颜色", setting_color, price_yuan, "1",
         )
         row["_系列原文"] = s(r[9])
+        # 来源定位(同培育钻): 发布完要把平台商品ID回填进货盘表原文件
+        row["_源表"] = sheet.title
+        row["_源行"] = row_index
+        row["_源码"] = s(r[4])
         result.append(row)
     return result
 

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import urllib.parse
 import urllib.request
@@ -875,6 +876,35 @@ def _job_params_of(row):
     return data if isinstance(data, dict) else {}
 
 
+# 发布前必须齐的「店铺级参数」: 缺了平台会整批拒。
+# 以前是建完任务、worker 逐个商品报"未配置微信运费模板", 运营看到满屏失败、回头补选还得重发一轮;
+# 现在建任务前直接拦住(见 publish 接口), 一个任务项都不建。
+# 每项 = (该平台映射里可能用的键..., 给人看的名字)
+_REQUIRED_SHOP_PARAMS = {
+    "wechat": (("wechat_freight_template_id", "freight_template_id", "微信运费模板"),),
+    "xhs": (("xhs_shipping_template_id", "小红书运费模板"), ("xhs_logistics_plan_id", "小红书物流方案")),
+}
+
+
+def _missing_shop_params(mappings, products, platforms, job_params=None):
+    """列出这批商品发布前还缺哪些店铺级必填参数(空列表=齐全)。
+
+    与 _wechat_payload/_xhs_payload 的必填判断保持同一套键: 跨店发布时先套用目标店参数快照,
+    和 worker 真正发品时的取值口径一致, 避免"这里放行、那边照样失败"。
+    """
+    product_mappings = (mappings or {}).get("products", {}) or {}
+    problems = []
+    for platform in platforms:
+        counts = {}
+        for product in products:
+            mapping = _apply_job_params(product_mappings.get(product.get("product_code")) or {}, job_params)
+            for keys in _REQUIRED_SHOP_PARAMS.get(platform, ()):
+                if not any(str(mapping.get(key) or "").strip() for key in keys[:-1]):
+                    counts[keys[-1]] = counts.get(keys[-1], 0) + 1
+        problems.extend(f"{label}（{count} 件商品未选）" for label, count in counts.items())
+    return problems
+
+
 def _apply_job_params(mapping, job_params):
     """把目标店的店铺私有参数覆盖到映射上。
 
@@ -1232,7 +1262,7 @@ def normalize_row(row, line):
             errors.append("库存不能小于0")
     except (TypeError, ValueError):
         errors.append("库存格式错误")
-    return {
+    normalized = {
         "line": line, "product_code": product_code,
         "title": value(row, "标题", "商品标题", "name"),
         "wechat_title": value(row, "微信标题"), "xhs_title": value(row, "小红书标题"),
@@ -1246,6 +1276,12 @@ def normalize_row(row, line):
         "original_price": value(row, "原价", "原价（元）"),
         "price": price, "stock": stock, "errors": errors,
     }
+    # 货盘直读的来源定位(哪张表哪一行/原始商家编码)要原样带下去:
+    # 发布完「回填平台商品ID到货盘表」靠它定位原文件的单元格。
+    for key in ("_源表", "_源行", "_源码", "_系列原文"):
+        if key in row:
+            normalized[key] = row[key]
+    return normalized
 
 
 # 「图片还在共享盘/本地磁盘上」的引用前缀: 扫描阶段只记路径, 真正上传平台时才读字节落盘(懒拷贝)
@@ -1547,6 +1583,8 @@ def import_batch(body: ImportBody, request: Request):
     conn.execute("INSERT INTO batches(id,shop_id,filename,status,total,valid,errors,created_at,operator,rows_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                  (batch_id, shop_id, body.filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), operator, json.dumps(rows, ensure_ascii=False)))
     conn.commit(); conn.close()
+    # 浏览器上传的 Excel 在服务器上没有原文件, 记一条空路径(回填ID到货盘表时会提示不支持)
+    save_source_info(batch_id, "", body.filename)
     products = group_products(rows)
     product_errors = sum(bool(product["errors"]) for product in products)
     return {"ok": True, "batch_id": batch_id, "total": len(rows), "product_count": len(products), "valid": len(rows) - errors, "errors": errors, "product_errors": product_errors}
@@ -1660,10 +1698,588 @@ def import_huopai(body: HuopaiImportBody | None = None, request: Request = None)
     conn.execute("INSERT INTO batches(id,shop_id,filename,status,total,valid,errors,created_at,operator,rows_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
                  (batch_id, shop_id, filename, "待校验" if errors else "待发布", len(rows), len(rows) - errors, errors, now(), operator, json.dumps(rows, ensure_ascii=False)))
     conn.commit(); conn.close()
+    # 记住货盘表原文件位置: 发布完「回填商品ID」直接改这个文件
+    save_source_info(batch_id, path, filename)
     products = group_products(rows)
     return {"ok": True, "batch_id": batch_id, "filename": filename, "total": len(rows),
             "product_count": len(products), "valid": len(rows) - errors, "errors": errors,
             "product_errors": sum(bool(product["errors"]) for product in products)}
+
+
+# ==================================================================
+# 回填平台商品ID到货盘表原文件
+# ==================================================================
+# 发布完成后运营要把平台生成的商品ID登记回货盘表(培育钻的「微信小店」「小红书产品id」列),
+# 原先只能照着导出的 CSV 一行行抄。这里直接改写货盘表原文件:
+#   - 只改需要的单元格: 在 xlsx 内部做字节级替换, 不重新保存整本工作簿 ——
+#     货盘表里 WPS 的内嵌图片(DISPIMG 主图)用 openpyxl 重存会丢;
+#   - 写前自动备份原文件, 写完自检(重新读回单元格)通过才替换, 失败则原文件不动;
+#   - 只填空白单元格: 已有值(人工填过)的行跳过并回报, 不覆盖;
+#   - 逐行用导入时记下的商家编码核对, 货盘表被改过/重排过的行不写(宁可不写, 不写错行)。
+SOURCE_INFO_DIR = os.path.join(BASE_DIR, "_sources")
+BACKUP_DIR = os.path.join(SOURCE_INFO_DIR, "huopai_backups")
+MAX_BACKUPS = 3
+
+# 货盘表各 sheet 的表头所在行；ID列可能叫的名字（都不匹配就追加到表尾）
+HUOPAI_SHEETS = {"培育钻": 2, "天然钻": 1}
+# 货盘表一行 = 一个 SKU(商家编码)，而平台商品ID是"款"级的(同款各规格都一样)，
+# 所以除了「产品id」，还要回填每行自己的「规格id」(平台 SKU ID)。
+HUOPAI_ID_HEADERS = {
+    "wechat": ("微信小店", "微信商品id", "微信小店商品id", "微信产品id"),
+    "xhs": ("小红书产品id", "小红书商品id"),
+    "wechat_sku": ("微信规格id", "微信sku id", "微信规格id(sku)"),
+    "xhs_sku": ("小红书规格id", "小红书sku id", "小红书规格id(sku)"),
+}
+HUOPAI_PLATFORM_LABEL = {"wechat": "微信小店", "xhs": "小红书产品id",
+                         "wechat_sku": "微信规格id", "xhs_sku": "小红书规格id"}
+HUOPAI_FIELD_PLATFORM = {"wechat": "wechat", "xhs": "xhs", "wechat_sku": "wechat", "xhs_sku": "xhs"}
+# 写入的ID列统一拉到这个宽度: 原表这些列宽只有 6 个字符, 24 位ID会溢出显示到相邻列,
+# 看着像"占用了别的平台ID的位置"
+HUOPAI_ID_COLUMN_WIDTH = 24
+
+
+def _source_info_path(batch_id):
+    return os.path.join(SOURCE_INFO_DIR, f"{batch_id}.json")
+
+
+def save_source_info(batch_id, path, filename):
+    """记下批次的来源文件(只有货盘直读才有 path), 供「回填ID到货盘表」定位原文件。"""
+    try:
+        os.makedirs(SOURCE_INFO_DIR, exist_ok=True)
+        with open(_source_info_path(batch_id), "w", encoding="utf-8") as handle:
+            json.dump({"path": os.path.abspath(path) if path else "", "filename": filename or ""},
+                      handle, ensure_ascii=False)
+    except Exception as exc:      # 记不下来不影响导入
+        print(f"[source-info] 记录来源失败: {exc}")
+
+
+def load_source_info(batch_id):
+    path = _source_info_path(batch_id)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle) or {}
+    except Exception:
+        return {}
+
+
+def _col_index(letter):
+    index = 0
+    for char in str(letter).upper():
+        if "A" <= char <= "Z":
+            index = index * 26 + (ord(char) - 64)
+    return index
+
+
+def _col_letter(index):
+    letters = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _xml_text(value):
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _patch_row_cells(row_xml, row_number, cells):
+    """在一行的 XML 里设置若干单元格: 已有就换内容(保留原样式), 没有就按列序插进去。"""
+    for letter in sorted(cells, key=_col_index):
+        target = f"{letter}{row_number}"
+        cell_re = re.compile(r'<c\b[^>]*\br="%s"[^>]*(?:/>|>.*?</c>)' % re.escape(target), re.S)
+        found = cell_re.search(row_xml)
+        style = ""
+        if found:
+            style_match = re.search(r'\bs="[^"]*"', found.group(0))
+            style = f" {style_match.group(0)}" if style_match else ""
+        new_cell = f'<c r="{target}"{style} t="inlineStr"><is><t>{_xml_text(cells[letter])}</t></is></c>'
+        if found:
+            row_xml = row_xml[:found.start()] + new_cell + row_xml[found.end():]
+            continue
+        insert_at = row_xml.rindex("</row>") if "</row>" in row_xml else len(row_xml)
+        for cell in re.finditer(r'<c\b[^>]*\br="([A-Z]+)\d+"', row_xml):
+            if _col_index(cell.group(1)) > _col_index(letter):
+                insert_at = cell.start()
+                break
+        row_xml = row_xml[:insert_at] + new_cell + row_xml[insert_at:]
+    # 追加列后把行的 spans(如 spans="1:35") 一起放宽: 有些阅读器(含 openpyxl 只读模式)
+    # 会按 spans/dimension 截断, 不改就会出现"写进去了但读出来是空"
+    widest = max(_col_index(letter) for letter in cells)
+    spans = re.search(r'spans="(\d+):(\d+)"', row_xml)
+    if spans and widest > int(spans.group(2)):
+        row_xml = row_xml[:spans.start()] + f'spans="{spans.group(1)}:{widest}"' + row_xml[spans.end():]
+    return row_xml
+
+
+def _unhide_columns(sheet_xml, letters, width=HUOPAI_ID_COLUMN_WIDTH):
+    """把指定列由隐藏改成显示, 并把列宽拉到放得下 24 位ID。
+
+    货盘表里 D~H 是整段隐藏的(小红书产品id/京东/抖音/微信小店都是隐藏列), 而且宽度只有 6 个字符:
+    运营即使取消隐藏, ID 也会因居中溢出显示到相邻列上, 看着像"占用了别的平台ID的位置"。
+    所以写入的列统一放开 + 加宽, 其余列(含同一段里其它隐藏列)原样不动。
+    <col min="4" max="8" hidden="1"/> 这种区间会被拆开, 只有目标列改属性。
+    """
+    for letter in sorted(set(letters), key=_col_index):
+        index = _col_index(letter)
+        target = None
+        for match in list(re.finditer(r"<col\b[^>]*/>", sheet_xml)):
+            low = re.search(r'min="(\d+)"', match.group(0))
+            high = re.search(r'max="(\d+)"', match.group(0))
+            if low and high and int(low.group(1)) <= index <= int(high.group(1)):
+                target = match
+                break
+        if target is None:
+            # 该列没有列定义(追加在表尾的新列就是这样): 补一条, 保持 min 升序
+            definition = f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>'
+            if "</cols>" in sheet_xml:
+                following = [(int(m.group(1)), m.start()) for m in re.finditer(r'<col\b[^>]*min="(\d+)"', sheet_xml)]
+                later = [position for value, position in following if value > index]
+                position = min(later) if later else sheet_xml.rindex("</cols>")
+                sheet_xml = sheet_xml[:position] + definition + sheet_xml[position:]
+            elif "<sheetData" in sheet_xml:
+                sheet_xml = sheet_xml.replace("<sheetData", f"<cols>{definition}</cols><sheetData", 1)
+            continue
+        attributes = target.group(0)
+        low = re.search(r'min="(\d+)"', attributes)
+        high = re.search(r'max="(\d+)"', attributes)
+        first, last = int(low.group(1)), int(high.group(1))
+        body = attributes[len("<col"):-2]
+        shown = re.sub(r'\s*(min="\d+"|max="\d+"|hidden="1"|width="[^"]*"|customWidth="[^"]*")', "", body)
+        shown += f' width="{width}" customWidth="1"'
+        still_hidden = re.sub(r'\s*(min="\d+"|max="\d+")', "", body)      # 其余列: 属性照旧
+        pieces = []
+        if first < index:
+            pieces.append(f'<col min="{first}" max="{index - 1}"{still_hidden}/>')
+        pieces.append(f'<col min="{index}" max="{index}"{shown}/>')
+        if last > index:
+            pieces.append(f'<col min="{index + 1}" max="{last}"{still_hidden}/>')
+        sheet_xml = sheet_xml[:target.start()] + "".join(pieces) + sheet_xml[target.end():]
+    return sheet_xml
+
+
+def _patch_sheet_xml(sheet_xml, updates):
+    """updates = {行号: {列字母: 值}}；只替换这些行, 其它内容(图片、样式)原样保留。"""
+    for row_number in sorted(updates):
+        row_re = re.compile(r'<row\b[^>]*\br="%d"[^>]*>.*?</row>' % row_number, re.S)
+        match = row_re.search(sheet_xml)
+        if not match:
+            continue
+        patched = _patch_row_cells(match.group(0), row_number, updates[row_number])
+        sheet_xml = sheet_xml[:match.start()] + patched + sheet_xml[match.end():]
+    # 写入的列如果原本是隐藏的, 一并显示出来, 否则运营看不到回填结果
+    sheet_xml = _unhide_columns(sheet_xml, (letter for cells in updates.values() for letter in cells))
+    # 新加的列要同步进 <dimension>, 否则阅读器按旧范围截断
+    widest = max(_col_index(letter) for cells in updates.values() for letter in cells)
+    dimension = re.search(r'<dimension ref="([^"]*)"\s*/>', sheet_xml)
+    if dimension:
+        parts = dimension.group(1).split(":")
+        end = parts[-1]
+        end_column = re.match(r"([A-Z]+)(\d*)", end)
+        if end_column and _col_index(end_column.group(1)) < widest:
+            end = f"{_col_letter(widest)}{end_column.group(2)}"
+            ref = f"{parts[0]}:{end}" if len(parts) > 1 else end
+            sheet_xml = sheet_xml[:dimension.start()] + f'<dimension ref="{ref}"/>' + sheet_xml[dimension.end():]
+    return sheet_xml
+
+
+def _sheet_xml_targets(archive):
+    """sheet 名 → zip 内的 XML 路径（经 workbook.xml + rels 解析, 不靠顺序猜）。"""
+    workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+    rels_xml = archive.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    rels = dict(re.findall(r'Id="([^"]+)"[^>]*?Target="([^"]+)"', rels_xml))
+    targets = {}
+    for attributes in re.findall(r'<sheet\b([^>]*?)/?>', workbook_xml):
+        name = re.search(r'name="([^"]*)"', attributes)
+        rid = re.search(r'r:id="([^"]*)"', attributes)
+        if not name or not rid:
+            continue
+        target = rels.get(rid.group(1), "")
+        if not target:
+            continue
+        target = target[1:] if target.startswith("/") else target
+        targets[name.group(1)] = target if target.startswith("xl/") else f"xl/{target}"
+    return targets
+
+
+def _write_workbook(source_path, target_path, updates_by_sheet):
+    """把各 sheet 的单元格更新写进 xlsx: 逐条拷贝 zip 内容, 只替换目标 sheet 的 XML。
+
+    ⚠️ 不能用 openpyxl 重新保存整本工作簿 —— 货盘表里的 WPS 内嵌图片(DISPIMG)会被丢掉。
+    """
+    with zipfile.ZipFile(source_path) as archive:
+        targets = _sheet_xml_targets(archive)
+        xml_paths = {targets[name]: updates for name, updates in updates_by_sheet.items() if name in targets}
+        with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as output:
+            for item in archive.infolist():
+                data = archive.read(item.filename)
+                if item.filename in xml_paths:
+                    data = _patch_sheet_xml(data.decode("utf-8"), xml_paths[item.filename]).encode("utf-8")
+                output.writestr(item, data)
+
+
+def _backup_source(path):
+    """备份原货盘表, 只保留最近几份(货盘表 60MB+, 不能无限留)。"""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stem, extension = os.path.splitext(os.path.basename(path))
+    backup = os.path.join(BACKUP_DIR, f"{stem}-{stamp}{extension}")
+    shutil.copy2(path, backup)
+    backups = sorted(
+        (os.path.join(BACKUP_DIR, name) for name in os.listdir(BACKUP_DIR) if name.endswith(extension)),
+        key=os.path.getmtime, reverse=True,
+    )
+    for stale in backups[MAX_BACKUPS:]:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    return backup
+
+
+def _verify_written(path, sheet_name, updates):
+    """重新读回写入的单元格, 确认真的写进去了(避免写坏 60MB 的货盘表还替换原文件)。"""
+    import openpyxl
+    lines = sorted(line for line in updates if line > 1)
+    if not lines:
+        return ""
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        sheet = workbook[sheet_name]
+        for index, values in enumerate(sheet.iter_rows(min_row=1, max_row=lines[-1], values_only=True), start=1):
+            if index not in updates:
+                continue
+            for letter, value in updates[index].items():
+                position = _col_index(letter) - 1
+                actual = str(values[position] or "").strip() if position < len(values) else ""
+                if actual != str(value).strip():
+                    return f"{sheet_name}!{letter}{index} 期望 {value} 实际 {actual}"
+    finally:
+        workbook.close()
+    return ""
+
+
+def _huopai_id_columns(sheet_name, sheet):
+    """(表头行, 表头内容, {字段: 列字母}, 需要追加的表头{字段: 名称})。
+
+    字段有 4 个: wechat/xhs = 款级「产品id」列, wechat_sku/xhs_sku = 行级「规格id」列。
+    """
+    header_row = HUOPAI_SHEETS[sheet_name]
+    headers = []
+    for row in sheet.iter_rows(min_row=header_row, max_row=header_row, values_only=True):
+        headers = [str(cell or "").strip() for cell in row]
+    normalized = [re.sub(r"[\s()（）]+", "", name).lower() for name in headers]
+    next_index = max(sheet.max_column or 0, len(headers))
+    columns, appended = {}, {}
+    for field, names in HUOPAI_ID_HEADERS.items():
+        wanted = {re.sub(r"[\s()（）]+", "", name).lower() for name in names}
+        index = next((i for i, name in enumerate(normalized) if name in wanted), None)
+        if index is None:
+            next_index += 1
+            index = next_index - 1
+            appended[field] = HUOPAI_PLATFORM_LABEL[field]
+        columns[field] = _col_letter(index + 1)
+    return header_row, headers, columns, appended
+
+
+def _sku_key(value):
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def build_huopai_updates(source_path, rows, ids, sku_ids=None):
+    """算出要写进货盘表的单元格: ({sheet: {行: {列: 值}}}, 统计)。
+
+    - 产品id(款级): 同一款所有行一样, 来自发布记录(ids)；
+    - 规格id(行级): 每个 SKU 一行不一样, 来自平台商品详情(sku_ids = {平台: {商品编码: {商家编码: 规格id}}})。
+    只写"当前为空"的单元格；已有值的行只统计不动(人工填过的不覆盖)；
+    导入后货盘表被改过(商家编码对不上)的行直接跳过, 宁可不写也不写错行。
+    """
+    import openpyxl
+    sku_ids = sku_ids or {}
+    updates, stats = {}, {"filled": 0, "existing": 0, "mismatch": 0, "sku_missing": 0,
+                          "filled_product": 0, "filled_sku": 0, "sheets": {}}
+    workbook = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    try:
+        for sheet_name in HUOPAI_SHEETS:
+            if sheet_name not in workbook.sheetnames:
+                continue
+            sheet = workbook[sheet_name]
+            header_row, headers, columns, appended = _huopai_id_columns(sheet_name, sheet)
+            code_index = next((i for i, name in enumerate(headers) if "商家编码" in name), None)
+            wanted = {}
+            for row in rows:
+                if str(row.get("_源表") or "") != sheet_name:
+                    continue
+                try:
+                    line = int(row.get("_源行") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if line <= header_row:
+                    continue
+                cells = wanted.setdefault(line, {})
+                for field, letter in columns.items():
+                    platform = HUOPAI_FIELD_PLATFORM[field]
+                    if field.endswith("_sku"):
+                        # 规格id按"这一行的商家编码"取: 优先用发品时真正提交的 SKU编码,
+                        # 再退回原表里的原始编码(老数据/清洗过的编码靠它兜底)
+                        variants = sku_ids.get(platform, {}).get(row.get("product_code"), {})
+                        value = None
+                        for key in (row.get("sku_code"), row.get("_源码")):
+                            value = variants.get(_sku_key(key))
+                            if value:
+                                break
+                        if not value and (ids.get(platform) or {}).get(row.get("product_code")):
+                            stats["sku_missing"] += 1
+                    else:
+                        value = (ids.get(platform) or {}).get(row.get("product_code"))
+                    if value:
+                        cells[letter] = str(value)
+                if cells:
+                    cells["__code"] = str(row.get("_源码") or "")
+            if appended:
+                header_cells = wanted.setdefault(header_row, {})
+                for field, label in appended.items():
+                    header_cells[columns[field]] = label
+            if not wanted:
+                continue
+            last_line = max(wanted)
+            sheet_updates = {}
+            for index, values in enumerate(sheet.iter_rows(min_row=1, max_row=last_line, values_only=True), start=1):
+                cells = wanted.get(index)
+                if not cells:
+                    continue
+                if index == header_row:
+                    sheet_updates[index] = dict(cells)
+                    continue
+                record = str(cells.pop("__code", "") or "")
+                actual_code = str(values[code_index] or "").strip() if code_index is not None and code_index < len(values) else ""
+                if record and actual_code != record:
+                    stats["mismatch"] += 1
+                    continue
+                for letter, value in list(cells.items()):
+                    position = _col_index(letter) - 1
+                    current = str(values[position] or "").strip() if position < len(values) else ""
+                    if current:
+                        stats["existing"] += 1
+                        cells.pop(letter)
+                        continue
+                    stats["filled"] += 1
+                    if _field_of_column(columns, letter).endswith("_sku"):
+                        stats["filled_sku"] += 1
+                    else:
+                        stats["filled_product"] += 1
+                if cells:
+                    sheet_updates[index] = cells
+            if sheet_updates:
+                updates[sheet_name] = sheet_updates
+                stats["sheets"][sheet_name] = {
+                    "rows": len([line for line in sheet_updates if line != header_row]),
+                    "columns": columns, "appended": appended,
+                }
+    finally:
+        workbook.close()
+    return updates, stats
+
+
+def _field_of_column(columns, letter):
+    return next((field for field, value in columns.items() if value == letter), "")
+
+
+def latest_platform_ids(shop_id=None):
+    """商品编码 → {平台: 平台商品ID}，取最近一次发布成功的记录。
+
+    为什么不只看"当前任务": 运营可能分几次发(分批发布/换批次重新导入/重试),
+    货盘表里要登记的是"这个商品在平台上是几号", 所以按商品取最近一次成功记录 ——
+    与「发布状态」页「已发布/未发布」的口径一致(它也是按商品而不是按批次汇总)。
+    同一商品同一平台存在多个不同ID(重发过、或跨店发布到两家店)时: 优先当前店, 仍不唯一则
+    记进 ambiguous, 由前端提示运营确认(仍写入最近一次, 避免整列空着)。
+    """
+    conn = db()
+    rows = conn.execute(
+        "SELECT product_code, platform, platform_product_id, shop_id, finished_at FROM publish_items "
+        "WHERE platform_product_id IS NOT NULL AND platform_product_id<>'' "
+        "AND status IN ('success','partial') ORDER BY finished_at"
+    ).fetchall()
+    conn.close()
+    candidates = {}
+    for row in rows:
+        key = (row["platform"], row["product_code"])
+        bucket = candidates.setdefault(key, [])
+        if not any(item["id"] == str(row["platform_product_id"]) for item in bucket):
+            bucket.append({"id": str(row["platform_product_id"]), "shop": row["shop_id"], "at": row["finished_at"] or ""})
+    ids, shops, ambiguous = {}, {}, {}
+    for (platform, code), bucket in candidates.items():
+        same_shop = [item for item in bucket if item["shop"] == shop_id]
+        pool = same_shop or bucket
+        chosen = sorted(pool, key=lambda item: item["at"])[-1]
+        ids.setdefault(platform, {})[code] = chosen["id"]
+        # 记下这个ID是哪家店发的: 查规格ID必须用同一家店(跨店发布时 A 店查不到 B 店的商品)
+        shops.setdefault(platform, {})[code] = chosen["shop"]
+        if len({item["id"] for item in pool}) > 1:
+            ambiguous.setdefault(platform, []).append(code)
+    return ids, shops, ambiguous
+
+
+def platform_sku_ids(platform, product_id, shop_id=None):
+    """查平台商品详情, 拿「商家编码 → 规格(SKU)ID」对应关系。
+
+    货盘表一行 = 一个 SKU(商家编码), 但平台给的商品ID是"款"级的、同款各规格完全一样,
+    所以行级要填的规格ID只能回平台查:
+      微信   GET /products/{pid}   → product.skus[].{sku_id, sku_code}
+      小红书 GET /items/{item_id}  → result.skuInfos[].{id, erpCode}
+    查不到就抛异常(由调用方记进"查不到"清单, 不影响产品ID的回填)。
+    """
+    target = urllib.parse.quote(str(product_id))
+    if platform == "wechat":
+        url = f"{WECHAT_API_BASE}/products/{target}"
+    elif platform == "xhs":
+        url = f"{XHS_API_BASE}/items/{target}"
+    else:
+        raise RuntimeError(f"不支持的平台：{platform}")
+    data = _http_get_json(url, timeout=60, shop_id=shop_id)
+    mapping = {}
+    if platform == "wechat":
+        product = (data.get("result") or {}).get("product") or {}
+        for sku in product.get("skus") or []:
+            sku_id = str(sku.get("sku_id") or "").strip()
+            for key in ("out_sku_id", "sku_code"):
+                code = _sku_key(sku.get(key))
+                if code and sku_id:
+                    mapping.setdefault(code, sku_id)
+    else:
+        if data.get("ok") is False:
+            raise RuntimeError(str(data.get("detail") or data)[:200])
+        for sku in (data.get("result") or {}).get("skuInfos") or []:
+            code = _sku_key(sku.get("erpCode"))
+            sku_id = str(sku.get("id") or sku.get("skuId") or "").strip()
+            if code and sku_id:
+                mapping[code] = sku_id
+    return mapping
+
+
+class WritebackBody(BaseModel):
+    dry_run: bool = False
+
+
+@app.post("/jobs/{job_id}/writeback-huopai")
+def writeback_huopai(job_id: str, body: WritebackBody | None = None, request: Request = None):
+    """【回填商品ID】把平台商品ID/规格ID写进货盘表原文件。
+
+    - 「微信小店」「小红书产品id」= 款级商品ID(同款各规格一样)；
+    - 「微信规格id」「小红书规格id」= 行级规格ID, 现查平台商品详情拿(同款不同规格ID不同)；
+    dry_run=true 只统计将要写哪些行(不落盘), 前端据此弹确认框；
+    正式写入前备份原文件, 写完自检通过才替换, 失败则原文件保持不动。
+    """
+    shop_id = _current_shop_id(request) if request else shop_registry.default_shop()["shop_id"]
+    _verify_shop(shop_id)
+    dry_run = bool(body.dry_run) if body else False
+    conn = db()
+    job_row = conn.execute("SELECT * FROM publish_jobs WHERE id=? AND shop_id=?", (job_id, shop_id)).fetchone()
+    if not job_row:
+        conn.close(); raise HTTPException(404, "发布任务不存在")
+    batch = conn.execute("SELECT id, filename, rows_json FROM batches WHERE id=? AND shop_id=?",
+                         (job_row["batch_id"], shop_id)).fetchone()
+    conn.close()
+    if not batch:
+        raise HTTPException(404, "批次不存在")
+    source = load_source_info(batch["id"])
+    source_path = source.get("path") or ""
+    if not source_path or not os.path.isfile(source_path):
+        raise HTTPException(400, "这批不是从货盘表直读导入的（或原货盘表已被移动），无法回填；请用「导出结果」")
+    ids, id_shops, ambiguous = latest_platform_ids(shop_id)
+    if not ids:
+        raise HTTPException(400, "还没有成功发布过的商品ID，发布成功后再回填")
+    try:
+        rows = json.loads(batch["rows_json"] or "[]")
+    except Exception:
+        rows = []
+    if not any(row.get("_源表") for row in rows):
+        raise HTTPException(400, "这批数据是旧版本导入的（没记录源表行号），请重新导入货盘表后再发布")
+    # 规格ID(行级)要现查平台: 只查"这批数据里真的用到、且已发布成功"的商品, 控制请求数
+    used_codes = {str(row.get("product_code") or "") for row in rows}
+    sku_ids, sku_failed, gone = {}, [], {}
+    for platform, mapping in ids.items():
+        gone_codes = set()
+        for code, product_id in list(mapping.items()):
+            if code not in used_codes:
+                continue
+            try:
+                # 必须用"发这个ID的那家店"去查, 否则跨店发布时另一家店查不到该商品(400)
+                sku_ids.setdefault(platform, {})[code] = platform_sku_ids(
+                    platform, product_id, (id_shops.get(platform) or {}).get(code) or shop_id)
+            except urllib.error.HTTPError as exc:
+                detail = _http_error_detail(exc)
+                markers = _WECHAT_GONE_MARKERS if platform == "wechat" else _XHS_GONE_MARKERS
+                if any(marker.lower() in detail.lower() for marker in markers):
+                    # 平台明确说这个商品不存在了(后台删过): 死ID不写进货盘表, 免得运营照着找
+                    gone_codes.add(code)
+                    gone.setdefault(platform, []).append(code)
+                else:
+                    sku_failed.append(f"{code}: {detail[:120]}")
+            except Exception as exc:
+                sku_failed.append(f"{code}: {str(exc)[:120]}")
+        for code in gone_codes:
+            mapping.pop(code, None)
+            (id_shops.get(platform) or {}).pop(code, None)
+    try:
+        updates, stats = build_huopai_updates(source_path, rows, ids, sku_ids)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"解析货盘表失败：{exc}")
+    result = {
+        "path": source_path, "filename": source.get("filename") or batch["filename"],
+        "filled": stats["filled"], "existing": stats["existing"], "mismatch": stats["mismatch"],
+        "filled_product": stats["filled_product"], "filled_sku": stats["filled_sku"],
+        "sku_missing": stats["sku_missing"],
+        "sheets": stats["sheets"],
+        "platform_ids": {platform: len(mapping) for platform, mapping in ids.items()},
+        "ambiguous": {platform: list(codes)[:20] for platform, codes in ambiguous.items()},
+        "sku_failed": sku_failed[:20],
+        "gone": {platform: list(codes)[:20] for platform, codes in gone.items()},
+        "dry_run": dry_run,
+    }
+    if dry_run:
+        return {"ok": True, "result": result}
+    if not updates:
+        result["message"] = "没有需要写入的单元格（可能都已有值，或商品编码在货盘表里对不上）"
+        return {"ok": True, "result": result}
+    try:
+        backup = _backup_source(source_path)
+    except Exception as exc:
+        raise HTTPException(500, f"备份货盘表失败（原文件未改动）：{exc}")
+    # ⚠️ 临时文件必须留 .xlsx 后缀: 下面自检要用 openpyxl 读它, openpyxl 不认 .tmp 会直接抛异常。
+    # 放在原文件同目录(同盘符才能 os.replace 原子替换), 失败路径统一删除。
+    stem, extension = os.path.splitext(source_path)
+    temp_path = f"{stem}.idbackup-{os.getpid()}{extension or '.xlsx'}"
+    try:
+        try:
+            _write_workbook(source_path, temp_path, updates)
+        except Exception as exc:
+            raise HTTPException(500, f"写入货盘表失败（原文件未改动）：{exc}")
+        problem = ""
+        for name, cells in updates.items():
+            problem = _verify_written(temp_path, name, cells)
+            if problem:
+                break
+        if problem:
+            raise HTTPException(500, f"写入后自检不通过（原文件未改动）：{problem}；备份在 {backup}")
+        try:
+            os.replace(temp_path, source_path)
+        except PermissionError:
+            raise HTTPException(409, "货盘表正被占用（可能有人用 Excel/WPS 打开着），请关闭后重试")
+        except OSError as exc:
+            raise HTTPException(500, f"替换货盘表失败（原文件未改动，新内容在 {temp_path}）：{exc}")
+    finally:
+        if os.path.exists(temp_path):     # 成功时已被 os.replace 移走, 失败时清掉, 不留垃圾文件
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+    result["backup"] = backup
+    result["message"] = f"已回填 {stats['filled']} 个单元格到 {os.path.basename(source_path)}"
+    return {"ok": True, "result": result}
 
 
 @app.get("/image-roots")
@@ -2006,6 +2622,13 @@ def publish(batch_id: str, body: PublishBody, request: Request):
         code_set = set(body.product_codes)
         products = [p for p in products if p["product_code"] in code_set]
         if not products: raise HTTPException(400, "所选商品均不存在")
+    # ⚠️ 店铺必填参数(运费模板/物流方案)没选 → 直接拦在这里, 不建任务:
+    #    否则任务建出来、worker 逐个商品报"未配置运费模板", 运营只能看着满屏失败项再重发一轮。
+    missing_params = _missing_shop_params(batch["mappings"], products, platforms, body.params or {})
+    if missing_params:
+        where = "目标店铺参数（跨店发布）" if cross_shop else "「平台映射」这一步"
+        raise HTTPException(400, "还没选：" + "；".join(missing_params)
+                            + f"。请先在{where}选好，再回来点发布（不会创建任务，也不会产生失败记录）")
     # Idempotency guard: do not create another platform item for a combination
     # that already has a publish record in this batch.
     check_conn = db()
