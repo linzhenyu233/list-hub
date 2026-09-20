@@ -11,6 +11,11 @@ http.interceptors.response.use((response) => response.data, (error) => {
   if (status === 413) {
     message = '导入文件过大，超过了服务器允许的请求体上限。请减少图片数量/体积后重试，或联系运维调大反向代理的 client_max_body_size'
   }
+  // 500 且后端没给 detail = 未捕获异常(裸报错)，光看 "Request failed with status code 500" 没法排查，
+  // 这里补一句明确的下一步，省得运营来回问。
+  if (status === 500 && typeof detail !== 'string') {
+    message = '中台内部错误（500，后端未返回具体原因），请把中台控制台的最后一段报错发给开发排查'
+  }
   return Promise.reject(new Error(message))
 })
 
@@ -45,6 +50,11 @@ export const bulkApi = {
   // shopId 可选：跨店发布的任务属于目标店，查进度/重试失败项必须带目标店，否则 404
   job: (id, shopId = '') => http.get(`/jobs/${id}`, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   retry: (id, itemIds = [], shopId = '') => http.post(`/jobs/${id}/retry`, { item_ids: itemIds }, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
+  // 回填商品ID到货盘表: 直接把平台生成的商品ID写进原货盘表(培育钻的「微信小店」「小红书产品id」列),
+  // 不用运营照着导出结果一个个登记。dryRun=true 只统计要写哪些行、不落盘(前端据此弹确认框)。
+  // 取值口径=按商品编码取最近一次发布成功的ID(不限本次任务/批次), 只填空白单元格;
+  // 写入前后端会备份原文件, 自检通过才替换。
+  writebackHuopai: (id, dryRun = false, shopId = '') => http.post(`/jobs/${id}/writeback-huopai`, { dry_run: dryRun }, { timeout: 600000, headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   categoryAliases: () => http.get('/category-aliases'),
   saveCategoryAlias: (body) => http.post('/category-aliases', body),
   deleteCategoryAlias: (id) => http.delete(`/category-aliases/${id}`),

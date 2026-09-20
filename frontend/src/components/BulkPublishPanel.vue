@@ -505,14 +505,24 @@ async function loadPlatformSettings() {
   try {
     const { errors, settings } = await fetchShopPlatformSettings()
     platformSettings.value = { ...platformSettings.value, ...settings }
-    if (!batchPlatformSettings.wechatFreightId && settings.wechatFreight?.length === 1) batchPlatformSettings.wechatFreightId = settingId(settings.wechatFreight[0])
-    if (!batchPlatformSettings.xhsShippingId && settings.xhsShipping.length === 1) batchPlatformSettings.xhsShippingId = settingId(settings.xhsShipping[0])
-    if (!batchPlatformSettings.xhsLogisticsId && settings.xhsLogistics.length === 1) batchPlatformSettings.xhsLogisticsId = settingId(settings.xhsLogistics[0])
+    // 选择顺序：当前已选 → 这家店上次选的(记住的) → 店里只有唯一模板时自动选中
+    const remembered = restorePlatformSettings()
+    const pick = (current, rememberedId, options) => {
+      if (current) return current
+      if (rememberedId && options.some((item) => settingId(item) === rememberedId)) return rememberedId
+      return options.length === 1 ? settingId(options[0]) : ''
+    }
+    batchPlatformSettings.wechatFreightId = pick(batchPlatformSettings.wechatFreightId, remembered.wechatFreightId, settings.wechatFreight || [])
+    batchPlatformSettings.xhsShippingId = pick(batchPlatformSettings.xhsShippingId, remembered.xhsShippingId, settings.xhsShipping || [])
+    batchPlatformSettings.xhsLogisticsId = pick(batchPlatformSettings.xhsLogisticsId, remembered.xhsLogisticsId, settings.xhsLogistics || [])
     if (errors.length) ElMessage.warning(errors.join('；'))
   } catch (error) {
     ElMessage.warning(`读取店铺平台设置失败：${error.message}`)
   } finally { settingsLoading.value = false }
 }
+
+// 选了就记住（按店铺存本地）：下次进来直接带上次的选择，忘记选的概率小很多
+watch(batchPlatformSettings, () => rememberPlatformSettings(), { deep: true })
 
 // 目标店的店铺参数：同店发布直接沿用第 3 步（平台映射）已选好的；跨店则按目标店重新拉取并重选
 async function loadTargetSettings() {
@@ -581,6 +591,76 @@ function targetParamsMissingHint() {
     return '请先选择目标店铺的微信运费模板'
   }
   return ''
+}
+
+// ------------------------------------------------------------------
+// 运费模板/物流方案忘了选 → 绝不建任务
+// 以前的行为：任务照建，worker 逐个商品报"未配置微信运费模板"，运营看到满屏失败，
+// 回第 2 步补选后还得再发一轮（而且还常发现"补选了也没用"，见下面 sync 的注释）。
+// ------------------------------------------------------------------
+// 把「平台映射」当前选的店铺参数同步进每个商品的映射，发布前也会再同步一次：
+// 常见操作是"发现没选 → 回第 2 步选好 → 直接点发布"，不再回退走一遍"保存并下一步"。
+// 以前这种情况发出的仍是旧映射（空模板）→ 又整批失败，现象就是"返回去选了也不行"。
+function syncPlatformSettingsIntoMappings(codes = null) {
+  const list = availablePlatforms.value
+  const mappings = { ...(mapping.value.products || {}) }
+  for (const product of products.value) {
+    if (codes && !codes.includes(product.product_code)) continue
+    const current = mappings[product.product_code]
+    if (!current) continue
+    const next = { ...current }
+    if (list.includes('wechat')) {
+      next.wechat_freight_template_id = next.wechat_freight_template_id || batchPlatformSettings.wechatFreightId
+    }
+    if (list.includes('xhs')) {
+      next.xhs_shipping_template_id = next.xhs_shipping_template_id || batchPlatformSettings.xhsShippingId
+      next.xhs_logistics_plan_id = next.xhs_logistics_plan_id || batchPlatformSettings.xhsLogisticsId
+    }
+    mappings[product.product_code] = next
+  }
+  mapping.value = { ...mapping.value, products: mappings }
+  return mappings
+}
+
+// 发布前必填校验：缺哪个店铺级参数、影响多少件商品（与后端 _missing_shop_params 同一套规则）
+function platformSettingGaps(codes = null) {
+  const list = availablePlatforms.value
+  if (crossShop.value) {
+    const hint = targetParamsMissingHint()
+    return hint ? [hint] : []
+  }
+  const rules = []
+  if (list.includes('wechat')) {
+    rules.push(['wechat_freight_template_id', '微信运费模板', batchPlatformSettings.wechatFreightId])
+  }
+  if (list.includes('xhs')) {
+    rules.push(['xhs_shipping_template_id', '小红书运费模板', batchPlatformSettings.xhsShippingId])
+    rules.push(['xhs_logistics_plan_id', '小红书物流方案', batchPlatformSettings.xhsLogisticsId])
+  }
+  const targets = products.value.filter((product) => !codes || codes.includes(product.product_code))
+  const gaps = []
+  for (const [key, label, chosen] of rules) {
+    const missing = targets.filter((product) => !String(chosen || mapping.value.products?.[product.product_code]?.[key] || '').trim()).length
+    if (missing) gaps.push(`${label}（${missing} 件商品未选）`)
+  }
+  return gaps
+}
+// 第 3 步显示的红条：进到确认发布这一步就能看到还缺什么，不用等到点发布才知道
+const publishGuardGaps = computed(() => (step.value === 3 && products.value.length ? platformSettingGaps() : []))
+
+// 「上次选的运费模板」按店铺记住：这一步最容易忘，记住上次的选择能少踩这个坑
+const platformSettingsKey = (shopId) => `bulk-platform-settings:${shopId || 'default'}`
+function rememberPlatformSettings() {
+  const { wechatFreightId, xhsShippingId, xhsLogisticsId } = batchPlatformSettings
+  if (!wechatFreightId && !xhsShippingId && !xhsLogisticsId) return   // 切店时会清空，别把记忆覆盖掉
+  try {
+    localStorage.setItem(platformSettingsKey(currentShopId.value), JSON.stringify({ wechatFreightId, xhsShippingId, xhsLogisticsId }))
+  } catch { /* 隐私模式/存储禁用，忽略 */ }
+}
+function restorePlatformSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(platformSettingsKey(currentShopId.value)) || '{}') || {}
+  } catch { return {} }
 }
 
 async function autoMatchWechatCategories() {
@@ -1489,6 +1569,60 @@ async function retryFailedItems(itemIds = []) {
 }
 onBeforeUnmount(() => { if (jobTimer) clearTimeout(jobTimer) })
 
+// 回填商品ID到货盘表：先 dry-run 看要写哪些行(不落盘)，确认后才真的写。
+// 后端只填空白单元格(人工填过的不覆盖)，写前自动备份，写完自检通过才替换原文件。
+const writebacking = ref(false)
+const escapeHtml = (text) => String(text ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+async function writebackHuopaiIds() {
+  const jobId = currentJob.value?.job_id
+  if (!jobId || writebacking.value) return
+  const shopId = jobShopId.value || currentShopId.value
+  writebacking.value = true
+  try {
+    const preview = await bulkApi.writebackHuopai(jobId, true, shopId)
+    const info = preview.result || {}
+    const sheetLines = Object.entries(info.sheets || {})
+      .map(([name, sheet]) => `${name} ${sheet.rows} 行（${Object.values(sheet.columns || {}).join(' / ')} 列）`)
+    const platformLines = Object.entries(info.platform_ids || {})
+      .map(([platform, count]) => `${platform === 'wechat' ? '微信' : '小红书'} ${count} 个商品ID`)
+    const ambiguous = Object.values(info.ambiguous || {}).flat()
+    const html = [
+      '把已发布商品的平台商品ID/规格ID直接写入货盘表原文件，之后不用再手工登记：',
+      `· 待写入 <b>${info.filled || 0}</b> 个单元格（产品id ${info.filled_product || 0} + 规格id ${info.filled_sku || 0}）：${escapeHtml(sheetLines.join('；') || '无')}`,
+      `· 已有人工填值的单元格 <b>${info.existing || 0}</b> 个（保持不动，不覆盖）`,
+      `· 货盘表里对不上的行 <b>${info.mismatch || 0}</b> 个（跳过，宁可不写也不写错行）`,
+      `· 可用商品ID：${escapeHtml(platformLines.join('、') || '无')}；规格id 是按行回平台查商品详情得到的（同款不同规格ID不同）`,
+      info.sku_missing
+        ? `· ⚠️ 有 ${info.sku_missing} 行没查到对应规格id（平台上该规格可能已被删，或编码不一致）`
+        : '',
+      Object.values(info.gone || {}).flat().length
+        ? `· ⚠️ 这些商品在平台上已不存在（后台删过），本次不写它们的ID：${escapeHtml(Object.values(info.gone || {}).flat().slice(0, 8).join('、'))}；建议先点「核对发布状态」把本地记录更新掉`
+        : '',
+      (info.sku_failed || []).length
+        ? `· ⚠️ 这些商品查平台详情失败，规格id没写：${escapeHtml((info.sku_failed || []).slice(0, 5).join('；'))}`
+        : '',
+      ambiguous.length
+        ? `· ⚠️ 这些商品在平台上有多个ID，已取最近一次：${escapeHtml(ambiguous.join('、'))}`
+        : '',
+      '· 写入的ID列会自动取消隐藏并加宽（货盘表的「小红书产品id」「微信小店」原本是隐藏列，宽度只有6个字符，ID会溢出到相邻列上）',
+      `<br>文件：${escapeHtml(info.path || '')}`,
+      '写入前会自动备份原文件；请先确认货盘表没有被 Excel/WPS 打开。',
+    ].filter(Boolean).join('<br>')
+    await ElMessageBox.confirm(html, '回填商品ID到货盘表', {
+      type: 'warning', dangerouslyUseHTMLString: true, confirmButtonText: '开始回填', cancelButtonText: '取消',
+    })
+    const done = await bulkApi.writebackHuopai(jobId, false, shopId)
+    const result = done.result || {}
+    ElMessage.success(result.message || '已回填到货盘表')
+  } catch (error) {
+    // 取消确认框时 reject 的是 'cancel'/'close'，不当错误提示
+    if (error !== 'cancel' && error !== 'close') ElMessage.error(error.message || String(error))
+  } finally {
+    writebacking.value = false
+  }
+}
+
 function exportJobResult() {
   const items = currentJob.value?.items || []
   if (!items.length) return ElMessage.info('暂无发布结果可导出')
@@ -1519,6 +1653,12 @@ async function publish(partial = false) {
   if (errorCount.value) return ElMessage.warning('请先修正全部校验错误')
   const codes = partial ? [...selectedProductCodes.value] : null
   if (partial && !codes.length) return ElMessage.warning('请先勾选要发布的商品')
+  // 必填项没选就不建任务：建了也是整批失败，运营还得重发一轮
+  const gaps = platformSettingGaps(codes)
+  if (gaps.length) {
+    if (!crossShop.value) step.value = 2      // 直接带回「平台映射」，运费模板就在那一步顶部
+    return ElMessage.warning(`还没选：${gaps.join('；')}，已阻止发布。请选好后再点发布`)
+  }
   const crossShopPublishing = crossShop.value
   if (crossShopPublishing) {
     // 跨店发布是真实上架，选错店/用错模板的代价高：先把该选的参数校验齐，再让运营确认一次
@@ -1541,6 +1681,8 @@ async function publish(partial = false) {
   loading.value = true
   try {
     await bulkApi.updateItems(batch.value.id, allItems.value)
+    // 第 2 步刚选的运费模板/物流方案要一起存下去（发布用的是这份映射）
+    syncPlatformSettingsIntoMappings(codes)
     await bulkApi.updateMappings(batch.value.id, mapping.value)
     const result = await bulkApi.publish(
       batch.value.id,
@@ -1575,12 +1717,14 @@ async function publish(partial = false) {
     <div v-if="step === 2" class="bulk-filters">
       <template v-if="availablePlatforms.includes('wechat')">
         <span>微信运费模板</span>
-        <el-select v-model="batchPlatformSettings.wechatFreightId" placeholder="选择微信运费模板" style="width:220px"><el-option v-for="item in (platformSettings.wechatFreight || [])" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
+        <el-select v-model="batchPlatformSettings.wechatFreightId" placeholder="选择微信运费模板" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.wechatFreightId }"><el-option v-for="item in (platformSettings.wechatFreight || [])" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
+        <span v-if="!batchPlatformSettings.wechatFreightId" class="setting-required-hint">必选，没选不能发布</span>
       </template>
       <template v-if="availablePlatforms.includes('xhs')">
         <span>小红书运费模板 / 物流方案</span>
-        <el-select v-model="batchPlatformSettings.xhsShippingId" placeholder="选择运费模板" style="width:220px"><el-option v-for="item in platformSettings.xhsShipping" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
-        <el-select v-model="batchPlatformSettings.xhsLogisticsId" placeholder="选择物流方案" style="width:220px"><el-option v-for="item in platformSettings.xhsLogistics" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
+        <el-select v-model="batchPlatformSettings.xhsShippingId" placeholder="选择运费模板" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.xhsShippingId }"><el-option v-for="item in platformSettings.xhsShipping" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
+        <el-select v-model="batchPlatformSettings.xhsLogisticsId" placeholder="选择物流方案" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.xhsLogisticsId }"><el-option v-for="item in platformSettings.xhsLogistics" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
+        <span v-if="!batchPlatformSettings.xhsShippingId || !batchPlatformSettings.xhsLogisticsId" class="setting-required-hint">必选，没选不能发布</span>
       </template>
     </div>
     <div v-if="step === 2 && availablePlatforms.includes('wechat') && mappingGroups.some((group) => group.mapping.wechat_candidates?.length > 1)" class="mapping-confirm-list">
@@ -1652,9 +1796,9 @@ async function publish(partial = false) {
     <section v-if="step === 0" class="content-panel bulk-card"><div class="bulk-drop" @click="pickExcelFile"><el-icon><Upload /></el-icon><h3>选择商品 Excel</h3><p>每个 SKU 一行</p><div class="bulk-drop__picker"><el-button type="primary" :icon="Upload" @click.stop="pickExcelFile">选择文件</el-button><span v-if="file" class="bulk-drop__filename">{{ file.name }}</span><span v-else class="muted-copy">未选择文件</span></div><input ref="excelInput" type="file" accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" style="display:none" @change="file = $event.target.files[0]" /></div><div class="bulk-import-row"><el-button type="primary" :loading="loading" @click="importFile">导入并校验 <el-icon><Right /></el-icon></el-button><el-select v-model="huopaiPath" placeholder="选择服务器货盘表" clearable><el-option v-for="item in huopaiFiles" :key="item.path" :label="item.name" :value="item.path" /></el-select><el-button :loading="loading" @click="importHuopai">直接导入货盘表</el-button></div><div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap"><span class="muted-copy">商品图片根目录</span><el-select v-model="imageRoot" placeholder="默认（服务端配置的图片根目录）" clearable style="width:400px"><el-option v-for="item in imageRootOptions" :key="item.path" :label="item.available ? item.path : `${item.path}（不可访问）`" :value="item.path" :disabled="!item.available" /></el-select><el-select v-model="imageMonths" multiple collapse-tags placeholder="全部月份" style="width:210px"><el-option v-for="m in IMAGE_MONTH_OPTIONS" :key="m" :label="m" :value="m" /></el-select><el-button :loading="scanning" :disabled="!batch?.id" @click="scanImages(false)">重新扫描图片</el-button></div><div class="folder-upload" style="margin-top: 12px"><label class="el-button el-button--default"><span>选择商品图片文件夹</span><input type="file" webkitdirectory directory multiple accept="image/*" hidden @change="readFolderFiles($event.target.files)" /></label><span v-if="folderFiles.length" class="muted-copy">已选择 {{ folderFiles.length }} 张商品图片</span><label class="el-button el-button--default" style="margin-left: 8px"><span>选择通用详情图文件夹</span><input type="file" webkitdirectory directory multiple accept="image/*" hidden @change="readCommonDetailFiles($event.target.files)" /></label><span v-if="commonDetailFiles.length" class="muted-copy">已选择 {{ commonDetailFiles.length }} 张通用详情图</span></div></section>
     <section v-else-if="step === 1" class="content-panel bulk-card"><input ref="skuImageInput" type="file" accept="image/*" style="display:none" @change="onSkuImagePicked" /><input ref="mainImageInput" type="file" accept="image/*" multiple style="display:none" @change="onMainImagePicked" /><div class="bulk-summary"><span>批次 {{ batch.id }}</span><el-tag type="success">可发布 {{ validCount }}</el-tag><el-tag type="danger">错误 {{ errorCount }}</el-tag><el-tag v-if="missingMainImageCount" type="warning">缺主图 {{ missingMainImageCount }} 个商品</el-tag><el-tag v-if="missingImageCount" type="warning">缺规格图 {{ missingImageCount }} 行</el-tag></div><el-alert v-if="imageScanResult" :type="(imageScanResult.unmatched_product_count || imageScanResult.unmatched_sku_count) ? 'warning' : 'success'" :closable="false" show-icon style="margin-bottom:12px"><template #title>图片匹配：商品 {{ imageScanResult.products_matched }}/{{ imageScanResult.products_total }}，SKU {{ imageScanResult.skus_matched }}/{{ imageScanResult.skus_total }}</template><template #default><div>扫描 {{ imageScanResult.folders }} 个商品文件夹 / {{ imageScanResult.scanned_images }} 张图；通用详情图 {{ imageScanResult.common_detail_images }} 张。</div><div v-if="imageScanResult.unmatched_product_count">有 {{ imageScanResult.unmatched_product_count }} 个商品没匹配到主图：发布会被平台以「至少需要一张主图」拒绝，需在下方列表点「缺主图·点击补图」补齐。</div><div v-if="imageScanResult.unmatched_sku_count">有 {{ imageScanResult.unmatched_sku_count }} 个 SKU 没匹配到规格图：图库里没有该款，需在下方列表点「缺图·点击补图」补齐。</div></template></el-alert><el-table :data="items" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="line" label="行" width="70" /><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip /><el-table-column prop="sku_code" label="SKU编码" width="150" show-overflow-tooltip /><el-table-column label="主图" width="100" align="center"><template #default="{ row }"><el-image v-if="(row.main_images || []).length" :src="bulkApi.imagePreviewUrl(row.main_images[0])" :preview-src-list="row.main_images.map((ref) => bulkApi.imagePreviewUrl(ref))" preview-teleported fit="cover" style="width:54px;height:54px;border-radius:4px" :title="`共 ${row.main_images.length} 张主图，点击可预览`" /><el-tag v-else-if="!(productMainImages[row.product_code] || []).length" type="warning" size="small" style="cursor:pointer" title="该商品没有任何主图，发布会被平台以「至少需要一张主图」拒绝；点击上传主图，可一次多选（只补空白行，已有主图的行不动）" @click="pickMainImage(row)">{{ uploadingMainImage ? '上传中…' : '缺主图·点击补图' }}</el-tag><span v-else class="muted-copy" style="font-size:11px;line-height:1.4" title="主图是商品级：同商品已有主图，本行留空不影响发布">同商品已填</span><div v-if="(row.main_images || []).length" class="muted-copy" style="font-size:11px;line-height:1.4">共 {{ row.main_images.length }} 张<span style="margin-left:4px;cursor:pointer;color:var(--el-color-primary)" title="换主图，可一次多选（会替换该商品现有全部主图，需确认）" @click="pickMainImage(row, 'replace')">换图</span></div></template></el-table-column><el-table-column label="规格图" width="120" align="center"><template #default="{ row }"><el-image v-if="row.sku_image" :src="bulkApi.imagePreviewUrl(row.sku_image)" :preview-src-list="[bulkApi.imagePreviewUrl(row.sku_image)]" preview-teleported fit="cover" style="width:54px;height:54px;border-radius:4px" /><el-tag v-else type="warning" size="small" style="cursor:pointer" title="点击上传该 SKU 的规格图" @click="pickSkuImage(row)">{{ uploadingSkuImage ? '上传中…' : '缺图·点击补图' }}</el-tag></template></el-table-column><el-table-column prop="price" label="售价" width="100" /><el-table-column prop="stock" label="库存" width="90" /><el-table-column label="校验结果" min-width="220" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.errors?.length" type="danger">{{ row.errors.join('；') }}</el-tag><el-tag v-else type="success">通过</el-tag></template></el-table-column><template v-if="requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" width="160" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '继承组级默认' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><el-button type="primary" :loading="loading" @click="validateBatch">重新校验并继续</el-button></div></section>
     <section v-else-if="step === 2" class="content-panel bulk-card"><h3>平台映射</h3><el-table :data="pagedMappingRows" max-height="520" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column prop="product_code" label="商品编码" min-width="150" show-overflow-tooltip /><el-table-column prop="internal_category" label="Excel 内部类目" min-width="150" show-overflow-tooltip /><el-table-column v-if="availablePlatforms.includes('wechat')" label="微信类目" min-width="280" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.wechat_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column v-if="availablePlatforms.includes('xhs')" label="小红书类目" min-width="280" show-overflow-tooltip><template #default="{ row }"><el-tag type="info">{{ row.mapping.xhs_category || '待系统匹配' }}</el-tag></template></el-table-column><el-table-column label="匹配状态" min-width="110" show-overflow-tooltip><template #default="{ row }"><el-tag type="warning">{{ row.mapping.status || '待处理' }}</el-tag></template></el-table-column><template v-if="availablePlatforms.includes('wechat') && requiredAttrNames.length"><el-table-column v-for="attrName in requiredAttrNames" :key="attrName" :label="`*${attrName}`" min-width="100" show-overflow-tooltip><template #default="{ row }"><span class="muted-copy">{{ getProductAttrValue(row, attrName) || '未配置' }}</span></template></el-table-column></template></el-table><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><el-button type="primary" :loading="loading" @click="saveAndNext">保存自动映射并继续</el-button></div></section>
-    <section v-else class="content-panel bulk-card"><h3>确认发布</h3><p>默认先创建微信草稿；小红书创建商品和 SKU 后进入审核，不自动上架。</p><el-alert v-if="productWarningCount" type="warning" :closable="false" show-icon :title="`${productWarningCount} 个商品存在 SKU 间属性不一致提醒`" description="商品属性是 SPU 级，各 SKU 行填了不同值时仅第一行生效。点“审核编辑”查看具体提醒，必要时把该差异提升为规格维度。" style="margin-bottom:12px" /><div class="platform-picker"><span class="platform-picker__label">目标店铺</span><el-select v-model="targetShopId" style="width:340px" :loading="targetSettingsLoading" @change="onTargetShopChange"><el-option v-for="shop in targetShopOptions" :key="shop.shop_id" :label="`${shop.name}（${shopPlatformText(shop)}）`" :value="shop.shop_id" /></el-select><span class="muted-copy">默认 = 当前店铺；换成同平台的其他店即为跨店发布</span></div><div class="platform-picker"><span class="platform-picker__label">发布到平台</span><el-checkbox-group v-model="platforms"><el-checkbox-button v-if="availablePlatforms.includes('wechat')" label="wechat">微信</el-checkbox-button><el-checkbox-button v-if="availablePlatforms.includes('xhs')" label="xhs">小红书</el-checkbox-button></el-checkbox-group><span class="muted-copy">可多选，至少选一个</span></div><div v-if="crossShop" class="platform-picker"><span class="platform-picker__label">目标店参数</span><template v-if="availablePlatforms.includes('xhs')"><span class="muted-copy">运费模板</span><el-select v-model="targetShopSettings.xhsShippingId" :loading="targetSettingsLoading" style="width:260px"><el-option v-for="item in targetPlatformSettings.xhsShipping" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select><span class="muted-copy">物流方案</span><el-select v-model="targetShopSettings.xhsLogisticsId" :loading="targetSettingsLoading" style="width:230px"><el-option v-for="item in targetPlatformSettings.xhsLogistics" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select></template><template v-if="availablePlatforms.includes('wechat')"><span class="muted-copy">运费模板</span><el-select v-model="targetShopSettings.wechatFreightId" :loading="targetSettingsLoading" style="width:260px"><el-option v-for="item in targetPlatformSettings.wechatFreight" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select></template><span class="muted-copy">跨店发布：类目/属性沿用当前批次映射，运费模板与物流方案按目标店铺选择</span></div><el-alert v-if="errorCount" type="error" :closable="false" show-icon title="仍有校验错误，不能发布" /><div class="bulk-filters" style="margin-bottom:12px"><el-input v-model="productKeyword" clearable :prefix-icon="Search" placeholder="搜索商品编码、标题或内部类目" style="width:300px" @clear="resetProductPage" @input="resetProductPage" /><el-select v-model="productPublishFilter" style="width:205px" @change="resetProductPage"><el-option :label="`全部 (${products.length})`" value="all" /><el-option :label="`仅看未发布 (${publishCounts.none})`" value="none" /><el-option :label="`仅看已发布 (${publishCounts.success})`" value="success" /><el-option :label="`仅看发布失败 (${publishCounts.failed})`" value="failed" /><el-option :label="`仅看发布中 (${publishCounts.pending})`" value="pending" /></el-select><el-button :loading="publishStatusLoading" @click="loadPublishStatus">刷新发布状态</el-button><el-button :loading="verifyingPublishStatus" title="把本地“已发布”记录拿去平台核对：在后台删掉的商品会自动改回“未发布”，可以重新发布" @click="verifyPublishStatus('verify')">核对发布状态</el-button><el-button v-if="selectedProductCodes.size" link type="warning" :loading="verifyingPublishStatus" title="确认这些商品已在平台后台删除，直接改回“未发布”（小红书核对不出时用它兜底）" @click="verifyPublishStatus('reset')">标记未发布 ({{ selectedProductCodes.size }})</el-button><span class="muted-copy">筛选后 {{ filteredProducts.length }} 件</span></div><div class="bulk-selection-bar"><div class="bulk-selection-bar__info"><span>共 <strong>{{ products.length }}</strong> 件商品，筛选后 <strong>{{ filteredProducts.length }}</strong> 件，已选 <strong>{{ selectedProductCodes.size }}</strong> 件</span><el-button link size="small" @click="toggleSelectAllFiltered">{{ allFilteredSelected ? '取消全选筛选结果' : '全选筛选结果' }}</el-button><el-button v-if="selectedProductCodes.size" link size="small" @click="clearSelection">清空选择</el-button><span v-if="selectedPublished.length" style="color:#e6a23c">⚠ 已选中有 {{ selectedPublished.length }} 件已经发布过，发布会因标题重复被平台拒</span><el-button v-if="selectedPublished.length" link type="warning" size="small" @click="dropPublishedSelection">移除已发布的</el-button></div></div><el-table ref="productTableRef" :data="pagedProducts" row-key="product_code" max-height="360" style="margin-bottom:16px" @selection-change="onSelectionChange" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column type="selection" width="50" reserve-selection /><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip /><el-table-column prop="internal_category" label="内部类目" min-width="180" show-overflow-tooltip /><el-table-column label="发布状态" width="110" align="center"><template #default="{ row }"><el-tag v-if="productPublishState(row.product_code) === 'success'" type="success" size="small" :title="productPublishedAt(row.product_code) ? `已经在所选平台发布过（最近成功：${formatPublishTime(productPublishedAt(row.product_code))}），再发会被平台以「标题重复」拒绝` : '该商品已经发布成功过，再发会被平台以「标题重复」拒绝'">已发布</el-tag><el-tag v-else-if="productPublishState(row.product_code) === 'pending'" type="info" size="small">发布中</el-tag><el-tag v-else-if="productPublishState(row.product_code) === 'failed'" type="danger" size="small" title="发过但失败了，看下方发布进度的失败原因">发布失败</el-tag><span v-else class="muted-copy">未发布</span></template></el-table-column><el-table-column label="属性状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag :type="productAttrTagType(row)" size="small">{{ productAttrCount(row) }} 项已配</el-tag></template></el-table-column><el-table-column label="SKU 提醒" width="110"><template #default="{ row }"><el-tooltip v-if="row.warnings?.length" placement="top"><template #content><div v-for="(w, i) in row.warnings" :key="i">{{ w }}</div></template><el-tag type="warning" size="small">{{ row.warnings.length }} 项不一致</el-tag></el-tooltip><span v-else class="muted-copy">--</span></template></el-table-column><el-table-column label="操作" width="100" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openReview(row)">审核编辑</el-button></template></el-table-column></el-table><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><div style="display:flex;gap:8px"><el-button :loading="loading" :disabled="!platforms.length || errorCount > 0 || !selectedProductCodes.size" title="优先执行：选中的这几件会插到队列前面，不必排在其它批次的大任务后面" @click="publish(true)">发布选中 ({{ selectedProductCodes.size }}) · 优先</el-button><el-button type="primary" :loading="loading" :disabled="!platforms.length || errorCount > 0" :icon="Check" @click="publish(false)">全部发布 ({{ products.length }})</el-button></div></div></section>
+    <section v-else class="content-panel bulk-card"><h3>确认发布</h3><p>默认先创建微信草稿；小红书创建商品和 SKU 后进入审核，不自动上架。</p><el-alert v-if="productWarningCount" type="warning" :closable="false" show-icon :title="`${productWarningCount} 个商品存在 SKU 间属性不一致提醒`" description="商品属性是 SPU 级，各 SKU 行填了不同值时仅第一行生效。点“审核编辑”查看具体提醒，必要时把该差异提升为规格维度。" style="margin-bottom:12px" /><div class="platform-picker"><span class="platform-picker__label">目标店铺</span><el-select v-model="targetShopId" style="width:340px" :loading="targetSettingsLoading" @change="onTargetShopChange"><el-option v-for="shop in targetShopOptions" :key="shop.shop_id" :label="`${shop.name}（${shopPlatformText(shop)}）`" :value="shop.shop_id" /></el-select><span class="muted-copy">默认 = 当前店铺；换成同平台的其他店即为跨店发布</span></div><div class="platform-picker"><span class="platform-picker__label">发布到平台</span><el-checkbox-group v-model="platforms"><el-checkbox-button v-if="availablePlatforms.includes('wechat')" label="wechat">微信</el-checkbox-button><el-checkbox-button v-if="availablePlatforms.includes('xhs')" label="xhs">小红书</el-checkbox-button></el-checkbox-group><span class="muted-copy">可多选，至少选一个</span></div><div v-if="crossShop" class="platform-picker"><span class="platform-picker__label">目标店参数</span><template v-if="availablePlatforms.includes('xhs')"><span class="muted-copy">运费模板</span><el-select v-model="targetShopSettings.xhsShippingId" :loading="targetSettingsLoading" style="width:260px"><el-option v-for="item in targetPlatformSettings.xhsShipping" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select><span class="muted-copy">物流方案</span><el-select v-model="targetShopSettings.xhsLogisticsId" :loading="targetSettingsLoading" style="width:230px"><el-option v-for="item in targetPlatformSettings.xhsLogistics" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select></template><template v-if="availablePlatforms.includes('wechat')"><span class="muted-copy">运费模板</span><el-select v-model="targetShopSettings.wechatFreightId" :loading="targetSettingsLoading" style="width:260px"><el-option v-for="item in targetPlatformSettings.wechatFreight" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select></template><span class="muted-copy">跨店发布：类目/属性沿用当前批次映射，运费模板与物流方案按目标店铺选择</span></div><el-alert v-if="errorCount" type="error" :closable="false" show-icon title="仍有校验错误，不能发布" /><div class="bulk-filters" style="margin-bottom:12px"><el-input v-model="productKeyword" clearable :prefix-icon="Search" placeholder="搜索商品编码、标题或内部类目" style="width:300px" @clear="resetProductPage" @input="resetProductPage" /><el-select v-model="productPublishFilter" style="width:205px" @change="resetProductPage"><el-option :label="`全部 (${products.length})`" value="all" /><el-option :label="`仅看未发布 (${publishCounts.none})`" value="none" /><el-option :label="`仅看已发布 (${publishCounts.success})`" value="success" /><el-option :label="`仅看发布失败 (${publishCounts.failed})`" value="failed" /><el-option :label="`仅看发布中 (${publishCounts.pending})`" value="pending" /></el-select><el-button :loading="publishStatusLoading" @click="loadPublishStatus">刷新发布状态</el-button><el-button :loading="verifyingPublishStatus" title="把本地“已发布”记录拿去平台核对：在后台删掉的商品会自动改回“未发布”，可以重新发布" @click="verifyPublishStatus('verify')">核对发布状态</el-button><el-button v-if="selectedProductCodes.size" link type="warning" :loading="verifyingPublishStatus" title="确认这些商品已在平台后台删除，直接改回“未发布”（小红书核对不出时用它兜底）" @click="verifyPublishStatus('reset')">标记未发布 ({{ selectedProductCodes.size }})</el-button><span class="muted-copy">筛选后 {{ filteredProducts.length }} 件</span></div><div class="bulk-selection-bar"><div class="bulk-selection-bar__info"><span>共 <strong>{{ products.length }}</strong> 件商品，筛选后 <strong>{{ filteredProducts.length }}</strong> 件，已选 <strong>{{ selectedProductCodes.size }}</strong> 件</span><el-button link size="small" @click="toggleSelectAllFiltered">{{ allFilteredSelected ? '取消全选筛选结果' : '全选筛选结果' }}</el-button><el-button v-if="selectedProductCodes.size" link size="small" @click="clearSelection">清空选择</el-button><span v-if="selectedPublished.length" style="color:#e6a23c">⚠ 已选中有 {{ selectedPublished.length }} 件已经发布过，发布会因标题重复被平台拒</span><el-button v-if="selectedPublished.length" link type="warning" size="small" @click="dropPublishedSelection">移除已发布的</el-button></div></div><el-table ref="productTableRef" :data="pagedProducts" row-key="product_code" max-height="360" style="margin-bottom:16px" @selection-change="onSelectionChange" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }"><el-table-column type="selection" width="50" reserve-selection /><el-table-column prop="product_code" label="商品编码" width="150" show-overflow-tooltip /><el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip /><el-table-column prop="internal_category" label="内部类目" min-width="180" show-overflow-tooltip /><el-table-column label="发布状态" width="110" align="center"><template #default="{ row }"><el-tag v-if="productPublishState(row.product_code) === 'success'" type="success" size="small" :title="productPublishedAt(row.product_code) ? `已经在所选平台发布过（最近成功：${formatPublishTime(productPublishedAt(row.product_code))}），再发会被平台以「标题重复」拒绝` : '该商品已经发布成功过，再发会被平台以「标题重复」拒绝'">已发布</el-tag><el-tag v-else-if="productPublishState(row.product_code) === 'pending'" type="info" size="small">发布中</el-tag><el-tag v-else-if="productPublishState(row.product_code) === 'failed'" type="danger" size="small" title="发过但失败了，看下方发布进度的失败原因">发布失败</el-tag><span v-else class="muted-copy">未发布</span></template></el-table-column><el-table-column label="属性状态" width="130" show-overflow-tooltip><template #default="{ row }"><el-tag :type="productAttrTagType(row)" size="small">{{ productAttrCount(row) }} 项已配</el-tag></template></el-table-column><el-table-column label="SKU 提醒" width="110"><template #default="{ row }"><el-tooltip v-if="row.warnings?.length" placement="top"><template #content><div v-for="(w, i) in row.warnings" :key="i">{{ w }}</div></template><el-tag type="warning" size="small">{{ row.warnings.length }} 项不一致</el-tag></el-tooltip><span v-else class="muted-copy">--</span></template></el-table-column><el-table-column label="操作" width="100" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="openReview(row)">审核编辑</el-button></template></el-table-column></el-table><el-alert v-if="publishGuardGaps.length" type="error" :closable="false" show-icon style="margin:12px 0 0" title="以下必填项没选，发布会被平台整批拒掉，已阻止发布"><div v-for="gap in publishGuardGaps" :key="gap">{{ gap }}</div><div style="margin-top:6px"><el-button link type="primary" :icon="ArrowLeft" @click="step = 2">去「平台映射」选择运费模板 / 物流方案</el-button></div></el-alert><div class="form-actions"><el-button :icon="ArrowLeft" @click="goBackStep">返回上一步</el-button><div style="display:flex;gap:8px"><el-button :loading="loading" :disabled="!platforms.length || errorCount > 0 || !selectedProductCodes.size" title="优先执行：选中的这几件会插到队列前面，不必排在其它批次的大任务后面" @click="publish(true)">发布选中 ({{ selectedProductCodes.size }}) · 优先</el-button><el-button type="primary" :loading="loading" :disabled="!platforms.length || errorCount > 0 || publishGuardGaps.length" :icon="Check" @click="publish(false)">全部发布 ({{ products.length }})</el-button></div></div></section>
     <section v-if="currentJob" class="content-panel bulk-card" style="margin-top:16px">
-      <div class="bulk-summary"><strong>发布进度</strong><span>{{ currentJob.processed }}/{{ currentJob.total }}</span><el-tag>{{ jobStatusText(currentJob.status) }}</el-tag><el-button v-if="currentJob.items?.length" size="small" @click="exportJobResult">导出结果</el-button><el-button v-if="currentJob.items?.some((item) => item.status === 'failed')" size="small" type="warning" :loading="retrying" @click="retryFailedItems()">重试全部失败</el-button></div>
+      <div class="bulk-summary"><strong>发布进度</strong><span>{{ currentJob.processed }}/{{ currentJob.total }}</span><el-tag>{{ jobStatusText(currentJob.status) }}</el-tag><el-button v-if="currentJob.items?.length" size="small" @click="exportJobResult">导出结果</el-button><el-button v-if="currentJob.items?.some((item) => item.platform_product_id)" size="small" type="primary" plain :loading="writebacking" @click="writebackHuopaiIds">回填ID到货盘表</el-button><el-button v-if="currentJob.items?.some((item) => item.status === 'failed')" size="small" type="warning" :loading="retrying" @click="retryFailedItems()">重试全部失败</el-button></div>
       <el-progress :percentage="currentJob.total ? Math.round(currentJob.processed * 100 / currentJob.total) : 0" />
       <el-table :data="currentJob.items" max-height="320" style="margin-top:12px" :tooltip-options="{ effect: 'light', showAfter: 0, hideAfter: 0 }">
         <el-table-column prop="product_code" label="商品编码" show-overflow-tooltip />

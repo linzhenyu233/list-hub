@@ -156,6 +156,9 @@ button, input { font-family: inherit; }
 /* 导入行：服务器货盘表下拉在桌面端保持固定宽度，不抢占整行剩余空间；
    窄屏（700px 以下）才自动换行并撑满整行 */
 .bulk-import-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 12px; }
+/* 运费模板/物流方案没选：红字 + 红框提醒，发布按钮同时会被拦住（见 BulkPublishPanel.platformSettingGaps） */
+.setting-required-hint { color: #d92d20; font-size: 12px; }
+.setting-required-select .el-select__wrapper { box-shadow: 0 0 0 1px #f0a6a0 inset; }
 .bulk-import-row .el-select { flex: 0 1 320px; min-width: 200px; }
 .bulk-summary { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; color: #667085; font-size: 13px; }
 .bulk-mapping-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; margin-top: 22px; }
