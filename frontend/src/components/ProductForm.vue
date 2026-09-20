@@ -244,6 +244,9 @@ watch(attrDefs, () => {
 // 不再一次性把用不到的维度都铺在页面上。
 const activeSpecNames = ref([])
 
+// 微信小店后台最多 4 个规格维度（颜色/尺码/材质…），超过平台不认，这里就卡住不让加
+const MAX_SPEC_DIMS = 4
+
 const activeSpecDefs = computed(() => activeSpecNames.value
   .map((name) => specDefs.value.find((d) => d.name === name))
   .filter(Boolean))
@@ -350,6 +353,10 @@ function cleanSpecValues() {
 // 微信的 sku_attrs.attr_key 是自由文本，所以自定义规格名能发出去；
 // 但平台对类目规格有校验，万一提交被拒，换成类目提供的规格名即可。
 function addSpecDim() {
+  if (activeSpecNames.value.length >= MAX_SPEC_DIMS) {
+    ElMessage.warning(`微信小店最多 ${MAX_SPEC_DIMS} 个规格`)
+    return
+  }
   const next = availableSpecDefs.value[0]
   if (next) {
     if (!Array.isArray(specValues[next.name])) specValues[next.name] = []
@@ -658,11 +665,16 @@ async function submit() {
           </div>
         </div>
         <div class="spec-rows-footer">
-          <el-button text type="primary" :icon="Plus" @click="addSpecDim">
-            {{ availableSpecDefs.length ? `新增规格（${availableSpecDefs[0].name}）` : '自定义规格' }}
-          </el-button>
-          <span v-if="!activeSpecNames.length" class="muted-copy">
-            {{ specDefs.length ? '不添加规格将生成单个默认 SKU' : '该类目没有预置规格，可点「自定义规格」自己加' }}
+          <el-tooltip :disabled="activeSpecNames.length < MAX_SPEC_DIMS" content="微信小店最多 4 个规格" placement="top">
+            <span class="spec-add-wrap">
+              <el-button text type="primary" :icon="Plus" :disabled="activeSpecNames.length >= MAX_SPEC_DIMS" @click="addSpecDim">
+                {{ availableSpecDefs.length ? `新增规格（${availableSpecDefs[0].name}）` : '自定义规格' }}
+              </el-button>
+            </span>
+          </el-tooltip>
+          <span class="muted-copy">
+            <template v-if="activeSpecNames.length">已添加 {{ activeSpecNames.length }}/{{ MAX_SPEC_DIMS }} 个规格</template>
+            <template v-else>{{ specDefs.length ? '不添加规格将生成单个默认 SKU' : '该类目没有预置规格，可点「自定义规格」自己加' }}</template>
           </span>
         </div>
       </div>

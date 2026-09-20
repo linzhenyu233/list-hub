@@ -113,6 +113,7 @@ button, input { font-family: inherit; }
 .spec-dim-tools { display: flex; align-items: center; gap: 6px; color: #525a67; font-size: 12px; white-space: nowrap; }
 .spec-manual-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .spec-rows-footer { display: flex; align-items: center; gap: 10px; }
+.spec-add-wrap { display: inline-flex; }   /* 按钮禁用后 el-tooltip 仍能有 hover 目标 */
 /* 开「配图」后，该规格每个值占一个图位（同色各尺码共用这张图） */
 .spec-value-images { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; padding: 12px 0 2px; }
 .spec-value-image { width: 72px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
