@@ -58,18 +58,25 @@ from wechat_store_client import WxStore
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
 import shop_registry
+import api_auth
 
 load_project_env()
 
 # ------------------------------------------------------------------
 # 配置（host/port/cors 仍是进程级；凭证改为按店铺取，见 store_for）
 # ------------------------------------------------------------------
-API_HOST = os.environ.get("WX_API_HOST", "0.0.0.0")
+# 默认只监听本机：原先 0.0.0.0 + 无鉴权，局域网内任意机器都能直接调发布/删商品接口。
+# 确需局域网直连时设 WX_API_HOST=0.0.0.0，并务必配好 API_KEY。
+API_HOST = os.environ.get("WX_API_HOST", "127.0.0.1")
 API_PORT = int(os.environ.get("WX_API_PORT", "8000"))
 CORS_ORIGINS = [item.strip() for item in os.environ.get("CORS_ORIGINS", "*").split(",") if item.strip()]
 
 # 创建 FastAPI 应用(标题/版本会在 /docs 文档页显示)
 app = FastAPI(title="微信小店自动上链接服务", version="0.2.0")
+
+# 鉴权：X-API-Key（未配置 API_KEY 时只告警不拦截，见 api_auth.py）。
+# 必须在 add_middleware(CORS) 之前装，否则 401 响应不经过 CORS 中间件。
+api_auth.install(app, "wechat-api")
 
 # CORS:允许前端页面跨域调用(开发期全放行,上线换成前端具体域名)
 app.add_middleware(
@@ -530,5 +537,6 @@ def list_products(request: Request,
 # ==================================================================
 if __name__ == "__main__":
     import uvicorn
-    # host=0.0.0.0 允许局域网/其他机器访问;port 默认 8000,可改
+    # host 默认 127.0.0.1（仅本机/前端代理访问）；确需局域网直连时设 WX_API_HOST=0.0.0.0
+    # 并配好 API_KEY。port 默认 8000,可改。
     uvicorn.run(app, host=API_HOST, port=API_PORT)

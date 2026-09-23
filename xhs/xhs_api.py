@@ -77,6 +77,7 @@ from xhs_store import XhsStore
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
 import shop_registry
+import api_auth
 
 load_project_env()
 
@@ -91,13 +92,19 @@ LEGACY_TOKEN_FILE = os.environ.get(
 )
 # 多店铺:token 目录，每店一个 <shop_id>.json
 TOKEN_DIR = os.environ.get("XHS_TOKEN_DIR", os.path.join(_BASE_DIR, "tokens"))
-API_HOST = os.environ.get("XHS_API_HOST", "0.0.0.0")
+# 默认只监听本机：原先 0.0.0.0 + 无鉴权，局域网内任意机器都能直接调发布/删商品接口。
+# 确需局域网直连时设 XHS_API_HOST=0.0.0.0，并务必配好 API_KEY。
+API_HOST = os.environ.get("XHS_API_HOST", "127.0.0.1")
 API_PORT = int(os.environ.get("XHS_API_PORT", "8010"))
 CORS_ORIGINS = [item.strip() for item in os.environ.get("CORS_ORIGINS", "*").split(",") if item.strip()]
 
 
 # 创建 FastAPI 应用
 app = FastAPI(title="小红书运营后台服务", version="0.2.0")
+
+# 鉴权：X-API-Key（未配置 API_KEY 时只告警不拦截，见 api_auth.py）。
+# 必须在 add_middleware(CORS) 之前装，否则 401 响应不经过 CORS 中间件。
+api_auth.install(app, "xhs-api")
 
 # CORS:允许前端跨域(开发期全放行,上线改成前端具体域名)
 app.add_middleware(
@@ -201,7 +208,10 @@ def _load_token(shop_id: str) -> dict:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as exc:
+            # 静默 return {} 会把"token 文件损坏"变成"从没授权过"，
+            # 上层只报鉴权失败，排查不到根因，必须留痕。
+            print(f"[xhs-api] WARN: 店铺 {shop_id} 的 token 文件不可读({path}): {exc}", flush=True)
             return {}
     return {}
 
@@ -242,8 +252,10 @@ def _get_access_token(shop_id: str, conf: dict) -> str:
     if refresh and expire_at and time.time() > expire_at - 1800:
         try:
             access = _refresh_access_token(shop_id, conf)
-        except Exception:
-            pass  # 续期失败不阻塞本次调用,让业务接口自己报鉴权错
+        except Exception as exc:
+            # 续期失败不阻塞本次调用,让业务接口自己报鉴权错；但必须留痕，
+            # 否则线上只看到"鉴权失败"，分不清是 refreshToken 过期还是网络问题。
+            print(f"[xhs-api] WARN: 店铺 {shop_id} refreshToken 自动续期失败: {exc}", flush=True)
     return access
 
 
@@ -584,7 +596,9 @@ def _material_url_ready(url: str) -> bool:
     try:
         resp = requests.head(url, timeout=10, allow_redirects=True)
         return resp.status_code in (200, 206)
-    except Exception:
+    except Exception as exc:
+        # 探测失败按"未就绪"处理，但留痕：否则视频上传超时看不出是网络问题
+        print(f"[xhs-api] WARN: 素材地址探测失败(按未就绪处理) {url}: {exc}", flush=True)
         return False
 
 
@@ -597,7 +611,10 @@ def _wait_video_material(sid: str, data: dict) -> dict:
     while True:
         try:
             details = _xhs_call("material.queryMaterial", {"materialId": material_id}, shop_id=sid) or {}
-        except HTTPException:
+        except HTTPException as exc:
+            # 转码中平台可能报错，这里继续轮询；留痕是为了"2 分钟没就绪"时能定位原因
+            print(f"[xhs-api] WARN: 查询视频素材 {material_id} 失败(继续等待): "
+                  f"{getattr(exc, 'detail', exc)}", flush=True)
             details = {}
         hit = next((d for d in (details.get("materialDetailList") or [])
                     if d.get("materialId") == material_id), None)
@@ -671,9 +688,9 @@ def upload_material_file(request: Request, body: dict = Body(...)):
                     img.save(buf, format=fmt if fmt in ("PNG", "WEBP") else "PNG")
                 content = buf.getvalue()
                 encoded = base64.b64encode(content).decode("ascii")
-        except Exception:
-            # 放大失败就传原图,不阻塞
-            pass
+        except Exception as exc:
+            # 放大失败就传原图,不阻塞；留痕便于判断平台是否因分辨率拒图
+            print(f"[xhs-api] WARN: 素材图放大失败,改传原图: {exc}", flush=True)
     elif len(content) > 20 * 1024 * 1024:
         # 小红书不像微信支持分块:视频要 base64 后一次 POST,而网关请求体约 30MB 封顶,
         # base64 放大 1/3 → 视频实际上限约 22MB,这里取 20MB 留余量(前端也用同一数值)。
@@ -777,6 +794,10 @@ def list_items(request: Request,
     return {"ok": True, "result": data}
 
 
+# 平台单次查询上限（原代码是直接 [:20] 截断）
+MAX_STATUS_IDS = 20
+
+
 @app.post("/items/status")
 def items_status(request: Request, body: dict = Body(..., example={"item_ids": ["itemId1", "itemId2"]})):
     """批量查审核状态(前端列表页每5分钟刷一次)。
@@ -787,7 +808,11 @@ def items_status(request: Request, body: dict = Body(..., example={"item_ids": [
     item_ids = body.get("item_ids") or []
     if not item_ids:
         raise HTTPException(status_code=400, detail="请求体需要 item_ids 列表")
-    item_ids = item_ids[:20]
+    # 超出的部分原先被静默丢掉，前端以为全查过了，表现是"有些商品一直没有审核状态"，
+    # 所以这里记录截断情况并在响应里显式回传（见下方 truncated/skipped/message）。
+    requested = len(item_ids)
+    item_ids = item_ids[:MAX_STATUS_IDS]
+    truncated = requested > len(item_ids)
     _get_access_token(sid, conf)  # 并发查询前先完成一次 token 检查或刷新
 
     def fetch_status(item_id):
@@ -806,13 +831,27 @@ def items_status(request: Request, body: dict = Body(..., example={"item_ids": [
             return {"itemId": item_id,
                     "name": (data.get("itemInfo") or {}).get("name"),
                     "skus": skus}
-        except HTTPException:
-            return {"itemId": item_id, "name": None, "skus": [], "error": "查询失败"}
+        except HTTPException as exc:
+            detail = str(getattr(exc, "detail", exc))[:300]
+            # 单条失败不影响其余商品，但要留痕：否则前端只显示"查询失败"，
+            # 分不清是限流、token 失效还是商品已被删。
+            print(f"[xhs-api] WARN: 查询商品 {item_id} 状态失败: {detail}", flush=True)
+            return {"itemId": item_id, "name": None, "skus": [], "error": "查询失败",
+                    "error_detail": detail}
 
     # 商品详情互不依赖，限制为最多 5 个并发，兼顾速度与平台限流。
     with ThreadPoolExecutor(max_workers=min(5, len(item_ids))) as pool:
         results = list(pool.map(fetch_status, item_ids))
-    return {"ok": True, "total": len(results), "result": results}
+    return {
+        "ok": True,
+        "total": len(results),
+        "requested": requested,
+        "truncated": truncated,
+        "skipped": requested - len(item_ids),
+        "message": (f"一次最多查询 {MAX_STATUS_IDS} 个商品，本次只查了前 {MAX_STATUS_IDS} 个，"
+                    f"其余 {requested - len(item_ids)} 个未查询，请分批重试") if truncated else "",
+        "result": results,
+    }
 
 
 @app.post("/skus/{sku_id}/available")

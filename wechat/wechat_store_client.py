@@ -158,7 +158,10 @@ class WxStore:
                 timeout=10,
             )
             data = resp.json() or {}
-        except Exception:
+        except Exception as exc:
+            # 静默吞掉会把"网络/接口报错"伪装成"没拿到 token"：紧接着回退老接口
+            # 再失败，最终只报一句"获取 access_token 失败"，排查不到根因。
+            print(f"[wechat] WARN: stable_token 接口调用失败，回退旧接口: {exc}", flush=True)
             data = {}
 
         if "access_token" not in data:
