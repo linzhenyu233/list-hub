@@ -29,6 +29,7 @@
     POST /token/test                   测试凭证是否有效
     GET  /categories?keyword=珠宝      查类目(返回每级的 cat_id)
     POST /images/upload                上传图片 {"img_url": "..."}
+    POST /videos/upload-file           上传本地视频 {"filename": "...", "content_base64": "..."}
     POST /products                     发布商品(草稿) {"product": {...}}
     POST /products/{pid}/update        更新商品 {"product": {...}}
     POST /products/{pid}/listing       上架商品
@@ -317,6 +318,30 @@ def upload_image_file(request: Request, body: dict = Body(...)):
         raise HTTPException(status_code=400, detail="图片为空或超过 20MB")
     filename = os.path.basename(str(body.get("filename") or "image.jpg"))[:100]
     return ok_or_400(store.upload_image_bytes, content, filename)
+
+
+@app.post("/videos/upload-file")
+def upload_video_file(request: Request, body: dict = Body(...)):
+    """上传本地视频(商品视频),返回微信给的视频临时 URL(发品时填 video_url)。
+
+    微信视频是分块上传(申请→分块→完成→轮询取URL),比图片慢得多;
+    轮询等转码最长约 5 分钟,所以前端调用要给足超时。
+    """
+    shop = shop_of(request)
+    store = store_for(shop)
+    encoded = body.get("content_base64")
+    if not encoded:
+        raise HTTPException(status_code=400, detail="请求体需要 content_base64 字段")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="content_base64 编码无效")
+    if not content:
+        raise HTTPException(status_code=400, detail="视频内容为空")
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="视频超过 50MB")
+    filename = os.path.basename(str(body.get("filename") or "video.mp4"))[:100]
+    return ok_or_400(store.upload_video_bytes, content, filename)
 
 
 @app.get("/freight-templates")

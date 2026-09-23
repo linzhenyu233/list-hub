@@ -6,6 +6,7 @@ import { storeApi } from '../api'
 import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
 import MediaUploader from './MediaUploader.vue'
+import VideoUploader from './VideoUploader.vue'
 import { longestOf, textWidth } from '../skuTableWidth'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
@@ -214,6 +215,13 @@ async function uploadWechatImage({ filename, contentBase64 }) {
   const data = await storeApi.uploadImageFile(filename, contentBase64)
   const result = data?.result
   return typeof result === 'string' ? result : (result?.img_url || result?.url || '')
+}
+
+// 商品视频：调 /videos/upload-file（微信分块上传 + 等转码），拿回视频临时 URL 填进 video_url。
+async function uploadWechatVideo({ filename, contentBase64 }) {
+  const data = await storeApi.uploadVideoFile(filename, contentBase64)
+  const result = data?.result
+  return typeof result === 'string' ? result : (result?.url || '')
 }
 
 async function searchCategories() {
@@ -677,9 +685,6 @@ async function submit() {
         <el-form-item label="商品毛重（克）">
           <el-input v-model="form.weight" placeholder="例如：500（将作为属性传给平台）" />
         </el-form-item>
-        <el-form-item label="商品视频链接">
-          <el-input v-model="form.video_url" placeholder="https://example.com/product.mp4（可选）" />
-        </el-form-item>
       </div>
       <el-form-item label="商品描述">
         <el-input v-model="form.description" type="textarea" :rows="3" placeholder="商品详情文字描述（可选，对应 desc_info.detail）" />
@@ -699,13 +704,15 @@ async function submit() {
 
     <section class="form-section">
       <div class="section-heading">
-        <div><h3>商品素材</h3><p>选择本地图片，直接上传到微信素材库（不用再找公网地址）</p></div>
+        <div><h3>商品素材</h3><p>选择本地图片/视频，直接上传到微信素材库（不用再找公网地址）</p></div>
         <span class="section-index">02</span>
       </div>
       <div class="field-label">商品主图 <span>至少 3 张，最多 9 张 · 第 1 张为首图</span></div>
       <MediaGallery v-model="form.head_imgs" :max="9" :upload="uploadWechatImage" />
       <div class="field-label description-label">详情图片 <span>可选，最多 50 张</span></div>
       <MediaGallery v-model="form.desc_imgs" :max="50" :upload="uploadWechatImage" />
+      <div class="field-label description-label">商品视频 <span>可选 · 本地直传</span></div>
+      <VideoUploader v-model="form.video_url" :upload="uploadWechatVideo" />
     </section>
 
     <section v-if="attrDefs.length" class="form-section">

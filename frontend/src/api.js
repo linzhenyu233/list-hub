@@ -32,6 +32,9 @@ export const storeApi = {
   // 直接上传本地图片：前端读成 base64 → 微信二进制上传接口 → 返回可发品的图片地址，
   // 运营不用再自己找公网图片地址（与批量发布里的补图/换图同一条链路）。
   uploadImageFile: (filename, contentBase64) => http.post('/images/upload-file', { filename, content_base64: contentBase64 }),
+  // 本地视频直传：微信视频是「分块上传 + 等转码」，比图片慢很多，超时给到 10 分钟
+  uploadVideoFile: (filename, contentBase64) =>
+    http.post('/videos/upload-file', { filename, content_base64: contentBase64 }, { timeout: 600000 }),
   // shopId 可选：不传用"当前选中店铺"，传了就用指定店铺（跨店发布要按目标店取该店运费模板）
   freightTemplates: (params = {}, shopId = '') => http.get('/freight-templates', { params, headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   // 按品牌 ID 查品牌名（编辑商品时把 10002926 显示成「钻石世家」）。一次请求即可，无需翻页。

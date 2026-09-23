@@ -1,4 +1,4 @@
-﻿<script setup>
+<script setup>
 import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -626,10 +626,10 @@ onMounted(async () => {
           <el-alert v-if="!serviceOnline" title="暂时无法连接服务" description="请检查平台服务是否已启动。" type="warning" show-icon :closable="false" class="offline-alert" />
 
           <div class="stats-grid">
-            <div class="stat-item"><span>商品总数</span><strong>{{ stats.ready ? stats.all : '—' }}</strong><el-icon><Goods /></el-icon></div>
-            <div class="stat-item"><span>销售中</span><strong>{{ stats.ready ? stats.online : '—' }}</strong><el-icon class="green"><CircleCheck /></el-icon></div>
-            <div class="stat-item"><span>未上架</span><strong>{{ stats.ready ? stats.draft : '—' }}</strong><el-icon class="gray"><EditPen /></el-icon></div>
-            <div class="stat-item"><span>已下架</span><strong>{{ stats.ready ? stats.offline : '—' }}</strong><el-icon class="amber"><Remove /></el-icon></div>
+            <div class="stat-item"><strong>{{ stats.ready ? stats.all : '—' }}</strong><span>商品总数</span><el-icon><Goods /></el-icon></div>
+            <div class="stat-item"><strong>{{ stats.ready ? stats.online : '—' }}</strong><span>销售中</span><el-icon class="green"><CircleCheck /></el-icon></div>
+            <div class="stat-item"><strong>{{ stats.ready ? stats.draft : '—' }}</strong><span>未上架</span><el-icon class="gray"><EditPen /></el-icon></div>
+            <div class="stat-item"><strong>{{ stats.ready ? stats.offline : '—' }}</strong><span>已下架</span><el-icon class="amber"><Remove /></el-icon></div>
           </div>
 
           <section class="content-panel">

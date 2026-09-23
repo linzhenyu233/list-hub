@@ -222,6 +222,10 @@ button, input { font-family: inherit; }
 @media (hover: none) {
   .media-card__tools { opacity: 1; background: rgba(17, 24, 39, .32); }
 }
+/* 单块素材并排（如「商品视频 + 透明图」）：靠左紧挨，各按自身宽度。
+   不用 form-grid-2 —— 那是等宽两列，小方块待在半个版心里会留出大片空白。 */
+.media-inline { display: flex; align-items: flex-start; gap: 28px; margin-top: 16px; }
+.media-inline > .el-form-item { flex: 0 0 auto; margin-bottom: 0; }
 .compact-section { padding-bottom: 16px; }
 .switch-list { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 28px; }
 .switch-list > div { display: flex; align-items: center; justify-content: space-between; gap: 20px; font-size: 13px; }

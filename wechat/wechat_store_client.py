@@ -59,6 +59,21 @@ SECRET = os.environ.get("WX_SECRET", "")
 DEFAULT_FREIGHT_TEMPLATE_ID = os.environ.get("WX_FREIGHT_TEMPLATE_ID", "")
 DEFAULT_AFTER_SALE_ADDRESS_ID = os.environ.get("WX_AFTER_SALE_ADDRESS_ID", "")
 
+# ------------------------------------------------------------------
+# 视频上传(商品视频)相关常量。
+# 微信的视频上传跟图片不一样:图片是一次 POST,视频是"申请→分块→完成→轮询取URL"四步。
+#   1) /shop/ec/basics/video/initupload    申请上传,拿 video_upload_key
+#   2) /shop/ec/basics/video/uploadpart    分块上传(1~2MB/块),每块回一个 part_sha
+#   3) /shop/ec/basics/video/finishupload  回传各块 partnum+part_sha,服务端校验连续性与 SHA
+#   4) /shop/ec/basics/video/getplayinfo   轮询取视频临时URL(转码中返回 10020347,需重试)
+# ------------------------------------------------------------------
+VIDEO_SCENE_TYPE_PRODUCT = 162        # 162=商品视频(≤500MB、≤180秒);173=售后视频(≤20MB)
+VIDEO_PART_SIZE = 1536 * 1024         # 分块大小:官方支持 1~2MB;非最后一块不得小于 1MB。
+                                      # 取 1.5MB 而非 2MB:实测 2*1024*1024(2MiB) 会报
+                                      # 45002 content size out of limit(平台按 2MB 为界,还要算 multipart 开销)
+VIDEO_POLL_INTERVAL = 3               # 秒:轮询取URL的间隔
+VIDEO_POLL_TIMEOUT = 300              # 秒:等转码完成的上限
+
 
 class WxStore:
     """
@@ -357,6 +372,101 @@ class WxStore:
         if not image_url:
             raise RuntimeError(f"[img_upload_file] 响应中没有 img_url: {data}")
         return image_url
+
+    # =================================================================
+    # 接口 1-B:上传视频(商品视频) —— 分块上传四步走
+    # =================================================================
+    def upload_video_bytes(self, content, filename="video.mp4", scene_type=VIDEO_SCENE_TYPE_PRODUCT):
+        """分块上传视频,返回微信给的视频临时 URL(填商品 video_url)。
+
+        临时 URL 会带过期时间戳,但官方明确"URL 失效后仍不影响提交"——
+        拿到后尽快提交到发品接口即可,不需要长期保存。
+        """
+        if not content:
+            raise RuntimeError("[video_upload] 视频内容为空")
+
+        # 1) 申请上传,换取本次上传流程的 video_upload_key
+        init = self._post("/shop/ec/basics/video/initupload", {
+            "scene_type": scene_type,
+            "file_type": "mp4",
+            "file_size": len(content),
+        })
+        upload_key = (init.get("data") or {}).get("video_upload_key")
+        if not upload_key:
+            raise RuntimeError(f"[video_upload] 申请上传未返回 video_upload_key: {init}")
+
+        # 2) 按块上传,收集每块的 part_sha(完成上传时要回传)
+        finish_parts = []
+        for partnum, start in enumerate(range(0, len(content), VIDEO_PART_SIZE), start=1):
+            chunk = content[start:start + VIDEO_PART_SIZE]
+            finish_parts.append({
+                "partnum": partnum,
+                "part_sha": self._upload_video_part(upload_key, partnum, chunk),
+            })
+
+        # 3) 完成上传:服务端校验分片连续且 SHA 匹配
+        self._post("/shop/ec/basics/video/finishupload", {
+            "video_upload_key": upload_key,
+            "finish_parts": finish_parts,
+        })
+
+        # 4) 轮询取视频临时 URL(后台还要转码)
+        return self._poll_video_url(upload_key)
+
+    def _upload_video_part(self, upload_key, partnum, chunk):
+        """上传一个视频分块,返回服务端计算的 part_sha(SHA1)。"""
+        for attempt in (0, 1):
+            params = {
+                "access_token": self.get_access_token(force=attempt == 1),
+                "video_upload_key": upload_key,
+                "partnum": partnum,
+            }
+            response = requests.post(
+                f"{self.BASE}/shop/ec/basics/video/uploadpart",
+                params=params,
+                files={"media": (f"part{partnum}", chunk)},
+                timeout=120,
+            )
+            data = response.json()
+            errcode = data.get("errcode", 0)
+            if errcode == 0:
+                part_sha = (data.get("data") or {}).get("part_sha")
+                if not part_sha:
+                    raise RuntimeError(f"[video_upload] 分块 {partnum} 未返回 part_sha: {data}")
+                return part_sha
+            if errcode in self.TOKEN_ERROR_CODES and attempt == 0:
+                continue          # token 被顶掉,强刷后重传该块
+            raise RuntimeError(f"[video_upload] 分块 {partnum} 上传失败: {data}")
+
+    def _poll_video_url(self, upload_key):
+        """轮询视频播放地址:转码中会返回 10020347,需要继续等。"""
+        deadline = time.time() + VIDEO_POLL_TIMEOUT
+        while True:
+            for attempt in (0, 1):
+                params = {
+                    "access_token": self.get_access_token(force=attempt == 1),
+                    "video_upload_key": upload_key,
+                }
+                response = requests.get(
+                    f"{self.BASE}/shop/ec/basics/video/getplayinfo",
+                    params=params,
+                    timeout=30,
+                )
+                data = response.json()
+                errcode = data.get("errcode", 0)
+                if errcode == 0:
+                    url = (data.get("data") or {}).get("url")
+                    if url:
+                        return url
+                    break
+                if errcode in self.TOKEN_ERROR_CODES and attempt == 0:
+                    continue
+                if errcode == 10020347:
+                    break         # 还在转码,稍后再轮询
+                raise RuntimeError(f"[video_upload] 取视频地址失败: {data}")
+            if time.time() >= deadline:
+                raise RuntimeError("[video_upload] 视频已上传,但等待转码超时(约 5 分钟)")
+            time.sleep(VIDEO_POLL_INTERVAL)
 
     def get_category_detail(self, cat_id):
         """获取叶子类目详情(属性定义 + 规格定义)。

@@ -556,6 +556,47 @@ def attribute_values(
 # ==================================================================
 # 发品页:素材上传
 # ==================================================================
+# 视频素材是异步转码的:material.uploadMaterial 返回时 url 还是 null(status=2),
+# 要轮询 material.queryMaterial 等转码完成(status=1)才拿到可用地址。
+VIDEO_TRANSCODE_TIMEOUT = 120    # 秒:等待转码上限
+VIDEO_TRANSCODE_INTERVAL = 3     # 秒:轮询间隔
+
+
+def _material_url_ready(url: str) -> bool:
+    """素材 CDN 地址是否真的能取到。
+
+    刚上传时接口就可能给出 url,但 CDN 上还没同步(取到的是 404),这种地址交给前端也播不了。
+    """
+    try:
+        resp = requests.head(url, timeout=10, allow_redirects=True)
+        return resp.status_code in (200, 206)
+    except Exception:
+        return False
+
+
+def _wait_video_material(sid: str, data: dict) -> dict:
+    """等视频转码完成、且素材地址真的能取到,再返回(超时给明确错误)。"""
+    material_id = (data or {}).get("materialId")
+    if not material_id:
+        raise HTTPException(status_code=400, detail="视频上传成功但未返回 materialId")
+    deadline = time.time() + VIDEO_TRANSCODE_TIMEOUT
+    while True:
+        try:
+            details = _xhs_call("material.queryMaterial", {"materialId": material_id}, shop_id=sid) or {}
+        except HTTPException:
+            details = {}
+        hit = next((d for d in (details.get("materialDetailList") or [])
+                    if d.get("materialId") == material_id), None)
+        if hit and hit.get("url") and _material_url_ready(hit["url"]):
+            return {**data, **hit}
+        if time.time() >= deadline:
+            raise HTTPException(
+                status_code=504,
+                detail="视频素材已上传,但约 2 分钟仍未就绪(平台还在转码,或素材已失效),请稍后重试",
+            )
+        time.sleep(VIDEO_TRANSCODE_INTERVAL)
+
+
 @app.post("/materials/upload")
 def upload_material(request: Request, body: dict = Body(..., example={"url": "https://你的图床/主图1.jpg"})):
     """传图:下载公网图片 → 上传小红书素材,返回素材URL(填进 images 字段)"""
@@ -576,42 +617,58 @@ def upload_material(request: Request, body: dict = Body(..., example={"url": "ht
 
 @app.post("/materials/upload-file")
 def upload_material_file(request: Request, body: dict = Body(...)):
-    """上传 Excel 中提取出的内嵌图片。"""
+    """上传本地文件到小红书素材库,返回素材 URL。
+
+    type=IMAGE(默认): Excel 内嵌图 / 前端选图,会放大到 ≥1200 长边;
+    type=VIDEO: 主图视频,不做图片处理,直接按视频素材上传。
+    """
     sid = shop_of(request)["shop_id"]
     encoded = body.get("content_base64")
     if not encoded:
         raise HTTPException(status_code=400, detail="请求体需要 content_base64 字段")
+    material_type = str(body.get("type") or "IMAGE").upper()
+    if material_type not in ("IMAGE", "VIDEO"):
+        raise HTTPException(status_code=400, detail=f"不支持的素材类型: {material_type}")
     try:
         content = base64.b64decode(encoded, validate=True)
     except Exception:
         raise HTTPException(status_code=400, detail="content_base64 编码无效")
-    if not content or len(content) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="图片为空或超过 20MB")
-    # 放大到至少 1200 长边,避免小红书 createItemV2 报「图片像素不低于800x800」
-    # (平台对 800x800 会再压缩到 <800,传 1200x1200 压完仍 ≥ 800)
-    try:
-        from PIL import Image
-        import io
-        img = Image.open(io.BytesIO(content))
-        w, h = img.size
-        if w < 1200 or h < 1200:
-            scale = max(1200.0 / w, 1200.0 / h)
-            new_size = (max(int(round(w * scale)), 1200), max(int(round(h * scale)), 1200))
-            img = img.resize(new_size, Image.LANCZOS)
-            buf = io.BytesIO()
-            fmt = (img.format or "JPEG").upper()
-            if fmt in ("JPG", "JPEG"):
-                img.save(buf, format="JPEG", quality=95)
-            else:
-                img.save(buf, format=fmt if fmt in ("PNG", "WEBP") else "PNG")
-            content = buf.getvalue()
-            encoded = base64.b64encode(content).decode("ascii")
-    except Exception:
-        # 放大失败就传原图,不阻塞
-        pass
-    name = os.path.basename(str(body.get("filename") or "material.jpg"))[:40]
+    if not content:
+        raise HTTPException(status_code=400, detail="文件内容为空")
+    if material_type == "IMAGE":
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="图片超过 20MB")
+        # 放大到至少 1200 长边,避免小红书 createItemV2 报「图片像素不低于800x800」
+        # (平台对 800x800 会再压缩到 <800,传 1200x1200 压完仍 ≥ 800)
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(content))
+            w, h = img.size
+            if w < 1200 or h < 1200:
+                scale = max(1200.0 / w, 1200.0 / h)
+                new_size = (max(int(round(w * scale)), 1200), max(int(round(h * scale)), 1200))
+                img = img.resize(new_size, Image.LANCZOS)
+                buf = io.BytesIO()
+                fmt = (img.format or "JPEG").upper()
+                if fmt in ("JPG", "JPEG"):
+                    img.save(buf, format="JPEG", quality=95)
+                else:
+                    img.save(buf, format=fmt if fmt in ("PNG", "WEBP") else "PNG")
+                content = buf.getvalue()
+                encoded = base64.b64encode(content).decode("ascii")
+        except Exception:
+            # 放大失败就传原图,不阻塞
+            pass
+    elif len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="视频超过 50MB")
+    default_name = "material.mp4" if material_type == "VIDEO" else "material.jpg"
+    name = os.path.basename(str(body.get("filename") or default_name))[:40]
     data = _xhs_call("material.uploadMaterial", {
-        "name": name, "type": "IMAGE", "materialContent": encoded}, shop_id=sid)
+        "name": name, "type": material_type, "materialContent": encoded}, shop_id=sid)
+    if material_type == "VIDEO" and not (data or {}).get("url"):
+        # 上传即刻返回的 url 为空(转码中),等转码完成再拿真实地址
+        data = _wait_video_material(sid, data)
     return {"ok": True, "result": data}
 
 

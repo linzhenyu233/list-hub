@@ -6,6 +6,7 @@ import { xhsApi } from '../xhsApi'
 import { currentShop } from '../shopContext'
 import MediaGallery from './MediaGallery.vue'
 import MediaUploader from './MediaUploader.vue'
+import VideoUploader from './VideoUploader.vue'
 import { longestOf, textWidth } from '../skuTableWidth'
 import { uploadLocalImage } from '../useMediaUpload'
 
@@ -507,14 +508,23 @@ const skuColumns = computed(() => {
 
 const skuTableWidth = computed(() => skuColumns.value.reduce((sum, column) => sum + column.width, 0))
 
-// 素材：本地图片 → 小红书素材库。
-// 旧流程要运营先在别处拿到公网图片地址、再点「上传」；现在直接调 /materials/upload-file，
-// 由后端把本地图片传给小红书素材接口拿回素材 URL（后端会自动放大到 ≥1200）。
-// 选图/换图/删除的交互都在 MediaGallery 组件里，这里只负责"把一张图传上去、返回地址"。
-async function uploadXhsImage({ filename, contentBase64 }) {
-  const data = await xhsApi.uploadMaterialFile(filename, contentBase64)
+// 素材：本地文件 → 小红书素材库。
+// 旧流程要运营先在别处拿到公网地址、再点「上传」；现在直接调 /materials/upload-file，
+// 由后端把本地文件传给小红书素材接口拿回素材 URL（图片会自动放大到 ≥1200）。
+// 选图/换图/删除的交互都在 MediaGallery / MediaUploader / VideoUploader 组件里，
+// 这里只负责"把一个文件传上去、返回地址"。
+function materialUrl(data) {
   const result = data?.result || {}
   return typeof result === 'string' ? result : (result.url || result.materialUrl || result.fileUrl || '')
+}
+
+async function uploadXhsImage({ filename, contentBase64 }) {
+  return materialUrl(await xhsApi.uploadMaterialFile(filename, contentBase64, 'IMAGE'))
+}
+
+// 商品视频：走同一条素材接口（type=VIDEO），返回视频素材地址填进 videoUrl
+async function uploadXhsVideo({ filename, contentBase64 }) {
+  return materialUrl(await xhsApi.uploadMaterialFile(filename, contentBase64, 'VIDEO'))
 }
 
 async function submit() {
@@ -799,14 +809,14 @@ onMounted(async () => {
     </section>
 
     <section class="form-section">
-      <div class="section-heading"><div><h3>小红书素材</h3><p>选择本地图片，直接上传到小红书素材库（不用再找公网地址）</p></div><span class="section-index">04</span></div>
+      <div class="section-heading"><div><h3>小红书素材</h3><p>选择本地图片/视频，直接上传到小红书素材库（不用再找公网地址）</p></div><span class="section-index">04</span></div>
       <div class="field-label">商品主图 <span>至少 1 张 · 第 1 张为首图</span></div>
       <MediaGallery v-model="form.images" :max="20" :upload="uploadXhsImage" />
       <div class="field-label description-label">详情图</div>
       <MediaGallery v-model="form.imageDescriptions" :max="50" :upload="uploadXhsImage" />
-      <div class="form-grid form-grid-2" style="margin-top: 16px">
-        <el-form-item label="商品视频链接"><el-input v-model="form.videoUrl" placeholder="https://.../video.mp4（可选）" /></el-form-item>
-        <el-form-item label="透明图链接"><el-input v-model="form.transparentImage" placeholder="https://.../transparent.png（可选）" /></el-form-item>
+      <div class="media-inline">
+        <el-form-item label="商品视频"><VideoUploader v-model="form.videoUrl" :upload="uploadXhsVideo" /></el-form-item>
+        <el-form-item label="透明图"><MediaUploader v-model="form.transparentImage" :upload="uploadXhsImage" placeholder="选图" /></el-form-item>
       </div>
     </section>
 

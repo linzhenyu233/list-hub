@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#f5f7fa" />
+    <!-- 小红书素材 CDN 有 Referer 防盗链：带我们页面地址的请求会被 403。
+         设为 same-origin 后，同源(本地 API/代理)照常带 Referer，跨域素材(图片/视频)不带。
+         图片靠 el-image 的 referrerpolicy 已能显示，<video> 不支持该属性，只能靠这里兜底。 -->
+    <meta name="referrer" content="same-origin" />
     <title>微信小店运营台</title>
   </head>
   <body>
