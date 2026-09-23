@@ -285,11 +285,25 @@ def _xhs_call(method: str, payload: dict = None, shop_id: str = None) -> dict:
             store.BASE,
             headers={"Content-Type": "application/json;charset=utf-8"},
             json=body,
-            timeout=30,
+            timeout=120,
         )
-        data = resp.json()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"请求小红书网关失败: {e}")
+    # 网关出错时会返回 nginx 的 HTML(最常见的是 413 请求体过大),此时 resp.json() 会抛出
+    # "Expecting value: line 1 column 1" 这种看不出原因的错,这里换成能定位的提示。
+    if resp.status_code == 413:
+        raise HTTPException(
+            status_code=400,
+            detail="小红书网关拒绝:请求体过大(HTTP 413)。素材经 base64 后体积约放大 1/3,"
+                   "超过网关约 30MB 的上限——请把图片/视频压小后再传。",
+        )
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"小红书网关返回了非预期内容(HTTP {resp.status_code}): {resp.text[:200]}",
+        )
 
     expired = data.get("error_code") == 401 or "accessToken expired" in str(data.get("error_msg") or data.get("message") or "")
     if expired and method not in ("oauth.getAccessToken", "oauth.refreshToken"):
@@ -660,8 +674,10 @@ def upload_material_file(request: Request, body: dict = Body(...)):
         except Exception:
             # 放大失败就传原图,不阻塞
             pass
-    elif len(content) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="视频超过 50MB")
+    elif len(content) > 20 * 1024 * 1024:
+        # 小红书不像微信支持分块:视频要 base64 后一次 POST,而网关请求体约 30MB 封顶,
+        # base64 放大 1/3 → 视频实际上限约 22MB,这里取 20MB 留余量(前端也用同一数值)。
+        raise HTTPException(status_code=400, detail="视频超过 20MB(小红书网关请求体上限约 30MB)")
     default_name = "material.mp4" if material_type == "VIDEO" else "material.jpg"
     name = os.path.basename(str(body.get("filename") or default_name))[:40]
     data = _xhs_call("material.uploadMaterial", {

@@ -4,17 +4,20 @@
 //   · 有视频时是一张 16:9 圆角封面，悬停右上角浮出「换视频 / 删除」；
 //   · 封面中央是圆形播放按钮，点了才播放并显示原生控件（平时画面干净）；
 //   · 没有视频时是同尺寸的虚线框。
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Delete, RefreshRight, VideoCamera, VideoPlay } from '@element-plus/icons-vue'
-import { uploadLocalVideo } from '../useMediaUpload'
+import { MAX_VIDEO_BYTES, uploadLocalVideo } from '../useMediaUpload'
 
 const props = defineProps({
   modelValue: { type: String, default: '' },
   // async ({ filename, contentBase64 }) => 视频地址
   upload: { type: Function, required: true },
   placeholder: { type: String, default: '选择视频' },
+  // 平台各自的体积上限（小红书网关限制严，微信是分块上传可以大得多）
+  maxBytes: { type: Number, default: MAX_VIDEO_BYTES },
 })
+const maxMb = computed(() => Math.round(props.maxBytes / 1024 / 1024))
 const emit = defineEmits(['update:modelValue'])
 
 const fileInput = ref(null)
@@ -46,7 +49,7 @@ async function onPicked(event) {
   if (!file) return
   busy.value = true
   try {
-    emit('update:modelValue', await uploadLocalVideo(file, props.upload))
+    emit('update:modelValue', await uploadLocalVideo(file, props.upload, props.maxBytes))
     ElMessage.success('视频已上传')
   } catch (error) {
     ElMessage.error(`${file.name}：${error.message}`)
@@ -78,9 +81,10 @@ async function onPicked(event) {
         <button type="button" class="is-danger" title="删除" @click="emit('update:modelValue', '')"><el-icon><Delete /></el-icon><span>删除</span></button>
       </div>
     </div>
-    <button v-else type="button" class="video-card video-card--add" :disabled="busy" :title="placeholder" @click="pick">
+    <button v-else type="button" class="video-card video-card--add" :disabled="busy" :title="`${placeholder}（最大 ${maxMb}MB）`" @click="pick">
       <el-icon><VideoCamera /></el-icon>
       <span>{{ busy ? '上传中…' : placeholder }}</span>
+      <em class="video-card__limit">最大 {{ maxMb }}MB</em>
     </button>
     <input ref="fileInput" type="file" accept="video/*" style="display: none" @change="onPicked" />
   </div>
@@ -120,6 +124,7 @@ async function onPicked(event) {
 .video-card--add:hover:not(:disabled) { border-color: var(--brand); background: #f4f9ff; color: var(--brand); }
 .video-card--add:disabled { border-color: #e5e9ef; background: #f7f8fa; color: #b9c0cb; cursor: not-allowed; }
 .video-card--add .el-icon { font-size: 20px; }
+.video-card__limit { color: #98a0ac; font-size: 11px; font-style: normal; }
 .video-card__veil { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; background: rgba(255, 255, 255, .88); color: #98a0ac; font-size: 12px; }
 /* 悬停工具：与图片卡的 .media-card__tools button 保持同一套观感（白底圆角小按钮），
    放在右上角而不是整卡浮层，避免遮住中间播放按钮。 */

@@ -8,7 +8,7 @@ import MediaGallery from './MediaGallery.vue'
 import MediaUploader from './MediaUploader.vue'
 import VideoUploader from './VideoUploader.vue'
 import { longestOf, textWidth } from '../skuTableWidth'
-import { uploadLocalImage } from '../useMediaUpload'
+import { MAX_XHS_VIDEO_BYTES, uploadLocalImage } from '../useMediaUpload'
 
 const emit = defineEmits(['created', 'cancel', 'updated'])
 
@@ -815,7 +815,7 @@ onMounted(async () => {
       <div class="field-label description-label">详情图</div>
       <MediaGallery v-model="form.imageDescriptions" :max="50" :upload="uploadXhsImage" />
       <div class="media-inline">
-        <el-form-item label="商品视频"><VideoUploader v-model="form.videoUrl" :upload="uploadXhsVideo" /></el-form-item>
+        <el-form-item label="商品视频"><VideoUploader v-model="form.videoUrl" :upload="uploadXhsVideo" :max-bytes="MAX_XHS_VIDEO_BYTES" /></el-form-item>
         <el-form-item label="透明图"><MediaUploader v-model="form.transparentImage" :upload="uploadXhsImage" placeholder="选图" /></el-form-item>
       </div>
     </section>
