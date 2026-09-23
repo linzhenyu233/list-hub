@@ -20,6 +20,7 @@ import uuid
 import zipfile
 import time
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
@@ -29,6 +30,7 @@ from pydantic import BaseModel
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
 import shop_registry
+import api_auth
 
 load_project_env()
 
@@ -72,7 +74,9 @@ def _verify_shop(shop_id: str) -> dict:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.environ.get("BULK_DB_FILE", os.path.join(BASE_DIR, "bulk_catalog.sqlite3"))
 IMAGE_DIR = os.environ.get("BULK_IMAGE_DIR", os.path.join(BASE_DIR, "../images"))
-BULK_API_HOST = os.environ.get("BULK_API_HOST", "0.0.0.0")
+# 默认只监听本机：原先 0.0.0.0 + 无鉴权，局域网内任意机器都能直接调发布/删商品接口。
+# 确需局域网直连时设 BULK_API_HOST=0.0.0.0，并务必配好 API_KEY。
+BULK_API_HOST = os.environ.get("BULK_API_HOST", "127.0.0.1")
 BULK_API_PORT = int(os.environ.get("BULK_API_PORT", "8020"))
 # 共享盘图片"懒拷贝"的保留天数(0=不清理): 发品时把共享盘图片按内容哈希拷进 IMAGE_DIR/_share/,
 # 内容随时能从共享盘重取, 所以可以安全按时间清; 不清的话这个目录只会越来越大(实测 10 天 147MB)。
@@ -154,6 +158,11 @@ def _allowed_roots_for(shop_id=None):
 
 
 app = FastAPI(title="商品批量发布中台", version="0.1.0")
+
+# 鉴权：X-API-Key（未配置 API_KEY 时只告警不拦截，见 api_auth.py）。
+# bulk_api 没有 CORS 中间件（前端经 vite 代理同源访问），顺序无额外要求。
+api_auth.install(app, "bulk-api")
+
 _WECHAT_CATEGORY_CHAIN_CACHE = {}
 _XHS_VAR_CANDIDATES_CACHE = {}
 
@@ -190,25 +199,54 @@ XHS_SPEC_VALUE_ALIASES = {
 }
 
 
+_db_schema_ready = False
+_db_schema_lock = threading.Lock()
+
+
+def _ensure_db_schema():
+    """建表 / 补列 / 重建表 / 迁移归属 / 建索引，一个进程只做一次。
+
+    原先这一整套挂在 db() 里，每开一个连接就重跑一遍 DDL：API 进程、worker 进程、
+    以及每个请求的短连接都在重复执行，多进程同时启动时会互相抢 sqlite_master 的写锁，
+    表现就是启动瞬间 database is locked / 建表超时。改成本进程内一次性执行。
+    """
+    global _db_schema_ready
+    if _db_schema_ready:
+        return
+    with _db_schema_lock:
+        if _db_schema_ready:      # 双检：等锁期间别的线程可能已经建好了
+            return
+        conn = sqlite3.connect(DB_FILE, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+
+            # 顺序很重要：先建表（新库直接是新结构）→ 补列 → 重建带单店约束的老表
+            # → 迁移历史数据归属 → 最后建索引。
+            # 如果索引先建，老库还没有 shop_id 列，CREATE INDEX 会直接报 no such column。
+            _create_tables(conn)
+            _migrate_add_shop_id(conn)
+            _migrate_add_job_params(conn)
+            _rebuild_multishop_tables(conn)
+            _reassign_legacy_shop(conn)
+            _create_indexes(conn)
+
+            conn.commit()
+        finally:
+            conn.close()
+        _db_schema_ready = True
+
+
 def db():
+    _ensure_db_schema()
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     # WAL 模式:读写互不阻塞,大幅降低 database is locked
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
-
-    # 顺序很重要：先建表（新库直接是新结构）→ 补列 → 重建带单店约束的老表
-    # → 迁移历史数据归属 → 最后建索引。
-    # 如果索引先建，老库还没有 shop_id 列，CREATE INDEX 会直接报 no such column。
-    _create_tables(conn)
-    _migrate_add_shop_id(conn)
-    _migrate_add_job_params(conn)
-    _rebuild_multishop_tables(conn)
-    _reassign_legacy_shop(conn)
-    _create_indexes(conn)
-
-    conn.commit()
     return conn
 
 
@@ -467,6 +505,8 @@ def _json_post(url, payload, timeout=180, shop_id=None, extra_headers=None):
         headers[SHOP_HEADER] = shop_id
     if extra_headers:
         headers.update(extra_headers)
+    # 调 wechat/xhs 服务：它们开启鉴权后必须带 X-API-Key，否则一律 401
+    headers.update(api_auth.auth_headers())
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                                      headers=headers, method="POST")
     try:
@@ -3260,7 +3300,8 @@ XHS_API_BASE = os.environ.get("XHS_API_BASE", "http://127.0.0.1:8010")
 
 
 def _http_get_json(url, timeout=60, shop_id=None, extra_headers=None):
-    headers = {}
+    # 调 wechat/xhs 服务：它们开启鉴权后必须带 X-API-Key，否则一律 401
+    headers = api_auth.auth_headers()
     if shop_id:
         headers[SHOP_HEADER] = shop_id
     if extra_headers:
@@ -3438,4 +3479,6 @@ def import_aliases(body: AliasImportBody, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
+    # 启动时一次性建表/迁移：避免第一个请求（或与 worker 进程并发）同时抢 DDL 写锁
+    _ensure_db_schema()
     uvicorn.run(app, host=BULK_API_HOST, port=BULK_API_PORT)

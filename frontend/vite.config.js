@@ -3,6 +3,10 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig(({ mode }) => {
   const env = { ...loadEnv(mode, '..', ''), ...process.env }
+  // 后端三个服务已开启 X-API-Key 鉴权（见 api_auth.py）。浏览器发起的
+  // <img src>、<a download> 带不了自定义头，所以在开发代理里由 node 侧补上。
+  // 生产环境请在 nginx 里补同样的头：proxy_set_header X-API-Key <值>;
+  const authHeaders = env.API_KEY ? { 'X-API-Key': env.API_KEY } : {}
   return {
   plugins: [vue()],
   build: {
@@ -25,16 +29,19 @@ export default defineConfig(({ mode }) => {
       '/api': {
         target: env.VITE_WECHAT_PROXY_TARGET || 'http://127.0.0.1:8000',
         changeOrigin: true,
+        headers: authHeaders,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/xhs-api': {
         target: env.VITE_XHS_PROXY_TARGET || 'http://127.0.0.1:8010',
         changeOrigin: true,
+        headers: authHeaders,
         rewrite: (path) => path.replace(/^\/xhs-api/, ''),
       },
       '/bulk-api': {
         target: env.VITE_BULK_PROXY_TARGET || 'http://127.0.0.1:8020',
         changeOrigin: true,
+        headers: authHeaders,
         rewrite: (path) => path.replace(/^\/bulk-api/, ''),
       },
     },

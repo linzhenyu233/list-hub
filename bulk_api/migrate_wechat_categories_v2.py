@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 
 from bulk_api import DB_FILE, WECHAT_API_BASE, now
+import api_auth
 
 
 def latest_chain(saved, cache):
@@ -20,7 +21,9 @@ def latest_chain(saved, cache):
     if cache_key in cache:
         return cache[cache_key]
     url = f"{WECHAT_API_BASE}/categories?keyword={urllib.parse.quote(leaf_name)}"
-    with urllib.request.urlopen(url, timeout=180) as response:
+    # wechat 服务开启 X-API-Key 鉴权后，不带这个头会直接 401
+    request = urllib.request.Request(url, headers=api_auth.auth_headers())
+    with urllib.request.urlopen(request, timeout=180) as response:
         candidates = json.loads(response.read().decode("utf-8")).get("results", [])
     matches = [item for item in candidates if item.get("leaf") and str(item.get("cat_id")) == leaf_id]
     if len(matches) != 1:

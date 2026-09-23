@@ -8,10 +8,12 @@
   4. 图片上传缓存按店隔离：同 source_hash 在两店各存一条，URL 不同
   5. /publish-status 按店汇总
   6. image-cache 只清当前店
+  7. X-API-Key 鉴权：配了 API_KEY 后无头 401、带头 200、/health 免鉴权
 
 用法：
     python bulk_api/multishop_regression_test.py
 """
+import asyncio
 import importlib.util
 import os
 import sys
@@ -48,6 +50,43 @@ def _boot(db_path):
     spec.loader.exec_module(mod)
     sys.path.remove(BULK_DIR)
     return mod
+
+
+def _asgi_status(app, path, key=None, query=""):
+    """进程内直接调 ASGI app，只取状态码。
+
+    没用 fastapi.testclient.TestClient：它依赖 httpx，本项目 requirements 里没装
+    （实测 `import httpx` 直接 ModuleNotFoundError），所以手搓一个最小 scope 走真实
+    中间件栈，效果一样但不引入新依赖。
+    """
+    headers = [(b"host", b"127.0.0.1")]
+    if key:
+        headers.append((b"x-api-key", key.encode("utf-8")))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": query.encode("utf-8"),
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8020),
+    }
+    status = {}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status["code"] = message["status"]
+
+    asyncio.run(app(scope, receive, send))
+    return status.get("code")
 
 
 def test_migration_idempotent():
@@ -229,6 +268,36 @@ def test_image_cache_clear_by_shop():
     print("  [OK] image-cache 按店清理")
 
 
+def test_api_key_auth():
+    """配了 API_KEY 时：无头 401、带对 200、带错 401、/health 免鉴权、?api_key= 兜底可用。
+
+    鉴权是三个服务共用的（api_auth.py），这里拿 bulk_api 代表验一遍。回归脚本自己也是
+    "调用方"，接口口径变了必须能被测出来 —— 尤其是「配了 API_KEY 后老调用方全 401」
+    这种上线当天才会暴露的问题。
+    """
+    p = _new_db_path()
+    old_key = os.environ.get("API_KEY")
+    os.environ["API_KEY"] = "regression_test_key"
+    try:
+        # _boot 会清掉模块缓存重新加载，让 api_auth.install 读到新的 API_KEY
+        m = _boot(p)
+        assert _asgi_status(m.app, "/shops") == 401, "没带 X-API-Key 居然放行了"
+        assert _asgi_status(m.app, "/shops", key="regression_test_key") == 200, "带对 key 仍被拒"
+        assert _asgi_status(m.app, "/shops", key="wrong") == 401, "带错 key 居然放行了"
+        assert _asgi_status(m.app, "/health") == 200, "/health 必须免鉴权（探活用）"
+        assert _asgi_status(m.app, "/shops", query="api_key=regression_test_key") == 200, \
+            "?api_key= 兜底失效（浏览器 <img>/<a download> 只能用它）"
+    finally:
+        if old_key is None:
+            os.environ.pop("API_KEY", None)
+        else:
+            os.environ["API_KEY"] = old_key
+        # 本用例只发 HTTP 请求、没碰 db()，临时库文件可能压根没建出来，直接 unlink 会报错
+        if os.path.exists(p):
+            os.unlink(p)
+    print("  [OK] X-API-Key 鉴权（含免鉴权路径与 query 兜底）")
+
+
 def main():
     print("多店铺中台回归测试：")
     test_migration_idempotent()
@@ -237,6 +306,7 @@ def main():
     test_image_cache_isolation()
     test_publish_status_isolation()
     test_image_cache_clear_by_shop()
+    test_api_key_auth()
     print("\n全部通过 OK")
 
 

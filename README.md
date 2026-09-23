@@ -43,6 +43,7 @@ PythonProject/
 │   ├── bulk_worker.py      #   常驻发布 worker（必须与 bulk_api 同时运行）
 │   └── *.py                #   Excel 生成/校验、类目迁移脚本
 ├── frontend/               # 前端运营台 (Vite:5173)，原 wechat-store-ops
+├── deploy/nginx.conf       # 生产 nginx 参考配置（含 X-API-Key 补头）
 ├── images/                 # 批量导入的图片缓存（运行时数据，已 gitignore）
 ├── upload_images.py        # 独立的双平台图片上传 CLI 工具
 ├── .env.example            # 环境变量模板（复制为 .env 填真值）
@@ -62,6 +63,27 @@ Copy-Item .env.example .env    # 然后编辑 .env 填入真实 AppID/Secret/Tok
 
 > ⚠️ 目前 `wechat_store_client.py` 与 `xhs/xhs_store.py` 仍把凭证写死为默认值，
 > 未全部改为读取环境变量；`.env` 中已标注哪些变量「已接入 / 未接入」。
+
+### 开启接口鉴权（X-API-Key）
+
+三个后端服务**默认不校验**任何凭证（只在启动日志里打 WARN）。要开启：
+
+```powershell
+# 1) 生成 48 位随机串写进 .env（.env 已 gitignore）
+$key = -join (1..48 | ForEach-Object { [char]((48..57) + (65..90) + (97..122) | Get-Random) })
+Add-Content -Path .env -Value "API_KEY=$key" -Encoding utf8
+# 2) 重启三个服务 + 前端 dev server（见下）
+```
+
+- 开启后所有请求必须带 `X-API-Key: <值>`；免鉴权路径：`/health`、`/docs`、`/redoc`、`/openapi.json`。
+- **四个进程都要重启**：三个服务都无 `--reload`；vite 也是在启动时读 `.env`
+  （由代理在服务端补头，见 `frontend/vite.config.js`）—— 只重启后端不重启前端，页面会整片 401。
+- 浏览器自己发的 `<img src>`、`<a download>`、裸 `fetch` 带不了自定义头，只能由代理侧补：
+  开发环境 vite 已处理，**生产环境必须在 nginx 补** `proxy_set_header X-API-Key <值>;`
+  （完整配置见 `deploy/nginx.conf`），否则商品缩略图 `/bulk-api/images/preview` 会 401。
+- 服务默认只监听 `127.0.0.1`（`WX_API_HOST` / `XHS_API_HOST` / `BULK_API_HOST`）；
+  确需局域网直连再改 `0.0.0.0`，且务必先配好 `API_KEY`。
+- 自检：`python bulk_api/multishop_regression_test.py`（含鉴权用例）。
 
 ## 启动服务
 
@@ -100,6 +122,8 @@ npm run dev        # http://localhost:5173，已配置 /api、/xhs-api、/bulk-a
 
 - 运行时数据（`*.sqlite3`、`images/`、`uploaded_images.*`）与密钥（`.env`）均已在
   `.gitignore` 中忽略，不会进入版本库。
+- `.env` 由 `sync_windows_env.py` 按 Windows 用户环境变量**整体重写**：手工追加的行
+  （例如 `API_KEY`）重跑一次就会被冲掉，要长期保留请同时 `setx API_KEY "<同一个值>"`。
 - `wechat/diagnostics/` 内为历史一次性调试脚本，归档保留，不属于服务运行链路。
 
 ## 运行时数据的自动清理（保留策略）
