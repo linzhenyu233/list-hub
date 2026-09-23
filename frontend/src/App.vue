@@ -550,14 +550,20 @@ onMounted(async () => {
         <div><strong>商品中台</strong><span>多平台运营</span></div>
       </div>
       <el-menu :default-active="activeView" class="nav-menu" @select="activeView = $event">
-        <el-menu-item index="products" @click="selectPlatform('wechat')"><el-icon><Goods /></el-icon><span>微信商品</span></el-menu-item>
-        <el-menu-item index="xhs-products" @click="selectPlatform('xhs')"><el-icon><Notebook /></el-icon><span>小红书商品</span></el-menu-item>
-        <el-menu-item index="create" @click="platform = 'wechat'"><el-icon><CirclePlus /></el-icon><span>发布微信商品</span></el-menu-item>
-        <el-menu-item index="xhs-create" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
-        <el-menu-item index="bulk-publish" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
-        <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
-        <el-menu-item index="shops"><el-icon><Shop /></el-icon><span>店铺管理</span></el-menu-item>
-        <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
+        <el-menu-item-group title="微信小店">
+          <el-menu-item index="products" @click="selectPlatform('wechat')"><el-icon><Goods /></el-icon><span>微信商品</span></el-menu-item>
+          <el-menu-item index="create" @click="platform = 'wechat'"><el-icon><CirclePlus /></el-icon><span>发布微信商品</span></el-menu-item>
+        </el-menu-item-group>
+        <el-menu-item-group title="小红书">
+          <el-menu-item index="xhs-products" @click="selectPlatform('xhs')"><el-icon><Notebook /></el-icon><span>小红书商品</span></el-menu-item>
+          <el-menu-item index="xhs-create" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
+        </el-menu-item-group>
+        <el-menu-item-group title="批量与配置">
+          <el-menu-item index="bulk-publish" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
+          <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
+          <el-menu-item index="shops"><el-icon><Shop /></el-icon><span>店铺管理</span></el-menu-item>
+          <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
+        </el-menu-item-group>
       </el-menu>
       <div class="sidebar-footer">
         <div :class="['service-dot', { online: serviceOnline }]" />

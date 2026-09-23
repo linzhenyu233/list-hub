@@ -1,0 +1,387 @@
+/* ============================================================================
+ * GEM Ops Design Tokens —— 多平台商品发布中台 设计语言
+ * ----------------------------------------------------------------------------
+ * 本文件承担两件事：
+ *   1) 声明一套与业务无关的设计 token（颜色 / 字体 / 间距 / 圆角 / 阴影 / 动效），
+ *      所有新写的样式都只引用 var(--gem-*)，方便统一调参、换肤。
+ *   2) 把 Element Plus 的 CSS 变量覆盖到同一套 token 上，使现有组件（按钮 / 表格 /
+ *      表单 / 标签 / 弹窗 / 步骤条）在不改任何 .vue 逻辑的前提下整体换肤。
+ *
+ * 引入顺序：main.js 中须在 element-plus/dist/index.css、./styles.css 之后引入本文件，
+ * 这样这里的覆盖规则与同特异度的 styles.css 规则冲突时，本文件胜出。
+ * ========================================================================== */
+
+:root {
+  /* ---------- 品牌主色（indigo，沉稳专业，区分于微信绿/小红书红） ---------- */
+  --gem-brand: #4F46E5;
+  --gem-brand-strong: #3F38B7;
+  --gem-brand-soft: #EEF0FE;
+
+  /* ---------- 平台色（仅用于平台标识，不作为操作主色） ---------- */
+  --gem-wechat: #07C160;
+  --gem-wechat-soft: #E7F8EF;
+  --gem-xhs: #FF2442;
+  --gem-xhs-soft: #FFE9EC;
+
+  /* ---------- 语义色 ---------- */
+  --gem-success: #16A34A;
+  --gem-success-soft: #ECFDF3;
+  --gem-warning: #D97706;
+  --gem-warning-soft: #FFFAEB;
+  --gem-danger: #DC2626;
+  --gem-danger-soft: #FEF3F2;
+  --gem-info: #667085;
+  --gem-info-soft: #F2F4F7;
+
+  /* ---------- 中性色（slate 体系） ---------- */
+  --gem-bg: #F6F7F9;          /* 页面底色 */
+  --gem-surface: #FFFFFF;      /* 卡片 / 浮层 */
+  --gem-surface-2: #FAFBFC;    /* 表头 / 浅底 */
+  --gem-border: #E6E8EB;
+  --gem-border-strong: #D6DAE0;
+  --gem-text: #1F2733;         /* 主文本 */
+  --gem-text-2: #3D4654;       /* 次文本 */
+  --gem-text-3: #667085;       /* 辅助文本 */
+  --gem-text-4: #98A2B3;       /* 占位 / 极弱 */
+
+  /* ---------- 间距（4px 基准） ---------- */
+  --gem-space-1: 4px;
+  --gem-space-2: 8px;
+  --gem-space-3: 12px;
+  --gem-space-4: 16px;
+  --gem-space-5: 20px;
+  --gem-space-6: 24px;
+  --gem-space-8: 32px;
+  --gem-space-10: 40px;
+  --gem-space-12: 48px;
+
+  /* ---------- 圆角 ---------- */
+  --gem-radius-sm: 8px;
+  --gem-radius-md: 12px;
+  --gem-radius-lg: 16px;
+  --gem-radius-pill: 999px;
+
+  /* ---------- 阴影 / 层级 ---------- */
+  --gem-shadow-sm: 0 1px 2px rgba(16, 24, 40, .06);
+  --gem-shadow-md: 0 2px 8px rgba(16, 24, 40, .06), 0 1px 2px rgba(16, 24, 40, .04);
+  --gem-shadow-lg: 0 12px 32px rgba(16, 24, 40, .10);
+  --gem-shadow-focus: 0 0 0 3px rgba(79, 70, 229, .18);
+
+  /* ---------- 动效 ---------- */
+  --gem-ease: cubic-bezier(.4, 0, .2, 1);
+  --gem-dur: .18s;
+
+  /* ---------- 布局 ---------- */
+  --gem-sidebar-w: 248px;
+  --gem-topbar-h: 64px;
+  --gem-content-max: 1280px;
+
+  /* ---------- 字体 ---------- */
+  --gem-font: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --gem-font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  /* ---------- 字号阶梯 ---------- */
+  --gem-fs-12: 12px;
+  --gem-fs-13: 13px;
+  --gem-fs-14: 14px;
+  --gem-fs-16: 16px;
+  --gem-fs-18: 18px;
+  --gem-fs-20: 20px;
+  --gem-fs-24: 24px;
+  --gem-fs-28: 28px;
+
+  /* ===================== Element Plus 变量覆盖 ===================== */
+  --el-color-primary: #4F46E5;
+  --el-color-primary-light-3: #7C73EF;
+  --el-color-primary-light-5: #A7A2F2;
+  --el-color-primary-light-7: #CBC9F7;
+  --el-color-primary-light-8: #DBDAF9;
+  --el-color-primary-light-9: #EEF0FE;
+  --el-color-primary-dark-2: #3F38B7;
+
+  --el-color-success: #16A34A;
+  --el-color-success-light-3: #57B587;
+  --el-color-success-light-9: #ECFDF3;
+  --el-color-warning: #D97706;
+  --el-color-warning-light-3: #E8A23F;
+  --el-color-warning-light-9: #FFFAEB;
+  --el-color-danger: #DC2626;
+  --el-color-danger-light-3: #E87070;
+  --el-color-danger-light-9: #FEF3F2;
+  --el-color-error: #DC2626;
+  --el-color-info: #667085;
+  --el-color-info-light-3: #98A2B3;
+  --el-color-info-light-9: #F2F4F7;
+
+  --el-bg-color-page: #F6F7F9;
+  --el-bg-color: #FFFFFF;
+  --el-bg-color-overlay: #FFFFFF;
+
+  --el-text-color-primary: #1F2733;
+  --el-text-color-regular: #3D4654;
+  --el-text-color-secondary: #667085;
+  --el-text-color-placeholder: #98A2B3;
+  --el-text-color-disabled: #B6BEC9;
+
+  --el-border-color: #E6E8EB;
+  --el-border-color-light: #ECEEF1;
+  --el-border-color-lighter: #F1F3F5;
+  --el-border-color-extra-light: #F5F7F9;
+
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+  --el-border-radius-round: 999px;
+
+  --el-fill-color: #F2F4F7;
+  --el-fill-color-light: #F6F7F9;
+  --el-fill-color-lighter: #FAFBFC;
+  --el-fill-color-blank: #FFFFFF;
+
+  --el-font-family: var(--gem-font);
+  --el-font-size-base: 14px;
+
+  --el-box-shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .10);
+  --el-box-shadow-light: 0 1px 2px rgba(16, 24, 40, .05);
+}
+
+/* ===================== 全局基底 ===================== */
+* { box-sizing: border-box; }
+html, body { font-family: var(--gem-font); color: var(--gem-text); background: var(--gem-bg); }
+.el-button { font-weight: 500; transition: background var(--gem-dur) var(--gem-ease), box-shadow var(--gem-dur) var(--gem-ease); }
+.el-button--primary:focus-visible,
+.el-button:focus-visible { outline: none; box-shadow: var(--gem-shadow-focus); }
+.el-tag { font-weight: 500; }
+.el-card { border-radius: var(--gem-radius-md); }
+
+/* ===================== 顶栏 ===================== */
+.topbar {
+  height: var(--gem-topbar-h);
+  padding: 0 28px;
+  border-bottom: 1px solid var(--gem-border);
+  background: rgba(255, 255, 255, .82);
+  backdrop-filter: saturate(180%) blur(8px);
+}
+.topbar strong { font-size: var(--gem-fs-16); color: var(--gem-text); letter-spacing: -.1px; }
+.breadcrumb { color: var(--gem-text-4); font-size: var(--gem-fs-13); }
+.operator { padding-left: 12px; border-left: 1px solid var(--gem-border); font-size: var(--gem-fs-13); }
+.avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--gem-brand-soft); color: var(--gem-brand-strong); font-weight: 700; font-size: 12px; }
+.shop-select { width: 250px; }
+.operator-input { width: 120px; }
+
+/* ===================== 侧边栏 + 分组导航 ===================== */
+.app-shell { background: var(--gem-bg); min-height: 100vh; }
+.sidebar {
+  width: var(--gem-sidebar-w) !important;
+  background: linear-gradient(180deg, #131C2E 0%, #0F1729 100%);
+  color: #fff;
+  box-shadow: 2px 0 16px rgba(15, 23, 41, .18);
+}
+.app-shell > .el-container { margin-left: var(--gem-sidebar-w); min-width: 0; }
+
+.brand { height: 76px; display: flex; align-items: center; gap: 12px; padding: 0 22px; border-bottom: 1px solid rgba(255, 255, 255, .07); }
+.brand-mark {
+  width: 38px; height: 38px; display: grid; place-items: center;
+  border-radius: 11px; background: linear-gradient(135deg, #6366F1, #4F46E5);
+  color: #fff; font-size: 20px; box-shadow: 0 4px 12px rgba(79, 70, 229, .40);
+}
+.brand strong { display: block; font-size: 15px; letter-spacing: .3px; color: #fff; }
+.brand span { display: block; margin-top: 2px; color: #8A93A3; font-size: 11px; letter-spacing: 2px; }
+
+.nav-menu { flex: 1; border: 0 !important; padding: 14px 12px; background: transparent !important; }
+.nav-menu .el-menu-item {
+  height: 42px; margin: 0 0 2px; border-radius: 10px; color: #9AA4B2; font-weight: 500;
+  transition: background var(--gem-dur) var(--gem-ease), color var(--gem-dur) var(--gem-ease);
+}
+.nav-menu .el-menu-item:hover { background: rgba(255, 255, 255, .06); color: #fff; }
+.nav-menu .el-menu-item.is-active {
+  background: linear-gradient(90deg, rgba(99, 102, 241, .24), rgba(79, 70, 229, .08));
+  color: #fff;
+  box-shadow: inset 3px 0 0 var(--gem-brand);
+}
+.nav-menu .el-menu-item .el-icon { font-size: 17px; }
+
+/* 分组标题 */
+.nav-menu .el-menu-item-group { margin-bottom: 6px; }
+.nav-menu .el-menu-item-group__title {
+  padding: 14px 14px 6px !important; color: #5B6472; font-size: 11px; font-weight: 600;
+  letter-spacing: 1.5px; line-height: 1;
+}
+
+.sidebar-footer { display: flex; align-items: center; gap: 10px; margin: 10px 12px; padding: 14px 12px; border-top: 1px solid rgba(255, 255, 255, .07); }
+.sidebar-footer strong { display: block; font-size: 12px; color: #DCE2EA; }
+.sidebar-footer span { display: block; margin-top: 3px; font-size: 10px; color: #718096; }
+.service-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: var(--gem-danger); box-shadow: 0 0 0 4px rgba(220, 38, 38, .14); }
+.service-dot.online { background: var(--gem-success); box-shadow: 0 0 0 4px rgba(22, 163, 74, .16); }
+
+/* ===================== 内容区 / 页面标题 ===================== */
+.main-content { padding: 28px; overflow: visible; }
+.page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
+.page-heading h1 { margin: 0; font-size: var(--gem-fs-24); font-weight: 700; line-height: 1.3; letter-spacing: -.2px; }
+.page-heading p { margin: 6px 0 0; color: var(--gem-text-3); font-size: var(--gem-fs-13); }
+
+/* ===================== 卡片 / 面板 ===================== */
+.content-panel, .settings-panel, .form-section {
+  border: 1px solid var(--gem-border); border-radius: var(--gem-radius-md);
+  background: var(--gem-surface); box-shadow: var(--gem-shadow-sm);
+}
+.stats-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 14px; margin-bottom: 18px; }
+.stat-item {
+  position: relative; min-height: 108px; padding: 20px; border: 1px solid var(--gem-border);
+  border-radius: var(--gem-radius-md); background: var(--gem-surface); box-shadow: var(--gem-shadow-sm);
+}
+.stat-item span { display: block; color: var(--gem-text-3); font-size: var(--gem-fs-13); }
+.stat-item strong { display: block; margin-top: 10px; font-size: var(--gem-fs-28); font-weight: 700; color: var(--gem-text); }
+.stat-item > .el-icon { position: absolute; top: 20px; right: 20px; width: 34px; height: 34px; border-radius: 9px; background: var(--gem-brand-soft); color: var(--gem-brand); font-size: 18px; }
+.stat-item > .el-icon.green { background: var(--gem-success-soft); color: var(--gem-success); }
+.stat-item > .el-icon.gray { background: var(--gem-info-soft); color: var(--gem-text-3); }
+.stat-item > .el-icon.amber { background: var(--gem-warning-soft); color: var(--gem-warning); }
+
+/* ===================== 表格 ===================== */
+.product-table th.el-table__cell { height: 46px; background: var(--gem-surface-2); color: var(--gem-text-3); font-weight: 600; border-bottom: 1px solid var(--gem-border); }
+.product-table td.el-table__cell { padding: 13px 0; }
+.product-cell strong { font-size: var(--gem-fs-14); color: var(--gem-text); }
+.product-cell span { margin-top: 5px; color: var(--gem-text-4); font-size: var(--gem-fs-12); }
+.product-thumb { width: 52px; height: 52px; flex: 0 0 auto; border: 1px solid var(--gem-border); border-radius: 8px; background: var(--gem-surface-2); }
+.price { color: var(--gem-danger); font-size: var(--gem-fs-14); font-weight: 600; }
+
+/* ===================== 平台标签（店铺下拉 / 状态） ===================== */
+.shop-option-tags .el-tag--success { background: var(--gem-wechat-soft); color: var(--gem-wechat); border-color: transparent; }
+.shop-option-tags .el-tag--danger { background: var(--gem-xhs-soft); color: var(--gem-xhs); border-color: transparent; }
+
+/* ===================== 表单区块（发布/编辑页） ===================== */
+.form-section { margin-bottom: 16px; padding: 22px 24px; }
+.section-heading { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 22px; padding-bottom: 16px; border-bottom: 1px solid var(--gem-border); }
+.section-heading h3 { margin: 0; font-size: var(--gem-fs-16); font-weight: 600; color: var(--gem-text); }
+.section-heading p { margin: 5px 0 0; color: var(--gem-text-3); font-size: var(--gem-fs-12); }
+.section-index { color: #DDE2EA; font-size: 25px; font-weight: 700; }
+
+.form-actions {
+  position: sticky; bottom: 0; z-index: 5; display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; padding: 15px 0;
+  background: linear-gradient(to bottom, rgba(246, 247, 249, 0), var(--gem-bg) 22%);
+}
+
+/* ===================== 批量发布步骤条 ===================== */
+.bulk-steps { margin: 0 0 22px; padding: 18px 24px; border: 1px solid var(--gem-border); border-radius: var(--gem-radius-md); background: var(--gem-surface); box-shadow: var(--gem-shadow-sm); }
+.bulk-card { padding: 24px; }
+.bulk-drop { border: 1px dashed var(--gem-border-strong); border-radius: var(--gem-radius-md); background: var(--gem-surface-2); }
+
+/* ===================== 店铺管理卡片 ===================== */
+.shop-card { border-radius: var(--gem-radius-md); box-shadow: var(--gem-shadow-sm); }
+.shop-name { font-size: var(--gem-fs-16); color: var(--gem-text); }
+.status-label { color: var(--gem-text-3); font-size: var(--gem-fs-13); }
+
+/* ===================== 响应式：折叠侧栏时隐藏分组标题文字 ===================== */
+@media (max-width: 900px) {
+  .sidebar { width: 72px !important; }
+  .app-shell > .el-container { margin-left: 72px; }
+  .brand { padding: 0 18px; }
+  .brand > div:last-child, .nav-menu .el-menu-item span, .nav-menu .el-menu-item-group__title, .sidebar-footer > div:last-child { display: none; }
+  .nav-menu { padding: 16px 8px; }
+  .nav-menu .el-menu-item { justify-content: center; padding: 0 !important; }
+  .nav-menu .el-menu-item .el-icon { margin: 0; }
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* ============================================================================
+ * 业务页细节打磨 —— 在统一 token 之上，针对业务场景做交互与视觉收口
+ * 仅补充「状态反馈 / 焦点 / 层级」类细节，不改动任何业务结构与文案
+ * ========================================================================== */
+
+/* ---------- 统计卡：hover 轻抬升，给出可点感 ---------- */
+.stat-item {
+  transition: box-shadow var(--gem-dur) var(--gem-ease), transform var(--gem-dur) var(--gem-ease), border-color var(--gem-dur) var(--gem-ease);
+}
+.stat-item:hover { transform: translateY(-2px); box-shadow: var(--gem-shadow-md); border-color: var(--gem-border-strong); }
+
+/* ---------- 表单分区序号徽标：从浅灰数字升级为品牌圆角徽标 ---------- */
+.section-index {
+  display: grid; place-items: center;
+  width: 30px; height: 30px; flex: 0 0 auto;
+  border-radius: var(--gem-radius-sm);
+  background: linear-gradient(135deg, #6366F1, var(--gem-brand));
+  color: #fff !important; font-size: var(--gem-fs-13); font-weight: 700; line-height: 1;
+  box-shadow: 0 3px 8px rgba(79, 70, 229, .28);
+}
+
+/* ---------- 表格：hover 行 / 当前行 / 表头浅底，统一描边 ---------- */
+.product-table .el-table {
+  --el-table-row-hover-bg-color: #F3F5FC;
+  --el-table-border-color: var(--gem-border);
+  --el-table-header-bg-color: var(--gem-surface-2);
+  --el-table-tr-bg-color: var(--gem-surface);
+  --el-table-current-row-bg-color: var(--gem-brand-soft);
+}
+.product-table .el-table__row td.el-table__cell { transition: background var(--gem-dur) var(--gem-ease); }
+.product-table .el-table__inner-wrapper::before { background: var(--gem-border); }
+
+/* ---------- 抽屉：品牌顶边 + 头部留白，统一浮层语言 ---------- */
+.el-drawer { border-top: 3px solid var(--gem-brand); }
+.el-drawer__header { margin-bottom: 0; padding: 18px 22px; border-bottom: 1px solid var(--gem-border); }
+.el-drawer__title { font-size: var(--gem-fs-18); font-weight: 600; color: var(--gem-text); }
+.el-drawer__body { padding: 22px; }
+.el-drawer__close-btn { font-size: 18px; color: var(--gem-text-3); transition: color var(--gem-dur) var(--gem-ease); }
+.el-drawer__close-btn:hover { color: var(--gem-brand); }
+
+/* ---------- 弹窗：圆角 + 头部分隔，与抽屉一致 ---------- */
+.el-dialog { border-radius: var(--gem-radius-lg); overflow: hidden; }
+.el-dialog__header { margin-right: 0; padding: 18px 22px; border-bottom: 1px solid var(--gem-border); }
+.el-dialog__title { font-size: var(--gem-fs-18); font-weight: 600; }
+.el-dialog__body { padding: 22px; }
+
+/* ---------- 空态文案弱化 ---------- */
+.el-empty__description { color: var(--gem-text-3); font-size: var(--gem-fs-13); }
+
+/* ---------- 分页按钮圆角化 ---------- */
+.el-pagination { --el-pagination-button-bg-color: var(--gem-surface); --el-pagination-button-disabled-bg-color: var(--gem-surface); }
+.el-pagination .el-pager li { border-radius: var(--gem-radius-sm); transition: all var(--gem-dur) var(--gem-ease); }
+.el-pagination .el-pager li.is-active { font-weight: 600; }
+
+/* ---------- 规格卡片：描边 + hover 微反馈 ---------- */
+.spec-card {
+  border: 1px solid var(--gem-border); background: var(--gem-surface-2);
+  transition: border-color var(--gem-dur) var(--gem-ease), box-shadow var(--gem-dur) var(--gem-ease);
+}
+.spec-card:hover { border-color: var(--gem-border-strong); box-shadow: var(--gem-shadow-sm); }
+.spec-value-item.is-selected { border-color: #B9C4FF; background: var(--gem-brand-soft); }
+
+/* ---------- 店铺卡片 hover 抬升 ---------- */
+.shop-card { transition: box-shadow var(--gem-dur) var(--gem-ease), transform var(--gem-dur) var(--gem-ease), border-color var(--gem-dur) var(--gem-ease); }
+.shop-card:hover { box-shadow: var(--gem-shadow-md); transform: translateY(-2px); border-color: var(--gem-border-strong); }
+
+/* ---------- 批量发布：选择条改用品牌浅底，强化「已选」语义 ---------- */
+.bulk-selection-bar { border-color: #CBC9F7; background: var(--gem-brand-soft); }
+.bulk-selection-bar__info { color: var(--gem-brand-strong); }
+.bulk-selection-bar__info strong { color: var(--gem-brand-strong); }
+
+/* ---------- 平台分段选择：选中态描边收口 ---------- */
+.platform-picker { border-color: var(--gem-border); }
+.platform-picker .el-checkbox-button.is-checked .el-checkbox-button__inner { box-shadow: -1px 0 0 0 var(--gem-brand); }
+
+/* ---------- 小红书状态分页：选中下划线统一品牌色 ---------- */
+.xhs-status-tabs button:hover { color: var(--gem-brand); }
+.xhs-status-tabs button.active { color: var(--gem-brand); }
+.xhs-status-tabs button.active::after { background: var(--gem-brand); }
+
+/* ---------- 属性列表：整行 hover 浅靛，便于逐行核对 ---------- */
+.attribute-list > div { transition: background var(--gem-dur) var(--gem-ease); }
+.attribute-list > div:hover { background: var(--gem-brand-soft); }
+
+/* ---------- 详情头图加轻投影，增强质感 ---------- */
+.detail-title .el-image, .operator-detail__header > .el-image { box-shadow: var(--gem-shadow-sm); }
+
+/* ---------- JSON 视图圆角 ---------- */
+.json-view { border-radius: var(--gem-radius-md); }
+
+/* ---------- 步骤条：已完成/进行中步标题用品牌深色并加粗 ---------- */
+.bulk-steps .el-step__title.is-finish,
+.bulk-steps .el-step__title.is-process { color: var(--gem-brand-strong); font-weight: 600; }
+
+/* ---------- 搜索栏：浅底分区，聚焦时输入框自带主色光环（由 EP 变量承接） ---------- */
+.product-search-bar { background: var(--gem-surface-2); }
+
+/* ---------- 发布进度 / 商品选择：失败行高亮，运营一眼定位失败项 ---------- */
+.el-table .job-item--failed > td.el-table__cell { background: var(--gem-danger-soft); }
+.el-table .job-item--failed:hover > td.el-table__cell { background: #FCE3E2 !important; }
+.el-table .publish-item--failed > td.el-table__cell { background: var(--gem-danger-soft); }
+.el-table .publish-item--failed:hover > td.el-table__cell { background: #FCE3E2 !important; }
