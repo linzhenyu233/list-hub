@@ -17,9 +17,20 @@ PROJECT_VARIABLES = {
     "BULK_WORKERS_PER_PLATFORM", "BULK_WORKERS_PER_SHOP",
     "WECHAT_API_BASE", "XHS_API_BASE",
     "CORS_ORIGINS", "HUOPAI_PATH", "HUOPAI_DIR",
+    # 鉴权：三个服务共用的 X-API-Key（见 api_auth.py；未配置则不校验）
+    "API_KEY",
+    # 以下键代码里在 os.environ.get，但白名单漏了 —— 在 .env 里配了也读不到：
+    # 货盘标题品牌（huopai_adapter.py）
+    "HUOPAI_WECHAT_BRAND", "HUOPAI_XHS_BRAND",
+    # 图片/批次/货盘备份/溯源信息的保留天数（bulk_api.py）
+    "BULK_IMAGE_TTL_DAYS", "BULK_BATCH_TTL_DAYS",
+    "BULK_MAX_HUOPAI_BACKUPS", "BULK_HUOPAI_BACKUP_TTL_DAYS",
+    "BULK_SOURCE_INFO_TTL_DAYS",
     # 多店铺
     "SHOPS_FILE", "DEFAULT_OPERATOR", "OPERATOR",
     "XHS_TOKEN_DIR",
+    # 各店图片根目录（shop_registry.py 读）
+    "DEFAULT_IMAGE_ROOT",
 }
 
 # 各店自己的平台凭证：键名约定 = 原键名 + "_" + SHOP_ID 大写，

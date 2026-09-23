@@ -478,25 +478,80 @@ def load_images(shop_id=None):
         return json.load(f)
 
 
+_BOUNDARY_BLOCK = re.compile(r"[A-Za-z0-9]")
+
+
+def _boundary_match(stem, code):
+    """stem 以 code 开头、且紧跟的字符落在边界上（结尾 / 分隔符 / 中文标记）。
+
+    不能直接 startswith：商家编码尾部就是分数（-10 / -100），
+    'ZSED004W-10' 会命中 'ZSED004W-100-D1' 的图，把 10 分的图发到 100 分商品上。
+    规则与 bulk_api/image_scanner.py 的 _boundary_match 一致（那边只认 '-'，
+    这里放宽到「非字母数字」以兼容 'XXX-50主图2.jpg' 这类带中文标记的命名）。
+    """
+    if not code or not stem.startswith(code):
+        return False
+    rest = stem[len(code):]
+    if not rest:
+        return True
+    return not _BOUNDARY_BLOCK.match(rest)
+
+
 def match_images(sku_code, images):
-    """按商家编码匹配主图：文件名去扩展名后以 sku_code 开头，排除 .psd"""
+    """按商家编码匹配主图：文件名去扩展名后等于 sku_code，或以 sku_code+边界 开头，排除 .psd"""
+    if not sku_code:
+        # 编码为空时 startswith("") 恒真，会把整套图挂到每个商品上
+        return []
     urls = []
     for img in images:
         fname = img.get("file", "")
         if fname.lower().endswith(".psd"):
             continue
         stem = os.path.splitext(fname)[0]
-        if stem == sku_code or stem.startswith(sku_code):
+        if _boundary_match(stem, sku_code):
             wx = img.get("wx_url")
             if wx:
                 urls.append(wx)
     return urls
 
 
-def ceil_div07(price_fen):
-    if price_fen is None:
+def parse_price_yuan(value):
+    """源表零售价 → 数值（元），解析不出返回 None。
+
+    这一列实测有 1280 / 1280.0 / '1,280' / '￥1280' / '1280元' / 空 等多种写法，
+    原来直接 int() 遇到带千分位或带单位的写法会抛 ValueError，
+    把整批转换直接打断（一行脏数据毁掉整次转换），所以统一先清洗再取数。
+    """
+    if value is None or isinstance(value, bool):
         return None
-    return (int(price_fen) * 10 + 6) // 7
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    text = s(value)
+    if not text:
+        return None                      # 空单元格：正常情况，不告警
+    cleaned = (text.replace(",", "").replace("，", "")
+                   .replace("￥", "").replace("¥", "").replace("元", ""))
+    match = re.search(r"\d+(?:\.\d+)?", cleaned)
+    if not match:
+        print(f"[货盘转换] WARN: 零售价无法解析({text!r})，该行售价留空", flush=True)
+        return None
+    price = float(match.group(0))
+    if price <= 0:
+        print(f"[货盘转换] WARN: 零售价非正数({text!r})，该行售价留空", flush=True)
+        return None
+    return price
+
+
+def ceil_div07(retail):
+    """售价(元) = 零售价 / 0.7，向上取整（与货盘「上架价」列同口径）。
+
+    沿用原整数算法（先 ×10 再按 7 向上取整），但先四舍五入到「角」，
+    避免 100.1/0.7 = 143.00000000000003 这类浮点误差把结果多算 1 元。
+    """
+    price = parse_price_yuan(retail)
+    if price is None:
+        return ""
+    return (round(price * 10) + 6) // 7
 
 
 def join_attrs(pairs):
@@ -533,7 +588,8 @@ def parse_peiyuzuan(sheet, images):
         if sub_series:
             product_code = f"{product_code}-{sub_series}"
         retail = r[37]  # 零售标价(单位: 元, 不是分)
-        price_yuan = ceil_div07(retail) if retail is not None else ""  # 售价(元) = 零售标价/0.7, 与货盘「上架价」列一致
+        # 售价(元) = 零售标价/0.7, 与货盘「上架价」列一致；解析不出时 ceil_div07 返回 ""
+        price_yuan = ceil_div07(retail)
         cut_wx, cut_xhs = map_cut(r[30])
         cat = s(r[17]) or s(r[16])
         attr_pairs = [
@@ -580,7 +636,8 @@ def parse_tianranzuan(sheet, images):
         product_code = split_product_code(shangjia)
         sku_code = clean_base(s(r[5])) or shangjia
         retail = r[26]  # 零售价(单位: 元, 不是分)
-        price_yuan = ceil_div07(retail) if retail is not None else ""  # 售价(元) = 零售价/0.7, 与货盘「上架价」列一致
+        # 售价(元) = 零售价/0.7, 与货盘「上架价」列一致；解析不出时 ceil_div07 返回 ""
+        price_yuan = ceil_div07(retail)
         cut_wx, cut_xhs = map_cut(r[19])
         attrs = join_attrs([
             ("色调", r[13]), ("形状", XHS_SHAPE_MAP.get(s(r[16]), s(r[16]))), ("钻石颜色", r[17]),
