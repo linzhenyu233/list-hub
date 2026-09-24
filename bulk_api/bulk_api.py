@@ -29,6 +29,7 @@ from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
+from app_version import APP_VERSION
 import shop_registry
 import api_auth
 
@@ -157,7 +158,7 @@ def _allowed_roots_for(shop_id=None):
     return list(dict.fromkeys(([shop_root] if shop_root else []) + list(ALLOWED_IMAGE_ROOTS)))
 
 
-app = FastAPI(title="商品批量发布中台", version="0.1.0")
+app = FastAPI(title="商品批量发布中台", version=APP_VERSION)
 
 # 鉴权：X-API-Key（未配置 API_KEY 时只告警不拦截，见 api_auth.py）。
 # bulk_api 没有 CORS 中间件（前端经 vite 代理同源访问），顺序无额外要求。

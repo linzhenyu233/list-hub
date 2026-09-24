@@ -76,6 +76,7 @@ from xhs_store import XhsStore
 # 多店铺：从项目根读店铺注册表（shops.json，缺失则回退 .env 单店）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
+from app_version import APP_VERSION
 import shop_registry
 import api_auth
 
@@ -100,7 +101,7 @@ CORS_ORIGINS = [item.strip() for item in os.environ.get("CORS_ORIGINS", "*").spl
 
 
 # 创建 FastAPI 应用
-app = FastAPI(title="小红书运营后台服务", version="0.2.0")
+app = FastAPI(title="小红书运营后台服务", version=APP_VERSION)
 
 # 鉴权：X-API-Key（未配置 API_KEY 时只告警不拦截，见 api_auth.py）。
 # 必须在 add_middleware(CORS) 之前装，否则 401 响应不经过 CORS 中间件。

@@ -55,6 +55,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
+import api_auth
 
 load_project_env()
 
@@ -162,7 +163,9 @@ def xhs_call(method: str, path: str, json_body: dict = None, timeout: int = 60):
     """调 xhs_api.py。HTTP 4xx/5xx 直接抛异常带 detail;
     ok=False 但 partial=True(部分 SKU 失败)时不抛,留给上层处理。"""
     url = f"{XHS_API_BASE.rstrip('/')}{path}"
-    resp = requests.request(method, url, json=json_body, timeout=timeout)
+    # xhs_api 开启 X-API-Key 鉴权后，不带这个头会直接 401
+    resp = requests.request(method, url, json=json_body, timeout=timeout,
+                            headers=api_auth.auth_headers())
     try:
         data = resp.json()
     except Exception:
@@ -331,8 +334,14 @@ def sync_items(since: str = None, dry_run: bool = False):
             for sku_id, sku in zip(result.get("skuIds") or [], payload["sku_list"]):
                 if sku.get("erpCode"):
                     mapping["skus"][sku["erpCode"]] = sku_id
+            # 建一个就落盘一个：原先是整批循环跑完才 save_mapping，中途任一商品抛错
+            # （限流/超时/平台报错）就会丢掉前面所有已建商品的绑定，下次同步把它们
+            # 当成「未绑定」再建一遍，平台上出现重复商品。
+            save_mapping(mapping)
             created += 1
             print(f"  + 创建: {code} → itemId={xhs_item_id}, skuIds={result.get('skuIds')}")
+            if not xhs_item_id:
+                print(f"    ! {code} 创建成功但未返回 itemId，无法登记绑定，请手工核对平台")
             for err in (result.get("skuErrors") or []):
                 print(f"    ! SKU 创建失败明细: {err}")
 
