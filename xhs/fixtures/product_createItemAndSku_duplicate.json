@@ -1,0 +1,8 @@
+{
+  "_comment": "负面剧本：商品名称在同店已存在被平台拒绝。用于复现「发布失败清单 → 在审核抽屉改标题 → 重试」这条路径。⚠️ error_code 是 `*` 待核对项（软著后用 MOCK_RECORD=1 录一次真实报错响应校正）；壳与真实网关一致。",
+  "_enable": "MOCK_FIXTURE_MAP=product.createItemAndSku=product_createItemAndSku_duplicate.json",
+  "error_code": -9000001,
+  "success": false,
+  "error_msg": "店铺商品名称不能重复，请修改后重试",
+  "data": null
+}

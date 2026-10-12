@@ -61,10 +61,12 @@ import os
 import sys
 import time          # 生成 timestamp
 import hashlib       # 做 MD5 签名
-import requests      # 发 HTTP 请求
+# 注意:HTTP 请求不再直接调 requests —— 统一走 mock_platform.gateway_call,
+# 由它决定是回放 fixture(mock) 还是真的发往网关(live/sandbox)。
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
+import mock_platform      # 三级模式(mock/sandbox/live)与 fixture 回放
 
 load_project_env()
 
@@ -89,15 +91,18 @@ class XhsStore:
     # 所有业务接口 + 换 token 接口,都走这一个网关(官方规定)
     BASE = "https://ark.xiaohongshu.com/ark/open_api/v3/common_controller"
 
-    def __init__(self, app_id, app_secret, access_token=None):
+    def __init__(self, app_id, app_secret, access_token=None, shop_id=None):
         """
         - app_id:       开放平台应用 appId
         - app_secret:   应用 appSecret(参与签名)
         - access_token: 店铺授权凭证;不传则必须在调用前 get_access_token()
+        - shop_id:      该 token 属于哪家店铺;仅用于解析 mock/sandbox/live 模式
+                        (shops.json 里按店配 mode,不传则按默认店/环境变量解析)
         """
         self.app_id = app_id
         self.app_secret = app_secret
         self.access_token = access_token
+        self.shop_id = shop_id or ""
         # token 到期时间(秒级时间戳),refresh 时用来判断是否需要续
         self._token_expire_at = 0
 
@@ -142,11 +147,8 @@ class XhsStore:
         if self.access_token and method != "oauth.getAccessToken":
             body["accessToken"] = self.access_token
 
-        resp = requests.post(
-            self.BASE,
-            headers={"Content-Type": "application/json;charset=utf-8"},
-            json=body,
-            timeout=15,
+        resp = mock_platform.gateway_call(
+            "xhs", self.BASE, method_key=method, body=body, timeout=15, shop_id=self.shop_id,
         )
         data = resp.json()
 
@@ -391,6 +393,118 @@ class XhsStore:
         kind = "主图" if int(material_type) == 1 else "主图视频"
         print(f"[product.updateItemImage] 修改{kind}成功 itemId={item_id}")
         return data
+
+    # =================================================================
+    # 接口 10:订单 / 售后(只读) —— 数据面板用
+    #
+    # ⚠️ 合规:订单/售后响应里有收件人姓名、电话、地址、买家ID 等隐私,**一律不透出**;
+    #    下面 summarize_* 用「白名单提取」,只挑选算指标要用的键。
+    # ⚠️ 参数一律用 camelCase(pageNo/pageSize/timeType/startTime/endTime):
+    #    小红书网关按 camelCase 校验,传 snake_case 会报 required param check 或 -9020。
+    # ⚠️ 时间区间限制:timeType=1(按创建时间)跨度 ≤ 24 小时;timeType=2(按更新时间)≤ 30 分钟。
+    # =================================================================
+    @staticmethod
+    def _pick(source, *keys):
+        """按顺序取第一个非空字段(小红书同一含义的字段名在不同接口里不一致)。"""
+        for key in keys:
+            if source.get(key) is not None:
+                return source[key]
+        return None
+
+    def list_orders(self, start_time, end_time, time_type=1, page_no=1, page_size=20, order_status=None):
+        """按时间区间拉订单列表(返回 orderList[];只能按天切分调用)。
+
+        timeType: 1=按下单/创建时间(≤24h) 2=按更新时间(≤30min,且需倒序翻页)
+        """
+        payload = {"timeType": int(time_type), "startTime": int(start_time), "endTime": int(end_time),
+                   "pageNo": int(page_no), "pageSize": int(page_size)}
+        if order_status is not None:
+            payload["orderStatus"] = int(order_status)
+        return self._post("order.getOrderList", payload)
+
+    @classmethod
+    def summarize_order(cls, order):
+        """订单 → 只留算指标要用的字段(买家隐私全部丢弃)。
+
+        ⚠️ 金额单位待真机验证:SDK 模型里 totalAmount/actualAmount 是 float(疑似「元」),
+           而微信那边是「分」;这里原样透出,换算由中台按平台分别处理。
+        """
+        order = order or {}
+        return {
+            "order_id": cls._pick(order, "orderId", "order_id"),
+            "order_no": cls._pick(order, "orderNo", "order_no"),
+            "status": cls._pick(order, "orderStatus", "order_status"),
+            "order_type": cls._pick(order, "orderType", "order_type"),
+            # ⚠️ 真机实测(2026-10-12):字段名是 createdTime / paidTime,而且是**毫秒**时间戳。
+            #    原代码找的是 createTime(不存在) → 时间读成 null → 该平台指标全 0,
+            #    表现就是"小红书面板一笔订单都没有"(订单数却有值)。
+            "create_time": cls._pick(order, "createdTime", "createTime", "create_time"),
+            "pay_time": cls._pick(order, "paidTime", "payTime", "pay_time"),
+            "finish_time": cls._pick(order, "finishTime", "finish_time"),
+            "cancel_time": cls._pick(order, "cancelTime", "cancel_time"),
+            "update_time": cls._pick(order, "updateTime", "update_time"),
+            # 列表接口**不返回任何金额字段**(实测 26 个字段里没有),金额只能靠订单详情补
+            "total_amount": cls._pick(order, "totalAmount", "total_amount"),
+            "actual_amount": cls._pick(order, "actualAmount", "actual_amount"),
+            "after_sale_status": cls._pick(order, "orderAfterSalesStatus", "afterSalesStatus"),
+        }
+
+    def get_order_detail(self, order_id):
+        """订单详情(只读)。
+
+        为什么必须调:实测 orderList 里 createTime/actualAmount/totalAmount **全是 null**
+        (只有 updateTime,且是**毫秒**),拿列表算指标会全部算成 0——线上表现为
+        "小红书面板一笔订单都没有",实际订单是有的。
+        """
+        return self._post("order.getOrderDetail", {"orderId": str(order_id)})
+
+    @classmethod
+    def summarize_order_detail(cls, payload):
+        """订单详情 → 指标要用的字段(收件人/买家等隐私字段一律丢弃)。"""
+        payload = payload or {}
+        order = payload.get("orderInfo") or payload.get("order") or payload
+        return {
+            "order_id": cls._pick(order, "orderId", "order_id"),
+            "status": cls._pick(order, "orderStatus", "order_status"),
+            "create_time": cls._pick(order, "createdTime", "createTime", "create_time"),
+            "pay_time": cls._pick(order, "paidTime", "payTime", "pay_time"),
+            "finish_time": cls._pick(order, "finishTime", "finish_time"),
+            "cancel_time": cls._pick(order, "cancelTime", "cancel_time"),
+            "update_time": cls._pick(order, "updateTime", "update_time"),
+            # 实测:付款金额字段是 totalPayAmount 且**单位是分**(109900 = 1099.00 元,
+            # 与同日售后退款 expectedRefundAmountYuan=1099.0 元交叉验证一致)。
+            "actual_amount": cls._pick(order, "totalPayAmount", "actualAmount", "actual_amount"),
+            "total_amount": cls._pick(order, "totalPayAmount", "totalAmount", "total_amount"),
+            "merchant_receive_amount": cls._pick(order, "merchantActualReceiveAmount"),
+        }
+
+    def list_aftersales(self, start_time, end_time, time_type=1, page_no=1, page_size=20):
+        """按时间区间拉售后单列表(旧版接口 afterSale.listAfterSaleApi,实测可用)。"""
+        # 实测:orderList 的 createTime/actualAmount/totalAmount 一律回 null,
+        # 只有 updateTime(毫秒) 有值 → 指标里的"下单时间/支付金额"必须靠订单详情补,
+        # 见 get_order_detail / summarize_order_detail。
+        payload = {"timeType": int(time_type), "startTime": int(start_time), "endTime": int(end_time),
+                   "pageNo": int(page_no), "pageSize": int(page_size)}
+        return self._post("afterSale.listAfterSaleApi", payload)
+
+    @classmethod
+    def summarize_aftersale(cls, record):
+        """售后单 → 指标字段。
+
+        ⚠️ 退款金额字段名是 refundAmountYuan(带 Yuan)→ 单位疑似「元」,与微信的「分」不同,
+           这里原样透出,换算与口径在中台定;字段名以真机复核为准。
+        """
+        record = record or {}
+        return {
+            "after_sale_id": cls._pick(record, "afterSaleId", "after_sale_id", "returnsId", "returns_id"),
+            "order_id": cls._pick(record, "orderId", "order_id"),
+            "status": cls._pick(record, "refundStatus", "status", "afterSaleStatus"),
+            "refund_amount": cls._pick(record, "refundAmountYuan", "refundAmount", "refund_amount_yuan"),
+            "expected_refund_amount": cls._pick(record, "expectedRefundAmountYuan", "expectedRefundAmount"),
+            "create_time": cls._pick(record, "createTime", "create_time"),
+            "update_time": cls._pick(record, "updateTime", "update_time"),
+            "refund_time": cls._pick(record, "refundTime", "refund_time"),
+        }
 
 
 # =====================================================================

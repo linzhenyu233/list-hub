@@ -1,0 +1,29 @@
+{
+  "_readme": [
+    "小红书接口的 mock 剧本（fixture）目录。",
+    "",
+    "【谁会读它】mock_platform._load_fixture —— 平台服务在 mock 模式下按 method 名找剧本。",
+    "  这里默认什么都不放：成功响应由 mock_platform._synthesize 按平台响应壳确定性合成",
+    "  （同一商品编码永远算出同一个假 ID，便于回归比对），没必要维护一堆固定文件。",
+    "  只有「平台才会给出的异常响应」（重名被拒、类目无权限…）才值得写成文件。",
+    "",
+    "【查找顺序】MOCK_FIXTURE_MAP 显式指定 > _recorded/<method>.json（录制的真实响应）",
+    "  > 本文件的 fixtures.<method>.file > <method 转文件名>.json。",
+    "",
+    "【文件内容】平台原样的响应体（不是中台自己的简化结构），",
+    "  例如小红书必须是 {error_code:0, success:true, data:{...}} 这种壳。",
+    "  只有壳对了，签名之外的所有解析/错误处理代码才会在 mock 下真的被执行。",
+    "  以 _ 开头的键（_comment / _enable 之类）只是给人看的注释，加载时会被忽略。",
+    "",
+    "【录制】live 模式下设 MOCK_RECORD=1，真实响应会被写进 _recorded/（自动脱敏密钥/买家信息）。",
+    "  _recorded/ 已被 .gitignore 忽略：里面有真实业务数据，不进仓库。"
+  ],
+  "platform": "xhs",
+  "fixtures": {},
+  "scenarios": {
+    "product_createItemAndSku_duplicate.json": {
+      "desc": "商品名称同店重复被拒 —— 复现失败清单与「改标题后重试」",
+      "enable": "MOCK_FIXTURE_MAP=product.createItemAndSku=product_createItemAndSku_duplicate.json"
+    }
+  }
+}

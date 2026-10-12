@@ -1,0 +1,27 @@
+{
+  "_readme": [
+    "微信小店接口的 mock 剧本（fixture）目录。",
+    "",
+    "【谁会读它】mock_platform._load_fixture —— 平台服务在 mock 模式下按 URL path 找剧本",
+    "  （微信没有统一 method 字段，所以用接口路径当接口标识，如 /channels/ec/product/add）。",
+    "  这里默认什么都不放：成功响应由 mock_platform._synthesize 按微信响应壳",
+    "  {errcode:0, errmsg:ok, data:{...}} 确定性合成。",
+    "",
+    "【查找顺序】MOCK_FIXTURE_MAP 显式指定 > _recorded/<path 转文件名>.json（真实录制）",
+    "  > 本文件的 fixtures.<path>.file > <path 转文件名>.json。",
+    "",
+    "【文件内容】微信**原样的响应体**（含 errcode/errmsg，错误时还有 ext_info.error_list）。",
+    "  与真实壳一致才有意义：发品失败时外层 errmsg 只有笼统的「商品信息检查不通过」，",
+    "  真正的原因在 ext_info.error_list 里，mock 必须把这个结构也还原出来。",
+    "",
+    "【录制】live 模式下设 MOCK_RECORD=1，真实响应写进 _recorded/（自动脱敏 app_secret/access_token）。"
+  ],
+  "platform": "wechat",
+  "fixtures": {},
+  "scenarios": {
+    "product_add_param_error.json": {
+      "desc": "发品参数错（ext_info.error_list 带出错字段）—— 复现失败清单可读性",
+      "enable": "MOCK_FIXTURE_MAP=/channels/ec/product/add=product_add_param_error.json"
+    }
+  }
+}

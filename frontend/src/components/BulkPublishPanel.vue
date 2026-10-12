@@ -357,13 +357,18 @@ function syncTableSelection() {
   pagedProducts.value.forEach((row) => table.toggleRowSelection(row, codes.has(row.product_code)))
 }
 function resetItemPage() { itemPage.value = 1 }
-const mappingRows = computed(() => products.value.map((product) => ({
-  ...product,
-  mapping: {
-    ...(mapping.value.products?.[product.product_code] || {}),
-    status: [mapping.value.products?.[product.product_code]?.status, mapping.value.products?.[product.product_code]?.xhs_status].filter(Boolean).join('；') || '待系统匹配',
-  },
-})))
+const mappingRows = computed(() => products.value.map((product) => {
+  const mapped = mapping.value.products?.[product.product_code] || {}
+  // 品牌没确认到（brandId 为空）平台会直接拒，必须让运营在第 2 步就看见
+  const brandTodo = String(mapped.xhs_brand_status || '').includes('待确认') ? mapped.xhs_brand_status : ''
+  return {
+    ...product,
+    mapping: {
+      ...mapped,
+      status: [mapped.status, mapped.xhs_status, brandTodo].filter(Boolean).join('；') || '待系统匹配',
+    },
+  }
+}))
 const mappingGroups = computed(() => {
   const groups = new Map()
   for (const row of mappingRows.value) {
@@ -647,6 +652,10 @@ function platformSettingGaps(codes = null) {
 }
 // 第 3 步显示的红条：进到确认发布这一步就能看到还缺什么，不用等到点发布才知道
 const publishGuardGaps = computed(() => (step.value === 3 && products.value.length ? platformSettingGaps() : []))
+// 品牌没确认到的商品数（brandId 为空时平台必拒）：
+// 以前这里会被静默填成「品牌库第一个品牌」（= 3D-JP），现在改为留空 + 标出来让运营处理
+const xhsBrandTodoCount = computed(() => Object.values(mapping.value.products || {})
+  .filter((item) => String(item?.xhs_brand_status || '').includes('待确认')).length)
 
 // 「上次选的运费模板」按店铺记住：这一步最容易忘，记住上次的选择能少踩这个坑
 const platformSettingsKey = (shopId) => `bulk-platform-settings:${shopId || 'default'}`
@@ -776,10 +785,25 @@ async function autoMatchWechatCategories() {
     }))
     // 小红书品牌阶段：同样只在发小红书时执行
     const xhsBrandCache = {}
+    // 店铺默认品牌：店铺自有/已授权品牌（如「钻石世家」241795）**不参与平台品牌库检索**，
+    // 按名字永远搜不到，所以货盘没填品牌时必须用它兜底。
+    // ⚠️ 绝不能取品牌列表的第一个：品牌库按 ID 排序，第一个是「3D-JP」——
+    //    曾整批以 3D-JP 发出（brandId=152568），小红书后台列表把品牌名拼在商品名前，
+    //    看着像标题里多了「3D-JP 」前缀，实际是品牌选错了。
+    const defaultBrandId = String(currentShop.value?.xhs?.brand_id || '')
+    const defaultBrandName = String(currentShop.value?.xhs?.brand_name || '')
     await Promise.all((availablePlatforms.value.includes('xhs') ? products.value : []).map(async (product) => {
       const current = mappings[product.product_code] || {}
       const categoryId = current.xhs_category_id
       let brandId = current.xhs_brand_id || ''
+      let brandStatus = current.xhs_brand_status || ''
+      // 旧版本「货盘没填品牌就取品牌库第一个」写进映射的值（典型 152568 = 3D-JP）：
+      // 货盘品牌列为空、又不是店铺默认品牌，那它只可能是那套兜底来的 → 重新匹配时纠正掉，
+      // 否则重跑一次「立即匹配类目」会原样带着 3D-JP 再发一遍。
+      if (brandId && brandId !== defaultBrandId && !String(product.brand || '').trim()) {
+        brandId = ''
+        brandStatus = ''
+      }
       if (categoryId && !brandId) {
         try {
           // 与单独发布页保持一致：先读取该末级类目的完整店铺品牌列表，避免关键词查询漏品牌
@@ -791,13 +815,19 @@ async function autoMatchWechatCategories() {
           if (product.brand) {
             const targetBrand = normalizeBrand(product.brand)
             const exact = brands.filter((item) => normalizeBrand(optionName(item)) === targetBrand)
-            if (exact.length === 1) brandId = settingId(exact[0])
+            if (exact.length === 1) { brandId = settingId(exact[0]); brandStatus = '' }
           }
-          // 兜底:Excel 没填品牌时,默认取该类目下第一个品牌(运营可在「审核编辑」里逐条改)
-          if (!brandId && brands.length) brandId = settingId(brands[0])
-        } catch { /* brand remains unconfirmed */ }
+        } catch { /* 品牌库取不到不影响下面的店铺默认品牌兜底 */ }
+        // 兜底顺序：店铺默认品牌 → 留空待确认（不再静默取平台品牌列表的第一个）
+        if (!brandId && defaultBrandId) {
+          brandId = defaultBrandId
+          brandStatus = `小红书品牌用店铺默认（${defaultBrandName || defaultBrandId}）`
+        }
       }
-      mappings[product.product_code] = { ...current, xhs_brand_id: brandId,
+      if (categoryId && !brandId) {
+        brandStatus = '小红书品牌待确认：货盘「品牌」列没填，当前店铺也没配默认品牌（shops.json 的 xhs.brand_id）'
+      }
+      mappings[product.product_code] = { ...current, xhs_brand_id: brandId, xhs_brand_status: brandStatus,
         xhs_shipping_template_id: current.xhs_shipping_template_id || batchPlatformSettings.xhsShippingId,
         xhs_logistics_plan_id: current.xhs_logistics_plan_id || batchPlatformSettings.xhsLogisticsId }
     }))
@@ -1755,6 +1785,10 @@ async function publish(partial = false) {
         <template v-for="(options, level) in (xhsCascade[group.internal_category]?.levels || [])" :key="level"><el-select :model-value="xhsCascade[group.internal_category]?.selected?.[level]" :placeholder="`第${level + 1}级类目`" @change="(value) => confirmXhsCategory(group, level, value)"><el-option v-for="item in options" :key="item.id || item.categoryId" :label="item.name" :value="item.id || item.categoryId" /></el-select></template>
       </div>
     </div>
+    <!-- 品牌没兜底可用时的红条：brandId 为空平台必拒（且不会静默替运营选一个品牌） -->
+    <el-alert v-if="step === 2 && availablePlatforms.includes('xhs') && xhsBrandTodoCount" type="warning" show-icon :closable="false" style="margin-bottom: 12px"
+      :title="`小红书品牌待确认：${xhsBrandTodoCount} 件商品`"
+      description="货盘「品牌」列没填，当前店铺也没配默认品牌。请给该店在 shops.json 里配 xhs.brand_id（店铺自有品牌不在平台品牌库里，按名字搜不到），或先在货盘表里填好品牌再导入。" />
     <div v-if="step === 2 && attrGroupTotal" class="bulk-filters" style="margin: 12px 0">
       <el-input v-model="attrGroupKeyword" clearable :prefix-icon="Search" placeholder="搜索内部类目" style="width: 240px" />
       <el-select v-model="attrGroupFilter" style="width: 180px"><el-option label="全部类目" value="all" /><el-option :label="`仅看未匹配 (${unmatchedCategoryCount})`" value="unmatched" /></el-select>

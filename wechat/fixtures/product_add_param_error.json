@@ -1,0 +1,17 @@
+{
+  "_comment": "负面剧本：发品被微信拒绝（参数错）。重点是还原 ext_info.error_list —— 外层 errmsg 只有笼统的「商品信息检查不通过」，真实原因（哪个字段错了）在 ext_info 里。⚠️ 错误码是 `*` 待核对项，软著后用 MOCK_RECORD=1 录一次真实报错响应校正。",
+  "_enable": "MOCK_FIXTURE_MAP=/channels/ec/product/add=product_add_param_error.json",
+  "errcode": 10020019,
+  "errmsg": "商品信息检查不通过",
+  "ext_info": {
+    "error_list": [
+      {
+        "error_code": 10020019,
+        "error_msg": "运费模板ID无效",
+        "error_field": [
+          "express_info.template_id"
+        ]
+      }
+    ]
+  }
+}

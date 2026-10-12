@@ -56,6 +56,7 @@ from wechat_store_client import WxStore
 
 # 多店铺：从项目根读店铺注册表（shops.json，缺失则回退 .env 单店）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import runtime_config
 from runtime_config import load_project_env
 from app_version import APP_VERSION
 import shop_registry
@@ -121,6 +122,8 @@ def store_for(shop: dict) -> "WxStore":
                 freight_template_id=conf.get("freight_template_id") or "",
                 # 只有默认店才允许回退 .env 的单店时代默认值
                 legacy_defaults=(shop_id == shop_registry.default_shop()["shop_id"]),
+                # 供 mock/sandbox/live 模式解析（shops.json 里按店配 mode）
+                shop_id=shop_id,
             )
             _STORES[shop_id] = inst
         return inst
@@ -534,10 +537,50 @@ def list_products(request: Request,
 
 
 # ==================================================================
+# 12. 订单 / 售后(只读) —— 中台「数据面板」用
+#     只返回算指标要用的字段;收货人姓名/电话/地址等买家隐私一律不透出。
+#     微信要求时间区间 ≤ 24 小时,所以调用方(中台)必须按天切分。
+# ==================================================================
+@app.get("/orders")
+def list_orders(request: Request,
+                start: int = Query(..., description="起始时间(秒级时间戳)"),
+                end: int = Query(..., description="结束时间(秒级时间戳),与 start 跨度不得超过 24 小时"),
+                page_size: int = Query(20, ge=1, le=100, description="每页订单数"),
+                next_key: str = Query(None, description="上一页返回的翻页游标"),
+                by_update_time: int = Query(0, description="1=按更新时间查询(默认按下单时间)")):
+    """订单列表 + 逐单详情摘要(金额单位:分;时间:秒级)。"""
+    store = store_for(shop_of(request))
+    return ok_or_400(lambda: store.list_order_summaries(
+        start, end, page_size=page_size, next_key=next_key, by_update_time=bool(by_update_time)))
+
+
+@app.get("/aftersales")
+def list_aftersales(request: Request,
+                    begin: int = Query(..., description="售后单起始时间(秒级时间戳)"),
+                    end: int = Query(..., description="结束时间(秒级时间戳),与 begin 跨度不得超过 24 小时"),
+                    page_size: int = Query(20, ge=1, le=100),
+                    next_key: str = Query(None),
+                    by_update_time: int = Query(0, description="1=按更新时间查询(默认按创建时间)")):
+    """售后单列表 + 逐单详情摘要(退款金额单位:分)。"""
+    store = store_for(shop_of(request))
+    return ok_or_400(lambda: store.list_aftersale_summaries(
+        begin, end, page_size=page_size, next_key=next_key, by_update_time=bool(by_update_time)))
+
+
+@app.get("/shop-overview")
+def shop_overview(request: Request,
+                  date: str = Query(..., description="日期 YYYY-MM-DD(罗盘只支持按日查询)")):
+    """平台自带的数据概览(微信罗盘)。金额单位:分;接口没有访客数/转化率字段。"""
+    store = store_for(shop_of(request))
+    return ok_or_400(lambda: store.get_shop_overview(str(date).replace("-", "")))
+
+
+# ==================================================================
 # 启动入口:python fastapi_server.py 直接跑
 # ==================================================================
 if __name__ == "__main__":
-    import uvicorn
     # host 默认 127.0.0.1（仅本机/前端代理访问）；确需局域网直连时设 WX_API_HOST=0.0.0.0
     # 并配好 API_KEY。port 默认 8000,可改。
-    uvicorn.run(app, host=API_HOST, port=API_PORT)
+    # DEV_RELOAD=1 时开热重载（开发机用）；未设置时行为与改造前完全一致。
+    runtime_config.run_service(app, "fastapi_server", API_HOST, API_PORT,
+                               reload_dirs=[os.path.dirname(os.path.abspath(__file__))])

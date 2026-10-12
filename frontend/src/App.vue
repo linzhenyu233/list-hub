@@ -20,6 +20,7 @@ import {
   Warning,
   Notebook,
   Upload,
+  TrendCharts,
 } from '@element-plus/icons-vue'
 import { storeApi } from './api'
 import { xhsApi } from './xhsApi'
@@ -32,6 +33,7 @@ const XhsProductForm = defineAsyncComponent(() => import('./components/XhsProduc
 const BulkPublishPanel = defineAsyncComponent(() => import('./components/BulkPublishPanel.vue'))
 const CategoryAliasPanel = defineAsyncComponent(() => import('./components/CategoryAliasPanel.vue'))
 const ShopPanel = defineAsyncComponent(() => import('./components/ShopPanel.vue'))
+const DataDashboardPanel = defineAsyncComponent(() => import('./components/DataDashboardPanel.vue'))
 const ProductDetailView = defineAsyncComponent(() => import('./components/ProductDetailView.vue'))
 const ProductSearchBar = defineAsyncComponent(() => import('./components/ProductSearchBar.vue'))
 import EllipsisText from './components/EllipsisText.vue'
@@ -381,6 +383,7 @@ const moreNavItems = [
   { view: 'create', label: '发布微信商品', icon: CirclePlus, platform: 'wechat' },
   { view: 'xhs-create', label: '发布小红书商品', icon: CirclePlus, platform: 'xhs' },
   { view: 'category-aliases', label: '类目映射', icon: Collection, platform: 'bulk' },
+  { view: 'data-dashboard', label: '数据面板', icon: TrendCharts, platform: 'bulk' },
   { view: 'shops', label: '店铺管理', icon: Shop },
   { view: 'settings', label: '接口设置', icon: Setting },
 ]
@@ -561,6 +564,7 @@ onMounted(async () => {
         <el-menu-item-group title="批量与配置">
           <el-menu-item index="bulk-publish" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
           <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
+          <el-menu-item index="data-dashboard" @click="platform = 'bulk'"><el-icon><TrendCharts /></el-icon><span>数据面板</span></el-menu-item>
           <el-menu-item index="shops"><el-icon><Shop /></el-icon><span>店铺管理</span></el-menu-item>
           <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
         </el-menu-item-group>
@@ -575,7 +579,7 @@ onMounted(async () => {
       <el-header class="topbar">
         <div>
           <span class="breadcrumb">运营中心 /</span>
-          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : activeView === 'shops' ? '店铺管理' : '连接设置' }}</strong>
+          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : activeView === 'data-dashboard' ? '数据面板' : activeView === 'shops' ? '店铺管理' : '连接设置' }}</strong>
         </div>
         <div class="topbar-actions">
           <el-select v-model="shopIdProxy" :loading="shopSwitching" placeholder="选择店铺"
@@ -693,6 +697,8 @@ onMounted(async () => {
           </div>
           <ProductForm @created="afterCreated" @cancel="activeView = 'products'" />
         </template>
+
+        <DataDashboardPanel v-if="activeView === 'data-dashboard'" />
 
         <ShopPanel v-if="activeView === 'shops'" :refresh-tick="globalRefreshTick" />
 

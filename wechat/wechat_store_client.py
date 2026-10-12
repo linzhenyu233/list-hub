@@ -34,11 +34,13 @@ import sys
 import struct
 import threading  # 并发上传图片时串行化"换 token",避免多个线程抢着换、互相顶掉
 import time    # 用来算 token 过期时间、测试时等待
-import requests  # 发 HTTP 请求的库(微信接口都是 HTTP 接口)
+# 注意:本类不再直接调用 requests —— 所有网关请求统一走 mock_platform.gateway_call,
+# 由它决定是回放 fixture(mock) 还是真的发往微信(live/sandbox)。
 from concurrent.futures import ThreadPoolExecutor  # 列表要逐个查详情,并发拉缩短耗时
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from runtime_config import load_project_env
+import mock_platform      # 三级模式(mock/sandbox/live)与 fixture 回放
 
 load_project_env()
 
@@ -90,7 +92,8 @@ class WxStore:
     # 是手里的 token 坏了",应强刷 token 重试一次,而不是直接把失败抛给业务层。
     TOKEN_ERROR_CODES = {40001, 40013, 40014, 42001, 42007}
 
-    def __init__(self, appid, secret, after_sale_address_id="", freight_template_id="", legacy_defaults=False):
+    def __init__(self, appid, secret, after_sale_address_id="", freight_template_id="",
+                 legacy_defaults=False, shop_id=""):
         """初始化:记住 appid/secret,准备一个空的 token 缓存
 
         多店铺:
@@ -105,6 +108,9 @@ class WxStore:
         self.after_sale_address_id = after_sale_address_id or ""
         self.freight_template_id = freight_template_id or ""
         self.legacy_defaults = bool(legacy_defaults)
+        # shop_id 只用于解析 mock/sandbox/live 模式（shops.json 里按店配 mode），
+        # 不参与签名、也不影响请求内容。
+        self.shop_id = shop_id or ""
         self._token = None            # 缓存 access_token,避免每次都重新换
         self._token_expire_at = 0     # token 的过期时间戳(Unix时间)
         # 批量发布是多线程并发上传图片(一次 10 路),若同时发现 token 过期、
@@ -147,15 +153,15 @@ class WxStore:
         # —— errcode 40001「access_token is invalid or not latest」就是这么来的。
         data = {}
         try:
-            resp = requests.post(
-                f"{self.BASE}/cgi-bin/stable_token",
-                json={
+            resp = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}/cgi-bin/stable_token", method_key="/cgi-bin/stable_token",
+                body={
                     "grant_type": "client_credential",
                     "appid": self.appid,
                     "secret": self.secret,
                     "force_refresh": bool(force),
                 },
-                timeout=10,
+                timeout=10, shop_id=self.shop_id,
             )
             data = resp.json() or {}
         except Exception as exc:
@@ -166,14 +172,14 @@ class WxStore:
 
         if "access_token" not in data:
             # 少数老账号不支持 stable_token 时回退老接口
-            resp = requests.get(
-                f"{self.BASE}/cgi-bin/token",          # 接口地址
+            resp = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}/cgi-bin/token", method_key="/cgi-bin/token",
                 params={                                # 查询参数
                     "grant_type": "client_credential",  # 固定写法:"客户端凭证"模式
                     "appid": self.appid,                # 你的应用ID
                     "secret": self.secret,              # 你的应用密钥
                 },
-                timeout=10,                             # 10秒超时,防止卡死
+                timeout=10, shop_id=self.shop_id, http_get=True,
             )
             data = resp.json()  # 把返回的 JSON 文本转成 Python 字典
 
@@ -215,6 +221,15 @@ class WxStore:
         for e in (data.get("ext_info") or {}).get("error_list") or []:
             text += f" {e.get('error_code')} {e.get('error_msg')}"
         hints = []
+        if "10020065" in text or "商品未上架或不存在" in text:
+            # 实测（2026-10-12）：同一个商品ID，用 A 店凭证查得到，换成 B 店凭证
+            # 就原样回这个错 —— 微信对"不属于本店的商品ID"统一回 10020065。
+            hints.append(
+                "【10020065 商品未上架或不存在】这个商品ID在当前选中的店铺里查不到，常见三种原因："
+                "① 右上角选错了店铺（两家微信店的商品ID不能互换查询）——先确认店铺再重试；"
+                "② 该商品已在微信小店后台被删除或在回收站；"
+                "③ 商品ID 抄错（例如货盘回填列里是另一家店的ID）。"
+            )
         if "6600016" in text or "类目错误" in text:
             hints.append(
                 "【6600016 类目错误】按实测经验按序排查: "
@@ -253,13 +268,13 @@ class WxStore:
         for attempt in (0, 1):
             params = {"access_token": self.get_access_token(force=attempt == 1)}
 
-            if is_json_body:
-                # json= 会自动把 Python 字典转成 JSON 字符串,并设置 Content-Type
-                resp = requests.post(f"{self.BASE}{path}", params=params,
-                                     json=payload or {}, timeout=15)
-            else:
-                resp = requests.post(f"{self.BASE}{path}", params=params,
-                                     data=payload or {}, timeout=15)
+            # 网关出口统一走 mock_platform：mock 模式在此回放 fixture（不发外网），
+            # live/sandbox 才真的请求微信。重试口径不变（token 失效强刷一次）。
+            resp = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}{path}", method_key=path, body=payload or {},
+                params=params, timeout=15, shop_id=self.shop_id,
+                form=not is_json_body, retries=0,   # 这里自带重试，别叠加
+            )
 
             data = resp.json()  # 解析响应
 
@@ -297,11 +312,10 @@ class WxStore:
                 "resp_type": 1,     # 1=返回图片URL(发商品head_imgs要填它); 0=返回media_id
             }
             # 请求体里放图片地址,微信去这个地址把图片拉过来转存
-            resp = requests.post(
-                f"{self.BASE}/shop/ec/basics/img/upload",
-                params=params,
-                json={"img_url": img_url},
-                timeout=15,
+            resp = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}/shop/ec/basics/img/upload",
+                method_key="/shop/ec/basics/img/upload", body={"img_url": img_url},
+                params=params, timeout=15, shop_id=self.shop_id, retries=0,
             )
             data = resp.json()
             errcode = data.get("errcode", 0)
@@ -356,11 +370,11 @@ class WxStore:
                 "width": width,
                 "height": height,
             }
-            response = requests.post(
-                f"{self.BASE}/shop/ec/basics/img/upload",
-                params=params,
+            response = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}/shop/ec/basics/img/upload",
+                method_key="/shop/ec/basics/img/upload", params=params,
                 files={"media": (os.path.basename(filename), content)},
-                timeout=120,
+                timeout=120, shop_id=self.shop_id, retries=0,
             )
             data = response.json()
             errcode = data.get("errcode", 0)
@@ -424,11 +438,11 @@ class WxStore:
                 "video_upload_key": upload_key,
                 "partnum": partnum,
             }
-            response = requests.post(
-                f"{self.BASE}/shop/ec/basics/video/uploadpart",
-                params=params,
+            response = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}/shop/ec/basics/video/uploadpart",
+                method_key="/shop/ec/basics/video/uploadpart", params=params,
                 files={"media": (f"part{partnum}", chunk)},
-                timeout=120,
+                timeout=120, shop_id=self.shop_id, retries=0,
             )
             data = response.json()
             errcode = data.get("errcode", 0)
@@ -450,10 +464,10 @@ class WxStore:
                     "access_token": self.get_access_token(force=attempt == 1),
                     "video_upload_key": upload_key,
                 }
-                response = requests.get(
-                    f"{self.BASE}/shop/ec/basics/video/getplayinfo",
-                    params=params,
-                    timeout=30,
+                response = mock_platform.gateway_call(
+                    "wechat", f"{self.BASE}/shop/ec/basics/video/getplayinfo",
+                    method_key="/shop/ec/basics/video/getplayinfo", params=params,
+                    timeout=30, shop_id=self.shop_id, http_get=True, retries=0,
                 )
                 data = response.json()
                 errcode = data.get("errcode", 0)
@@ -747,10 +761,10 @@ class WxStore:
         """用给定 token 拉一次全量类目,返回 (扁平节点列表, 是否 token 失效)。"""
         token_invalid = False
         for path in ("/channels/ec/category/all", "/shop/ec/category/all"):
-            resp = requests.get(
-                f"{self.BASE}{path}",
-                params={"access_token": token},
-                timeout=30,
+            resp = mock_platform.gateway_call(
+                "wechat", f"{self.BASE}{path}", method_key=path,
+                params={"access_token": token}, timeout=30, shop_id=self.shop_id,
+                http_get=True, retries=0,
             )
             data = resp.json()
             errcode = data.get("errcode", 0)
@@ -1095,6 +1109,200 @@ class WxStore:
             "next_key": d.get("next_key"),
             "total": d.get("total_num", 0),
         }
+
+    # =================================================================
+    # 接口 12:订单 / 售后(只读) —— 数据面板用
+    #
+    # ⚠️ 合规:订单详情里有收货人姓名/电话/地址/虚拟号等买家隐私,**一律不透出**。
+    #    这里用「白名单提取」而不是"删几个字段":只挑选下面这些键,其余整块丢掉,
+    #    平台以后新增隐私字段也不会被顺手带出去(中台同样不落地明文买家信息)。
+    # ⚠️ 微信要求:订单/售后的时间区间**不得大于 24 小时**,所以调用方必须按天切分。
+    # =================================================================
+    # 订单状态:10 待付款 / 20 待发货 / 21 部分发货 / 30 待收货 / 100 完成
+    #           200 全部商品售后后取消 / 250 未付款取消
+    def list_orders(self, start_time, end_time, page_size=30, next_key=None, by_update_time=False):
+        """按时间区间拉订单ID列表(微信只返回ID,详情要另查)。
+
+        返回 {"order_ids": [...], "next_key": ..., "has_more": bool}
+        """
+        payload = {"page_size": int(page_size)}
+        if by_update_time:
+            payload["update_time_range"] = {"start_time": int(start_time), "end_time": int(end_time)}
+        else:
+            payload["create_time_range"] = {"start_time": int(start_time), "end_time": int(end_time)}
+        if next_key:
+            payload["next_key"] = next_key
+        data = self._post("/channels/ec/order/list/get", payload)
+        body = data.get("data", data)
+        return {"order_ids": body.get("order_id_list") or [],
+                "next_key": body.get("next_key"),
+                "has_more": bool(body.get("has_more"))}
+
+    @staticmethod
+    def summarize_order(order):
+        """订单详情 → 只留算指标要用的字段(买家隐私全部丢弃)。
+
+        金额单位:**分**;时间字段:**秒级时间戳**。
+        """
+        order = order or {}
+        detail = order.get("order_detail") or {}
+        price = detail.get("price_info") or {}
+        delivery = detail.get("delivery_info") or {}
+        products = []
+        for item in (detail.get("product_infos") or []):
+            products.append({
+                "product_id": item.get("product_id"),
+                "sku_id": item.get("sku_id"),
+                "product_cnt": item.get("product_cnt"),
+                "real_price": item.get("real_price"),                 # 分
+                "on_aftersale_sku_cnt": item.get("on_aftersale_sku_cnt"),
+                "finish_aftersale_sku_cnt": item.get("finish_aftersale_sku_cnt"),
+            })
+        return {
+            "order_id": order.get("order_id"),
+            "status": order.get("status"),
+            "create_time": order.get("create_time"),
+            "update_time": order.get("update_time"),
+            "pay_time": (detail.get("pay_info") or {}).get("pay_time"),
+            "ship_done_time": delivery.get("ship_done_time"),
+            "confirm_receipt_time": (detail.get("ext_info") or {}).get("confirm_receipt_time"),
+            "order_price": price.get("order_price"),                  # 分,用户实付
+            "product_price": price.get("product_price"),              # 分
+            "freight": price.get("freight"),                          # 分
+            "refund_freight": (detail.get("refund_info") or {}).get("refund_freight"),  # 分
+            "on_aftersale_order_cnt": (order.get("aftersale_detail") or {}).get("on_aftersale_order_cnt"),
+            "product_infos": products,
+        }
+
+    def get_order_summary(self, order_id):
+        """订单详情 → 指标用摘要(不含任何买家隐私)。"""
+        data = self._post("/channels/ec/order/get", {"order_id": str(order_id)})
+        body = data.get("data", data)
+        return self.summarize_order(body.get("order") or body)
+
+    def list_aftersales(self, begin_time, end_time, page_size=30, next_key=None, by_update_time=False):
+        """按时间区间拉售后单ID列表(区间同样不得大于 24 小时)。
+
+        返回 {"aftersale_ids": [...], "next_key": ..., "has_more": bool}
+        """
+        payload = {"page_size": int(page_size)}
+        if by_update_time:
+            payload["begin_update_time"], payload["end_update_time"] = int(begin_time), int(end_time)
+        else:
+            payload["begin_create_time"], payload["end_create_time"] = int(begin_time), int(end_time)
+        if next_key:
+            payload["next_key"] = next_key
+        data = self._post("/channels/ec/aftersale/getaftersalelist", payload)
+        body = data.get("data", data)
+        return {"aftersale_ids": body.get("after_sale_order_id_list") or [],
+                "next_key": body.get("next_key"),
+                "has_more": bool(body.get("has_more"))}
+
+    @staticmethod
+    def summarize_aftersale(aftersale):
+        """售后单 → 只留算指标要用的字段(退款金额单位:**分**)。
+
+        退款完成的状态值:MERCHANT_REFUND_SUCCESS / MERCHANT_RETURN_SUCCESS
+        (完整枚举见微信官方文档「获取售后单」;这里按值原样透出,口径在中台定)。
+        """
+        aftersale = aftersale or {}
+        product = aftersale.get("product_info") or {}
+        return {
+            "after_sale_order_id": aftersale.get("after_sale_order_id"),
+            "order_id": aftersale.get("order_id"),
+            "status": aftersale.get("status"),
+            "type": aftersale.get("type"),
+            "sub_type": aftersale.get("sub_type"),
+            "refund_amount": (aftersale.get("refund_info") or {}).get("amount"),   # 分
+            "create_time": aftersale.get("create_time"),
+            "update_time": aftersale.get("update_time"),
+            "complete_time": aftersale.get("complete_time"),
+            "product_id": product.get("product_id"),
+            "sku_id": product.get("sku_id"),
+            "count": product.get("count"),
+        }
+
+    def get_aftersale_summary(self, aftersale_id):
+        """售后单详情 → 指标用摘要。"""
+        data = self._post("/channels/ec/aftersale/getaftersaleorder",
+                          {"after_sale_order_id": str(aftersale_id)})
+        body = data.get("data", data)
+        return self.summarize_aftersale(body.get("after_sale_order") or body)
+
+    def list_order_summaries(self, start_time, end_time, page_size=20, next_key=None,
+                             by_update_time=False, workers=8):
+        """订单列表 + 逐单详情摘要(并发)。
+
+        微信 list 只返回订单ID,金额/状态/时间都要逐单查详情,所以这里并发取;
+        单笔失败只把该笔标成 error,不拖垮整页(与 list_products 同一套容错口径)。
+        """
+        page = self.list_orders(start_time, end_time, page_size=page_size, next_key=next_key,
+                                by_update_time=by_update_time)
+        ids = page["order_ids"]
+        orders = []
+        if ids:
+            self.get_access_token()   # 先取一次 token,避免多线程同时去换
+
+            def fetch(order_id):
+                try:
+                    return self.get_order_summary(order_id)
+                except Exception as exc:  # noqa: BLE001
+                    return {"order_id": order_id, "error": str(exc)[:200]}
+
+            with ThreadPoolExecutor(max_workers=min(workers, len(ids))) as pool:
+                orders = list(pool.map(fetch, ids))
+        return {"orders": orders, "next_key": page["next_key"], "has_more": page["has_more"]}
+
+    def list_aftersale_summaries(self, begin_time, end_time, page_size=20, next_key=None,
+                                 by_update_time=False, workers=8):
+        """售后单列表 + 逐单详情摘要(并发)。"""
+        page = self.list_aftersales(begin_time, end_time, page_size=page_size, next_key=next_key,
+                                    by_update_time=by_update_time)
+        ids = page["aftersale_ids"]
+        aftersales = []
+        if ids:
+            self.get_access_token()
+
+            def fetch(aftersale_id):
+                try:
+                    return self.get_aftersale_summary(aftersale_id)
+                except Exception as exc:  # noqa: BLE001
+                    return {"after_sale_order_id": aftersale_id, "error": str(exc)[:200]}
+
+            with ThreadPoolExecutor(max_workers=min(workers, len(ids))) as pool:
+                aftersales = list(pool.map(fetch, ids))
+        return {"aftersales": aftersales, "next_key": page["next_key"], "has_more": page["has_more"]}
+
+    # =================================================================
+    # 接口 13:平台自带数据概览(微信罗盘) —— 数据面板的"官方口径"指标
+    #   POST /channels/ec/compass/shop/overall/get,入参只有一个 ds(YYYYMMDD,**单日**),
+    #   没有 实时/周/月 粒度(后台界面上的按钮在接口层不存在)。
+    #   ⚠️ 接口里**没有**访客数/支付转化率/客单价/净支付金额四个字段——
+    #      它们是罗盘后台自己算的,我们只能按公式推算(前端卡片上会标明口径)。
+    # =================================================================
+    def get_shop_overview(self, ds):
+        """取某一天的电商数据概览。ds 形如 '20261010'(YYYYMMDD)。"""
+        data = self._post("/channels/ec/compass/shop/overall/get", {"ds": str(ds)})
+        return self.summarize_shop_overview(data.get("data", data))
+
+    @staticmethod
+    def summarize_shop_overview(payload):
+        """罗盘概览 → 整数化(接口返回的是字符串;缺失/非数字一律 0)。
+
+        字段:pay_gmv 成交金额(分) / pay_uv 成交人数 / pay_order_cnt 成交订单数 /
+             pay_refund_gmv 成交退款金额(分) / product_click_uv 商品点击人数 /
+             live_pay_gmv 直播成交金额(分) / feed_pay_gmv 短视频成交金额(分)
+        """
+        def num(key):
+            try:
+                return int((payload or {}).get(key))
+            except (TypeError, ValueError):
+                return 0
+
+        return {key: num(key) for key in (
+            "pay_gmv", "pay_uv", "pay_order_cnt", "pay_refund_gmv",
+            "product_click_uv", "live_pay_gmv", "feed_pay_gmv",
+        )}
 
 
 # =====================================================================

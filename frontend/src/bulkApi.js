@@ -70,4 +70,18 @@ export const bulkApi = {
   // ⚠️ 这是浏览器自己发的 <img> 请求, 带不了 X-Shop-Id 自定义头, 所以用 query 传店铺 ——
   //    否则切到别的店铺后, 图片白名单还按默认店校验, 预览会 404。
   imagePreviewUrl: (ref) => withShopQuery(`${import.meta.env.VITE_BULK_API_BASE_URL || '/bulk-api'}/images/preview?ref=${encodeURIComponent(ref || '')}`),
+  // 数据面板：订单日报指标（按「天 × 平台」，可选按月/周归并）。纯读本地表，不打平台，切日期很快。
+  // platform 可选（wechat / xhs），granularity 可选（day / week / month）。
+  // 返回里除 rows/totals 外还带 prev_totals（上一周期）与 daily（按天原始值，用于画趋势图）。
+  orderMetrics: (start = '', end = '', platform = '', granularity = 'day') => {
+    const params = {}
+    if (start) params.start = start
+    if (end) params.end = end
+    if (platform) params.platform = platform
+    if (granularity) params.granularity = granularity
+    return http.get('/orders/metrics', { params })
+  },
+  // 手动同步订单指标：拉平台订单/售后算指标后落库（默认「昨天+今天」，T+1 补拉）。
+  // 要逐单查平台详情，慢一些，所以给足超时。
+  orderSync: (body = {}) => http.post('/orders/sync', body, { timeout: 900000 }),
 }

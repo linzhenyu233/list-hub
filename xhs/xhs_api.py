@@ -68,17 +68,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-import requests
+# 注意:本服务不再直接调用 requests —— 所有网关请求统一走 mock_platform.gateway_call。
 
 # 复用 xhs_store.py 里的客户端类(凭证改为按店铺从 shop_registry 取)
 from xhs_store import XhsStore
 
 # 多店铺：从项目根读店铺注册表（shops.json，缺失则回退 .env 单店）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import runtime_config
 from runtime_config import load_project_env
 from app_version import APP_VERSION
 import shop_registry
 import api_auth
+import mock_platform        # 三级模式(mock/sandbox/live):网关出口统一走它
 
 load_project_env()
 
@@ -280,7 +282,7 @@ def _xhs_call(method: str, payload: dict = None, shop_id: str = None) -> dict:
     if method not in ("oauth.getAccessToken", "oauth.refreshToken"):
         access = _get_access_token(sid, conf)
 
-    store = XhsStore(app_id, app_secret, access)
+    store = XhsStore(app_id, app_secret, access, shop_id=sid)
     timestamp = str(int(time.time()))
     body = {
         "timestamp": timestamp,
@@ -294,11 +296,10 @@ def _xhs_call(method: str, payload: dict = None, shop_id: str = None) -> dict:
         body["accessToken"] = access
 
     try:
-        resp = requests.post(
-            store.BASE,
-            headers={"Content-Type": "application/json;charset=utf-8"},
-            json=body,
-            timeout=120,
+        # 网关出口唯一收口：mock 模式在此回放 fixture（不发外网），
+        # live/sandbox 才真的发请求；限流会在这里退避重试（见 mock_platform.gateway_call）。
+        resp = mock_platform.gateway_call(
+            "xhs", store.BASE, method_key=method, body=body, timeout=120, shop_id=sid,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"请求小红书网关失败: {e}")
@@ -322,10 +323,13 @@ def _xhs_call(method: str, payload: dict = None, shop_id: str = None) -> dict:
     if expired and method not in ("oauth.getAccessToken", "oauth.refreshToken"):
         try:
             access = _refresh_access_token(sid, conf)
-            store = XhsStore(app_id, app_secret, access)
+            store = XhsStore(app_id, app_secret, access, shop_id=sid)
             timestamp = str(int(time.time()))
             retry_body = {"timestamp": timestamp, "appId": app_id, "sign": store._sign(method, timestamp), "version": "2.0", "method": method, **(payload or {}), "accessToken": access}
-            resp = requests.post(store.BASE, headers={"Content-Type": "application/json;charset=utf-8"}, json=retry_body, timeout=30)
+            resp = mock_platform.gateway_call(
+                "xhs", store.BASE, method_key=method, body=retry_body, timeout=30, shop_id=sid,
+                retries=0,   # 已经为"刷 token"重试过一次，不再叠加自动重试
+            )
             data = resp.json()
         except Exception as exc:
             raise HTTPException(status_code=401, detail=f"小红书授权已过期，自动刷新失败: {exc}")
@@ -799,6 +803,69 @@ def list_items(request: Request,
 MAX_STATUS_IDS = 20
 
 
+# ==================================================================
+# 订单 / 售后(只读) —— 中台「数据面板」用
+#   只返回算指标要用的字段;收件人姓名/电话/地址、买家ID 等隐私一律不透出。
+#   时间区间限制:timeType=1(按下单时间)≤24h;timeType=2(按更新时间)≤30min。
+# ==================================================================
+@app.get("/orders")
+def list_orders(request: Request,
+                start: int = Query(..., description="起始时间(秒级时间戳)"),
+                end: int = Query(..., description="结束时间(秒级时间戳),timeType=1 时跨度 ≤24h"),
+                time_type: int = Query(1, description="1=按下单时间 2=按更新时间(≤30min)"),
+                page_no: int = Query(1, ge=1),
+                page_size: int = Query(20, ge=1, le=100),
+                order_status: int = Query(None, description="订单状态(可选,码表以平台为准)")):
+    """订单列表(只读)。金额单位待真机复核(疑似「元」,与微信的「分」不同)。"""
+    sid = shop_of(request)["shop_id"]
+    payload = {"timeType": int(time_type), "startTime": int(start), "endTime": int(end),
+               "pageNo": int(page_no), "pageSize": int(page_size)}
+    if order_status is not None:
+        payload["orderStatus"] = int(order_status)
+
+    def load():
+        data = _xhs_call("order.getOrderList", payload, shop_id=sid)
+        return {"orders": [XhsStore.summarize_order(row) for row in (data.get("orderList") or [])],
+                "total": data.get("total"), "page_no": data.get("pageNo"),
+                "max_page_no": data.get("maxPageNo")}
+
+    return ok_or_400(load)
+
+
+@app.get("/order-detail")
+def order_detail(request: Request, order_id: str = Query(..., description="订单号 orderId")):
+    """订单详情(只读)。
+
+    列表接口不返回下单时间与金额(实测全为 null),指标要用这两项,只能靠详情补;
+    返回同样做了隐私白名单,只留算指标要用的字段。
+    """
+    sid = shop_of(request)["shop_id"]
+    return ok_or_400(lambda: XhsStore.summarize_order_detail(
+        _xhs_call("order.getOrderDetail", {"orderId": str(order_id)}, shop_id=sid)))
+
+
+@app.get("/aftersales")
+def list_aftersales(request: Request,
+                    start: int = Query(..., description="起始时间(秒级时间戳)"),
+                    end: int = Query(..., description="结束时间(秒级时间戳),≤24h"),
+                    time_type: int = Query(1, description="1=按创建时间 2=按更新时间"),
+                    page_no: int = Query(1, ge=1),
+                    page_size: int = Query(20, ge=1, le=100)):
+    """售后单列表(只读)。退款金额字段名 refundAmountYuan → 单位疑似「元」,待真机复核。"""
+    sid = shop_of(request)["shop_id"]
+    payload = {"timeType": int(time_type), "startTime": int(start), "endTime": int(end),
+               "pageNo": int(page_no), "pageSize": int(page_size)}
+
+    def load():
+        data = _xhs_call("afterSale.listAfterSaleApi", payload, shop_id=sid)
+        rows = data.get("simpleAfterSaleList") or data.get("afterSaleList") or []
+        return {"aftersales": [XhsStore.summarize_aftersale(row) for row in rows],
+                "total": data.get("total"), "page_no": data.get("pageNo"),
+                "max_page_no": data.get("maxPageNo")}
+
+    return ok_or_400(load)
+
+
 @app.post("/items/status")
 def items_status(request: Request, body: dict = Body(..., example={"item_ids": ["itemId1", "itemId2"]})):
     """批量查审核状态(前端列表页每5分钟刷一次)。
@@ -942,5 +1009,6 @@ def update_sku(sku_id: str, request: Request, body: dict = Body(..., example={
 # 启动入口:python xhs_api.py 直接跑(端口 8010,避开微信小店 8000)
 # ==================================================================
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=API_HOST, port=API_PORT)
+    # DEV_RELOAD=1 时开热重载（开发机用）；未设置时行为与改造前完全一致
+    runtime_config.run_service(app, "xhs_api", API_HOST, API_PORT,
+                               reload_dirs=[os.path.dirname(os.path.abspath(__file__))])
