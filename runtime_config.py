@@ -31,6 +31,10 @@ PROJECT_VARIABLES = {
     "XHS_TOKEN_DIR",
     # 各店图片根目录（shop_registry.py 读）
     "DEFAULT_IMAGE_ROOT",
+    # 开发期开关（runtime_config.run_service / mock_platform.py 读）
+    # ⚠️ DEV_RELOAD 只用于开发机；MOCK_* 是 mock 模式的故障注入与录制开关
+    "DEV_RELOAD", "MOCK_SCENARIO", "MOCK_SCENARIO_FAIL_ALWAYS", "MOCK_RECORD",
+    "MOCK_FIXTURE_MAP",
 }
 
 # 各店自己的平台凭证：键名约定 = 原键名 + "_" + SHOP_ID 大写，
@@ -46,9 +50,15 @@ _PER_SHOP_PREFIXES = (
 )
 
 
+# 按前缀放行的变量（不逐店枚举，否则每新增一家店/一个平台都要改本文件）
+_PREFIX_ALLOWED = _PER_SHOP_PREFIXES + (
+    "BULK_MODE_",    # BULK_MODE_XHS=mock：临时把某平台切到 mock（见 mock_platform.resolve_mode）
+)
+
+
 def _is_allowed_variable(name: str) -> bool:
-    """白名单：显式列出的项目变量，或"某店自己的平台凭证"（见 _PER_SHOP_PREFIXES）。"""
-    return name in PROJECT_VARIABLES or name.startswith(_PER_SHOP_PREFIXES)
+    """白名单：显式列出的项目变量，或"某店自己的平台凭证"/模式覆盖（见上方前缀表）。"""
+    return name in PROJECT_VARIABLES or name.startswith(_PREFIX_ALLOWED)
 
 # ensure_env_loaded() 的幂等标记
 _ENV_LOADED = False
@@ -121,3 +131,49 @@ def ensure_env_loaded():
     _load_dotenv(Path(__file__).resolve().parent / ".env")
     _load_windows_user_environment()
     _ENV_LOADED = True
+
+
+# ------------------------------------------------------------------
+# 开发期热重载开关（三个服务共用）
+#
+# 三个服务原本都是 ``python xxx.py`` 且**没有 --reload**，联调期每改一行后端都要
+# 手工重启进程，四个进程来回重启很快就没人愿意改了。这里给一个开发开关：
+#
+#     DEV_RELOAD=1   开热重载（仅开发机）
+#     未设置/其它值   行为与改造前完全一致（生产行为不变 —— 这是硬要求）
+#
+# 为什么不能直接把 app 对象传给 uvicorn.run(reload=True)：uvicorn 的 reload 子进程
+# 是一个**全新的解释器**，它只认 import string（"模块名:app"），而且不继承本进程
+# 的 sys.path。所以要把服务目录通过 PYTHONPATH 传下去，子进程才 import 得到。
+# ------------------------------------------------------------------
+
+def dev_reload_enabled() -> bool:
+    """是否开启开发期热重载（``DEV_RELOAD=1``）。"""
+    return str(os.environ.get("DEV_RELOAD") or "").strip() == "1"
+
+
+def run_service(app, module_name: str, host: str, port: int, reload_dirs=()):
+    """统一的启动入口：``DEV_RELOAD=1`` 时开热重载，否则与改造前完全一致。
+
+    - app:          FastAPI 实例（非重载路径直接用）
+    - module_name:  模块名（如 "xhs_api" / "fastapi_server" / "bulk_api"），
+                    重载路径需要它拼 import string
+    - reload_dirs:  要监视的目录（一般是服务自己的目录）
+    """
+    import uvicorn
+
+    if not dev_reload_enabled():
+        uvicorn.run(app, host=host, port=port)
+        return
+
+    root = str(Path(__file__).resolve().parent)
+    dirs = [str(Path(item).resolve()) for item in reload_dirs]
+    paths = [root] + dirs
+    existing = os.environ.get("PYTHONPATH")
+    if existing:
+        paths.append(existing)
+    os.environ["PYTHONPATH"] = os.pathsep.join(paths)
+    print(f"[dev] DEV_RELOAD=1：{module_name} 已开启热重载（监视 {dirs or [root]}），"
+          f"仅用于开发机，勿在生产环境设置", flush=True)
+    uvicorn.run(f"{module_name}:app", host=host, port=port, reload=True,
+                reload_dirs=dirs or None)

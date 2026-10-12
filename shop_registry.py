@@ -1,8 +1,9 @@
 """多店铺注册表（单实例运行时切换用）。
 
-一个 shop = 一个运营单元（品牌/店铺组），同时包含微信 + 小红书两套配置。
+一个 shop = 一个运营单元（品牌/店铺组），同时包含各平台（微信 / 小红书 / …）的配置段。
 运营在前端切换 shop，切换后批次/任务/图片缓存/类目映射全部按 shop 隔离。
-每个平台的凭证与参数挂在 shop.wechat / shop.xhs 下，缺失则该平台不可用。
+每个平台的凭证与参数挂在 ``shop.<平台标识>`` 下（如 shop.wechat / shop.xhs），缺失则该平台不可用。
+**平台标识、凭证主键、参数键都不在本文件写死** —— 全部来自 ``platform_registry``。
 
 启动时由三个服务（wechat / xhs / bulk_api）分别读取 ``shops.json`` 并校验；
 若根目录不存在 ``shops.json``，自动用现有 ``.env`` 中的 ``WX_*`` / ``XHS_*``
@@ -31,9 +32,13 @@ import re
 import threading
 from pathlib import Path
 
+import platform_registry
+
 # --- 常量 -------------------------------------------------------------------
 
-_VALID_PLATFORMS = ("wechat", "xhs")
+# ⚠️ 平台白名单与下面四张表都从 platform_registry 派生，不要在这里写死平台名：
+#    接新平台时只改 platform_registry._ADAPTERS，本文件自动跟上。
+_VALID_PLATFORMS = platform_registry.all_platforms()
 _SHOP_ID_RE = re.compile(r"^[a-z0-9_]+$")
 
 # 单店回退时使用的默认 shop_id（数据库迁移历史数据回填必须与此一致）
@@ -42,38 +47,20 @@ DEFAULT_SHOP_NAME = "默认店铺"
 
 # 每个平台的必填凭证键（enabled=true 时校验非空才是完整可用状态，允许留空占位）
 _REQUIRED_CREDENTIALS = {
-    "wechat": ("appid", "secret"),
-    "xhs": ("app_id", "app_secret"),
+    p: platform_registry.adapter(p)["required_credentials"] for p in _VALID_PLATFORMS
 }
 
 # 每个平台的参数键（均允许空字符串占位）
 _PARAM_KEYS = {
-    "wechat": ("brand_id", "freight_template_id", "after_sale_address_id"),
-    "xhs": ("brand_id", "category_id", "shipping_template_id", "logistics_plan_id"),
+    p: platform_registry.adapter(p)["param_keys"] for p in _VALID_PLATFORMS
 }
 
 # 从 .env 合成默认店时的字段映射
 _ENV_CREDENTIALS_MAP = {
-    "wechat": {"appid": "WX_APPID", "secret": "WX_SECRET"},
-    "xhs": {
-        "app_id": "XHS_APP_ID",
-        "app_secret": "XHS_APP_SECRET",
-        "access_token": "XHS_ACCESS_TOKEN",
-        "refresh_token": "XHS_REFRESH_TOKEN",
-    },
+    p: platform_registry.adapter(p)["env_credentials"] for p in _VALID_PLATFORMS
 }
 _ENV_PARAMS_MAP = {
-    "wechat": {
-        "brand_id": ("WX_BRAND_ID", "2100000000"),  # 微信默认无品牌占位
-        "freight_template_id": ("WX_FREIGHT_TEMPLATE_ID", ""),
-        "after_sale_address_id": ("WX_AFTER_SALE_ADDRESS_ID", ""),
-    },
-    "xhs": {
-        "brand_id": ("XHS_BRAND_ID", ""),
-        "category_id": ("XHS_CATEGORY_ID", ""),
-        "shipping_template_id": ("XHS_SHIPPING_TEMPLATE_ID", ""),
-        "logistics_plan_id": ("XHS_LOGISTICS_PLAN_ID", ""),
-    },
+    p: platform_registry.adapter(p)["env_params"] for p in _VALID_PLATFORMS
 }
 
 # 凭证字段（redacted_list 会剔除这些键）
@@ -174,9 +161,8 @@ def has_platform(shop_id: str, platform: str) -> bool:
         raise ValueError(f"非法平台: {platform}")
     shop = resolve(shop_id) if isinstance(shop_id, str) and shop_id else default_shop()
     pconf = shop.get(platform) or {}
-    # 有 appid/app_id 字段即视为配置了该平台（secret 可能为空占位）
-    key = "appid" if platform == "wechat" else "app_id"
-    return bool(pconf.get(key))
+    # 有该平台的凭证主键即视为配置了该平台（secret 可能为空占位）
+    return bool(pconf.get(platform_registry.creds_key(platform)))
 
 
 def platform_creds(shop_id: str | None, platform: str) -> dict:
@@ -192,8 +178,7 @@ def platform_creds(shop_id: str | None, platform: str) -> dict:
         raise ValueError(f"非法平台: {platform}")
     shop = resolve(shop_id)
     pconf = shop.get(platform) or {}
-    key = "appid" if platform == "wechat" else "app_id"
-    if not pconf.get(key):
+    if not pconf.get(platform_registry.creds_key(platform)):
         raise ValueError(f"店铺 {shop['shop_id']} 未配置 {platform} 平台")
     return _deep_copy(pconf)
 
@@ -380,8 +365,7 @@ def _validate_shops(shops: list[dict]):
                 continue
             if not isinstance(pconf, dict):
                 raise ValueError(f"{prefix}.{platform} 必须是对象")
-            key = "appid" if platform == "wechat" else "app_id"
-            if pconf.get(key):
+            if pconf.get(platform_registry.creds_key(platform)):
                 has_any = True
         if not has_any and s.get("enabled", True):
             # 启用的店铺至少得有一个平台配置了 appid
@@ -447,7 +431,8 @@ if __name__ == "__main__":
         sys.exit(1)
     print(f"共 {len(shops)} 家店铺")
     for s in redacted_list(only_enabled=False):
-        platforms = [p for p in _VALID_PLATFORMS if s.get(p, {}).get("appid" if p == "wechat" else "app_id")]
+        platforms = [p for p in _VALID_PLATFORMS
+                     if s.get(p, {}).get(platform_registry.creds_key(p))]
         print(f"  {s['shop_id']} - {s['name']} [{','.join(platforms) or '无平台'}]"
               f"{' (默认)' if s.get('is_default') else ''}"
               f"{' [已停用]' if not s.get('enabled', True) else ''}")

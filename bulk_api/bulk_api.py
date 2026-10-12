@@ -23,15 +23,18 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import runtime_config
 from runtime_config import load_project_env
 from app_version import APP_VERSION
+import platform_registry
 import shop_registry
 import api_auth
+import mock_platform    # 三级模式标签(mock/sandbox/live)：只用于统计隔离，不参与发布行为
 
 load_project_env()
 
@@ -230,6 +233,8 @@ def _ensure_db_schema():
             _create_tables(conn)
             _migrate_add_shop_id(conn)
             _migrate_add_job_params(conn)
+            _migrate_add_publish_mode(conn)
+            _migrate_add_order_stats_columns(conn)
             _rebuild_multishop_tables(conn)
             _reassign_legacy_shop(conn)
             _create_indexes(conn)
@@ -276,13 +281,19 @@ def _create_tables(conn):
         operator TEXT, created_at TEXT, updated_at TEXT,
         -- 跨店发布：目标店铺的私有参数快照(运费模板/物流方案/品牌)。
         -- shop_id 即目标店；本字段让 worker 执行时覆盖批次里的来源店参数。空对象=同店发布。
-        params_json TEXT NOT NULL DEFAULT '{}'
+        params_json TEXT NOT NULL DEFAULT '{}',
+        -- 三级模式标签：mock/sandbox/live（多平台混合任务 = mixed）。
+        -- ⚠️ 这是**标签**，行为不在这里 —— 是否真的 mock 由平台服务自己按 shops.json 判定
+        --    （见 mock_platform.resolve_mode）。统计默认只算 live：mock 成功绝不能
+        --    被当成"这个商品已经发过了"（否则会漏发真实商品）。
+        mode TEXT NOT NULL DEFAULT 'live'
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS publish_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, batch_id TEXT NOT NULL,
         shop_id TEXT NOT NULL, product_code TEXT NOT NULL, platform TEXT NOT NULL,
         status TEXT NOT NULL, platform_product_id TEXT, platform_sku_ids TEXT, error TEXT,
         started_at TEXT, finished_at TEXT, priority INTEGER NOT NULL DEFAULT 0,
+        mode TEXT NOT NULL DEFAULT 'live',
         UNIQUE(job_id, product_code, platform)
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS image_upload_cache (
@@ -290,6 +301,41 @@ def _create_tables(conn):
         source_url TEXT NOT NULL, platform_url TEXT NOT NULL, updated_at TEXT,
         PRIMARY KEY(shop_id, platform, source_hash)
     )""")
+    # 数据面板:订单日报指标（只存聚合值，不存订单明细/买家信息）。
+    # 金额单位统一为「元」；日期为自然日 YYYY-MM-DD（本地时区）。
+    # pay_gmv/pay_uv/... 是**平台自带数据概览**（微信罗盘）的官方口径原值，单位分；
+    # 平台不提供这些接口时留空（stats_source 为空），由订单聚合值兜底。
+    conn.execute("""CREATE TABLE IF NOT EXISTS order_daily_metrics (
+        shop_id TEXT NOT NULL, platform TEXT NOT NULL, stat_date TEXT NOT NULL,
+        paid_orders INTEGER NOT NULL DEFAULT 0, paid_amount REAL NOT NULL DEFAULT 0,
+        dealt_orders INTEGER NOT NULL DEFAULT 0, refund_amount REAL NOT NULL DEFAULT 0,
+        actual_income REAL NOT NULL DEFAULT 0, actual_orders INTEGER NOT NULL DEFAULT 0,
+        refund_rate REAL NOT NULL DEFAULT 0,
+        order_count INTEGER NOT NULL DEFAULT 0, aftersale_count INTEGER NOT NULL DEFAULT 0,
+        status_map_ready INTEGER NOT NULL DEFAULT 0, notes TEXT,
+        pay_gmv INTEGER NOT NULL DEFAULT 0, pay_uv INTEGER NOT NULL DEFAULT 0,
+        pay_order_cnt INTEGER NOT NULL DEFAULT 0, pay_refund_gmv INTEGER NOT NULL DEFAULT 0,
+        product_click_uv INTEGER NOT NULL DEFAULT 0, stats_source TEXT,
+        synced_at TEXT, sync_error TEXT,
+        PRIMARY KEY(shop_id, platform, stat_date)
+    )""")
+
+
+def _migrate_add_order_stats_columns(conn):
+    """给 order_daily_metrics 补「平台自带数据概览」的列（老库升级用）。
+
+    单独一个函数、并显式挂进 _ensure_db_schema：老库走到这里时表已存在，
+    塞进已有迁移函数会因为它们提前 return 而补不上列（同 _migrate_add_publish_mode 的教训）。
+    """
+    for col_def in (
+        "pay_gmv INTEGER NOT NULL DEFAULT 0",
+        "pay_uv INTEGER NOT NULL DEFAULT 0",
+        "pay_order_cnt INTEGER NOT NULL DEFAULT 0",
+        "pay_refund_gmv INTEGER NOT NULL DEFAULT 0",
+        "product_click_uv INTEGER NOT NULL DEFAULT 0",
+        "stats_source TEXT",
+    ):
+        _safe_add_column(conn, "order_daily_metrics", col_def)
 
 
 def _create_indexes(conn):
@@ -301,6 +347,7 @@ def _create_indexes(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_pick ON publish_items(shop_id, platform, status, priority DESC, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_items_product ON publish_items(shop_id, product_code, platform, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_image_cache_shop ON image_upload_cache(shop_id, platform, updated_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_order_metrics_shop_date ON order_daily_metrics(shop_id, stat_date DESC)")
     # 唯一索引（老库靠这两条兜底保证含 shop_id 的唯一性；新库表定义里已内置同名约束）
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_category_aliases_shop_internal "
@@ -450,6 +497,53 @@ def _migrate_add_job_params(conn):
     _safe_add_column(conn, "publish_jobs", "params_json TEXT NOT NULL DEFAULT '{}'")
 
 
+def _migrate_add_publish_mode(conn):
+    """给 publish_jobs / publish_items 补 mode 列（mock/sandbox/live）。幂等。
+
+    ⚠️ 与 params_json 同理，必须独立成函数并在 _ensure_db_schema 里显式调用：
+       _migrate_add_shop_id 对现存库会提前 return，新列塞进去永远补不上。
+    ⚠️ 历史数据一律回填 'live'：改造前没有 mock 概念，所有历史发布记录都是真实的，
+       回填 live 才与"统计默认只算 live"的口径一致（否则老记录会从发布状态页消失）。
+    """
+    _safe_add_column(conn, "publish_jobs", "mode TEXT NOT NULL DEFAULT 'live'")
+    _safe_add_column(conn, "publish_items", "mode TEXT NOT NULL DEFAULT 'live'")
+
+
+def _mode_scope(platforms, shop_id: str):
+    """一个任务覆盖多平台时，把各平台的模式压成一个标签。
+
+    - 全 mock  → "mock"
+    - 全 live  → "live"
+    - 其余     → "mixed"（部分 mock/部分 live，或含 sandbox）
+    真值以 **publish_items.mode**（逐条）为准，本标签只给任务列表用。
+    """
+    modes = {mock_platform.resolve_mode(platform, shop_id) for platform in platforms}
+    if len(modes) == 1:
+        return modes.pop()
+    return "mixed"
+
+
+def _mode_where(request: Request) -> tuple[str, tuple]:
+    """发布状态类查询的 mode 过滤（默认只算 live）。
+
+    为什么默认只看 live：mock 任务是"假成功"——它没有在平台上产生任何商品。
+    如果混进统计，会出现两种事故：
+      1. 发布状态页显示"已发布"，运营以为发出去了，实际平台上一件都没有；
+      2. 幂等保护把 mock 成功当成"发过了"，真正的发布被静默跳过（漏发，且不可见）。
+    需要看 mock 记录时显式加 ``?mode=mock`` / ``?mode=all``。
+    """
+    raw = ""
+    try:
+        raw = str(request.query_params.get("mode") or "").strip().lower()
+    except Exception:
+        raw = ""
+    if raw in ("mock", "sandbox", "mixed"):
+        return " AND mode=?", (raw,)
+    if raw == "all":
+        return "", ()
+    return " AND mode='live'", ()
+
+
 def _meta_get(conn, key, default=None):
     try:
         row = conn.execute("SELECT value FROM _meta WHERE key=?", (key,)).fetchone()
@@ -544,6 +638,13 @@ def fit_xhs_title(title):
     return text
 
 
+# 平台 → 发布前的标题长度兜底函数。新平台先补 fit_* 再在这里登记，否则 platform_title 会 fail fast。
+_TITLE_FITTERS = {
+    "wechat": fit_wechat_title,
+    "xhs": fit_xhs_title,
+}
+
+
 def platform_title(product, mapping, platform):
     """取要发给平台的标题，并做长度兜底。
 
@@ -552,9 +653,15 @@ def platform_title(product, mapping, platform):
     就回落到「标题」= 微信那版（带品牌/系列，54 字/75 字符），触发 -5000500 标题长度错误，
     实测一个批次 250 个商品全因此失败。
     """
-    column = "wechat_title" if platform == "wechat" else "xhs_title"
-    raw = mapping.get(column) or product.get(column) or product.get("title", "")
-    fixed = fit_wechat_title(raw) if platform == "wechat" else fit_xhs_title(raw)
+    entry = platform_registry.adapter(platform)
+    raw = (mapping.get(entry["title_column"])
+           or product.get(entry["title_column"])
+           or product.get("title", ""))
+    fit = _TITLE_FITTERS.get(entry["title_fit"])
+    if fit is None:
+        # 不静默用别家平台的规则裁剪（那会把标题裁成运营没预期的样子）
+        raise RuntimeError(f"平台 {platform} 尚未实现标题长度兜底（缺少 {entry['title_fit']} 的 fit_* 函数）")
+    fixed = fit(raw)
     if fixed != str(raw or ""):
         print(f"[{platform}] 标题长度不合规，已裁剪为 {fixed!r}（原 {str(raw)!r}）")
     return fixed
@@ -688,16 +795,17 @@ def _platform_image(platform, source_url, shop_id=None):
         return cached["platform_url"]
     # 3. 未命中: 真正上传
     _image_cache_miss += 1
+    # 未知平台在这里就 fail fast，不会发出请求（也避免把图传到别家平台的服务上）
+    entry = platform_registry.adapter(platform)
+    base = platform_registry.api_base(platform)
     if local_image:
         payload = {"filename": os.path.basename(local_image[0]),
                    "content_base64": base64.b64encode(local_image[1]).decode("ascii")}
-        endpoint = "/images/upload-file" if platform == "wechat" else "/materials/upload-file"
-        base = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
-        response = _json_post(f"{base}{endpoint}", payload, shop_id=shop_id)
-    elif platform == "wechat":
-        response = _json_post(f"{WECHAT_API_BASE}/images/upload", {"img_url": source_url}, shop_id=shop_id)
+        response = _json_post(f"{base}{entry['image_file_path']}", payload, shop_id=shop_id)
     else:
-        response = _json_post(f"{XHS_API_BASE}/materials/upload", {"url": source_url}, shop_id=shop_id)
+        # 外链上传：端点与入参键名两个平台都不同（img_url / url），均由适配器给出
+        response = _json_post(f"{base}{entry['image_url_path']}",
+                              {entry["image_url_payload_key"]: source_url}, shop_id=shop_id)
     if response.get("ok") is False: raise RuntimeError(str(response.get("detail") or response)[:500])
     result = response.get("result")
     if isinstance(result, str): platform_url = result
@@ -755,9 +863,9 @@ def _upload_image_uncached(platform, source_url, shop_id=None):
         raise RuntimeError(f"无法读取图片: {str(source_url)[:120]}")
     payload = {"filename": os.path.basename(local_image[0]),
                "content_base64": base64.b64encode(local_image[1]).decode("ascii")}
-    endpoint = "/images/upload-file" if platform == "wechat" else "/materials/upload-file"
-    base = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
-    response = _json_post(f"{base}{endpoint}", payload, shop_id=shop_id)
+    entry = platform_registry.adapter(platform)
+    base = platform_registry.api_base(platform)
+    response = _json_post(f"{base}{entry['image_file_path']}", payload, shop_id=shop_id)
     if response.get("ok") is False:
         raise RuntimeError(str(response.get("detail") or response)[:300])
     result = response.get("result")
@@ -807,8 +915,9 @@ def _prepare_platform_images(product, platform, shop_id=None):
             sku["uploaded_sku_image"] = url
     # 小红书开了「主规格图」后要求每个规格值都有图(否则报「启用规格大图需上传所有规格图」)。
     # 图库缺图的 SKU(如某颜色没拍图)用商品主图兜底, 保证每个颜色值都有图。
+    # 该行为由适配器 sku_image_fallback 声明（微信不需要，其余平台按各自规则加字段即可）。
     fallback = (prepared.get("main_images") or [""])[0]
-    if platform == "xhs" and fallback:
+    if fallback and platform_registry.adapter(platform)["sku_image_fallback"]:
         for sku in skus:
             if not sku.get("uploaded_sku_image"):
                 sku["uploaded_sku_image"] = fallback
@@ -954,10 +1063,10 @@ def _job_params_of(row):
 # 发布前必须齐的「店铺级参数」: 缺了平台会整批拒。
 # 以前是建完任务、worker 逐个商品报"未配置微信运费模板", 运营看到满屏失败、回头补选还得重发一轮;
 # 现在建任务前直接拦住(见 publish 接口), 一个任务项都不建。
-# 每项 = (该平台映射里可能用的键..., 给人看的名字)
+# 每项 = (该平台映射里可能用的键..., 给人看的名字)；条目来自 platform_registry 的 required_params，
+# 接新平台只改注册表（口径与 _wechat_payload/_xhs_payload 的必填判断保持一致）。
 _REQUIRED_SHOP_PARAMS = {
-    "wechat": (("wechat_freight_template_id", "freight_template_id", "微信运费模板"),),
-    "xhs": (("xhs_shipping_template_id", "小红书运费模板"), ("xhs_logistics_plan_id", "小红书物流方案")),
+    p: platform_registry.adapter(p)["required_params"] for p in platform_registry.all_platforms()
 }
 
 
@@ -996,8 +1105,45 @@ def _apply_job_params(mapping, job_params):
     return merged
 
 
+def _publish_wechat(product, mapping, group_config, shop_id):
+    """微信发布：一个接口创建商品（含 SKU）。返回 {product_id: ...} 或商品对象。
+
+    ⚠️ 与改造前人肉 diff 过：图片顺序、payload 组装、返回结构完全一致。
+    """
+    product = _prepare_platform_images(product, "wechat", shop_id=shop_id)
+    path = platform_registry.adapter("wechat")["publish_path"]
+    result = _json_post(f"{WECHAT_API_BASE}{path}", _wechat_payload(product, mapping, shop_id), shop_id=shop_id)
+    if result.get("ok") is False: raise RuntimeError(str(result.get("detail") or result)[:500])
+    value = result.get("result")
+    return {"product_id": value} if not isinstance(value, dict) else value
+
+
+def _publish_xhs(product, mapping, group_config, shop_id):
+    """小红书发布：一个接口创建商品（含 SKU）。部分成功时不抛错，返回带 partial_error 的结果供前端展示。"""
+    product = _prepare_platform_images(product, "xhs", shop_id=shop_id)
+    path = platform_registry.adapter("xhs")["publish_path"]
+    result = _json_post(f"{XHS_API_BASE}{path}", _xhs_payload(product, mapping, group_config, shop_id), shop_id=shop_id)
+    value = result.get("result") or {}
+    if value.get("itemId") and (result.get("partial") or value.get("skuErrors")):
+        value["partial_error"] = json.dumps(value.get("skuErrors") or [], ensure_ascii=False)
+        return value
+    if result.get("ok") is False: raise RuntimeError(str(result.get("detail") or result)[:500])
+    return value
+
+
+# 平台 → 发布处理器。接新平台 = 在 platform_registry 加一条适配器 + 在这里加一个 _publish_<平台>，
+# 不需要在编排层再加 if 分支（分支一旦漏掉就会走到"当成别家平台发布"）。
+_PUBLISH_HANDLERS = {
+    "wechat": _publish_wechat,
+    "xhs": _publish_xhs,
+}
+
+
 def _run_publish_item(row):
     shop_id = row["shop_id"]
+    platform = row["platform"]
+    handler = _PUBLISH_HANDLERS.get(platform)
+    if handler is None: raise RuntimeError(f"不支持的平台: {platform}")
     # 用缓存版:避免每个发布项都重新 json.loads 全量 rows + mappings(800 商品时单次近百毫秒)
     batch = get_batch_cached(row["batch_id"])
     product = next((p for p in batch["products"] if p.get("product_code") == row["product_code"]), None)
@@ -1008,22 +1154,7 @@ def _run_publish_item(row):
         _job_params_of(row),
     )
     group_config = batch["mappings"].get("attr_groups", {}).get(product.get("internal_category"), {})
-    if row["platform"] == "wechat":
-        product = _prepare_platform_images(product, "wechat", shop_id=shop_id)
-        result = _json_post(f"{WECHAT_API_BASE}/products", _wechat_payload(product, mapping, shop_id), shop_id=shop_id)
-        if result.get("ok") is False: raise RuntimeError(str(result.get("detail") or result)[:500])
-        value = result.get("result")
-        return {"product_id": value} if not isinstance(value, dict) else value
-    if row["platform"] == "xhs":
-        product = _prepare_platform_images(product, "xhs", shop_id=shop_id)
-        result = _json_post(f"{XHS_API_BASE}/items/and-sku", _xhs_payload(product, mapping, group_config, shop_id), shop_id=shop_id)
-        value = result.get("result") or {}
-        if value.get("itemId") and (result.get("partial") or value.get("skuErrors")):
-            value["partial_error"] = json.dumps(value.get("skuErrors") or [], ensure_ascii=False)
-            return value
-        if result.get("ok") is False: raise RuntimeError(str(result.get("detail") or result)[:500])
-        return value
-    raise RuntimeError(f"不支持的平台: {row['platform']}")
+    return handler(product, mapping, group_config, shop_id)
 
 
 def recover_interrupted_items(shop_id=None):
@@ -1040,9 +1171,9 @@ def recover_interrupted_items(shop_id=None):
 
 
 def _platform_ready(platform, shop_id=None):
-    base_url = WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
     try:
-        url = f"{base_url}/health"
+        # 未知平台会抛 ValueError → 与"连不上"同样处理成 False（fail closed，不会误判为可用）
+        url = f"{platform_registry.api_base(platform)}/health"
         if shop_id:
             req = urllib.request.Request(url, headers={SHOP_HEADER: shop_id})
         else:
@@ -1093,6 +1224,12 @@ def _worker_loop(platform=None, shop_id=None):
                 ).fetchone()
             if not item:
                 conn.commit(); conn.close()
+                # 数据面板：空闲时顺手做一次「每天最多一次」的订单指标同步（date-guard，不新增调度器）。
+                # 放在空闲分支是为了不阻塞发品；失败只打日志，绝不影响发布链路。
+                try:
+                    maybe_sync_order_metrics(shop_id, platform)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[orders] 自动同步跳过（不影响发布）：{exc}", flush=True)
                 time.sleep(1)
                 continue
             conn.execute("UPDATE publish_items SET status='running', started_at=? WHERE id=? AND shop_id=?",
@@ -1368,6 +1505,43 @@ def is_share_image(source):
     return str(source or "").startswith(SHARE_PREFIX)
 
 
+# 共享盘读取失败的分级处理（线上实测：Worker 以 SYSTEM 跑时整批报 WinError 1326）：
+#   53 找不到网络路径 / 64 网络名不再可用 / 1219 凭据冲突 / 1231 网络不可达
+#     → 网络或 SMB 会话抖动，等一会儿重试通常就恢复，自动重试；
+#   1326 用户名或密码不正确
+#     → 运行 Worker 的账户根本没有该共享的凭据（典型：SYSTEM / 服务会话），
+#       重试只会把 NAS 账号试到锁定，所以不重试，直接给可执行的排查提示，
+#       并在冷却期内快速失败（一批几百张图不会反复去试错密码）。
+_SHARE_TRANSIENT_WINERRORS = {53, 64, 1219, 1231}
+_SHARE_AUTH_WINERROR = 1326
+_SHARE_AUTH_COOLDOWN = 60.0
+_SHARE_READ_ATTEMPTS = 3
+_share_auth_failed_until = 0.0
+
+
+def _winerror_code(exc):
+    """取 OSError 的 Windows 错误码（拿不到返回 None）。"""
+    code = getattr(exc, "winerror", None)
+    if code:
+        return code
+    if exc.args and isinstance(exc.args[0], int):
+        return exc.args[0]
+    return None
+
+
+def _share_error_text(path, exc, code):
+    if code == _SHARE_AUTH_WINERROR:
+        return (f"共享盘不可访问：{path}（{exc}）\n"
+                "原因：运行发布 Worker 的账户没有该共享盘的登录凭据"
+                "（常见于 Worker 被 SYSTEM / 服务方式启动——共享盘凭据只保存在登录用户的凭据管理器里）。\n"
+                "处理：用有共享盘权限的登录用户启动 Worker（bulk_api\\start_worker.ps1）；"
+                "并确认计划任务 BulkWorkerAutostart 的身份是当前登录用户，不是 SYSTEM。")
+    if code in _SHARE_TRANSIENT_WINERRORS:
+        return (f"共享盘暂时不可达：{path}（{exc}）"
+                f"——已自动重试 {_SHARE_READ_ATTEMPTS} 次仍失败，稍后重试该商品即可")
+    return f"共享盘不可访问：{path}（{exc}）"
+
+
 def fetch_share_image(source, shop_id=None):
     """读共享盘上的图片并落盘缓存, 返回 (本地路径, 内容)。
 
@@ -1378,20 +1552,34 @@ def fetch_share_image(source, shop_id=None):
     安全: disk: 引用会存进批次数据, 而批次数据可由客户端通过 PUT /import/{id}/items
     覆写, 因此这里必须再校验一次路径白名单, 否则可被用来读服务器任意文件并上传平台。
     白名单必须按店铺取(见 _allowed_roots_for)，否则服务器上挂载点路径会被误拒。
+
+    容错: 见上面 _SHARE_TRANSIENT_WINERRORS / _SHARE_AUTH_WINERROR 的说明。
     """
+    global _share_auth_failed_until
     path = str(source)[len(SHARE_PREFIX):]
     if not path or not _within_allowed_roots(path, _allowed_roots_for(shop_id)):
         raise RuntimeError(f"共享盘图片路径不在允许的图片目录内：{path}")
+    if time.monotonic() < _share_auth_failed_until:
+        raise RuntimeError(_share_error_text(
+            path, "Worker 账户没有共享盘凭据，冷却期内不重复尝试", _SHARE_AUTH_WINERROR))
     # 用 os.stat 而不是 os.path.isfile: 后者把"无权限 / 网络不可达"也一并吞成 False,
     # 让权限问题伪装成"文件不存在"(线上踩过: worker 以 SYSTEM 跑时整批报"不存在")。
-    try:
-        os.stat(path)
-    except FileNotFoundError:
-        raise RuntimeError(f"共享盘图片不存在(可能已被移动或删除)：{path}")
-    except PermissionError:
-        raise RuntimeError(f"共享盘图片无权读取(Worker 运行账户对该共享没有权限)：{path}")
-    except OSError as exc:
-        raise RuntimeError(f"共享盘不可访问：{path}（{exc}）")
+    for attempt in range(1, _SHARE_READ_ATTEMPTS + 1):
+        try:
+            os.stat(path)
+            break
+        except FileNotFoundError:
+            raise RuntimeError(f"共享盘图片不存在(可能已被移动或删除)：{path}")
+        except PermissionError:
+            raise RuntimeError(f"共享盘图片无权读取(Worker 运行账户对该共享没有权限)：{path}")
+        except OSError as exc:
+            code = _winerror_code(exc)
+            if code == _SHARE_AUTH_WINERROR:
+                _share_auth_failed_until = time.monotonic() + _SHARE_AUTH_COOLDOWN
+                raise RuntimeError(_share_error_text(path, exc, code))
+            if code not in _SHARE_TRANSIENT_WINERRORS or attempt == _SHARE_READ_ATTEMPTS:
+                raise RuntimeError(_share_error_text(path, exc, code))
+            time.sleep(0.5 * attempt)
     if not os.path.isfile(path):
         raise RuntimeError(f"共享盘路径不是图片文件：{path}")
     with open(path, "rb") as image_file:
@@ -1808,15 +1996,19 @@ HUOPAI_SHEETS = {"培育钻": 2, "天然钻": 1}
 #   「小红书规格id」「微信规格id」 = 行级规格ID(后台商品规格列表里的"规格ID", 一行一个)
 # 以前只填一种: 只填商品ID则每行都一样、定位不到具体规格; 只填规格ID则跟后台商品ID对不上,
 # 运营拿这个值在后台搜不到商品。所以两种都填, 缺哪列就追加哪列。
+# 三张表都从 platform_registry 派生。
+# ⚠️ 键顺序 = _huopai_id_columns 追加新列的顺序，必须保持「款级在前、规格级在后」；
+#    所以这里分两轮构建（先所有平台的款级键，再所有平台的规格级键），不要合并成一轮。
 HUOPAI_ID_HEADERS = {
-    "wechat": ("微信小店", "微信商品id", "微信小店商品id", "微信产品id"),
-    "xhs": ("小红书产品id", "小红书商品id"),
-    "wechat_sku": ("微信规格id", "微信sku id", "微信规格id(sku)"),
-    "xhs_sku": ("小红书规格id", "小红书sku id", "小红书规格id(sku)"),
+    p: tuple(platform_registry.adapter(p)["id_headers"])
+    for p in platform_registry.all_platforms()
 }
-HUOPAI_PLATFORM_LABEL = {"wechat": "微信小店", "xhs": "小红书产品id",
-                         "wechat_sku": "微信规格id", "xhs_sku": "小红书规格id"}
-HUOPAI_FIELD_PLATFORM = {"wechat": "wechat", "xhs": "xhs", "wechat_sku": "wechat", "xhs_sku": "xhs"}
+HUOPAI_ID_HEADERS.update({
+    f"{p}_sku": tuple(platform_registry.adapter(p)["sku_id_headers"])
+    for p in platform_registry.all_platforms()
+})
+HUOPAI_PLATFORM_LABEL = {key: names[0] for key, names in HUOPAI_ID_HEADERS.items()}
+HUOPAI_FIELD_PLATFORM = {key: key[:-4] if key.endswith("_sku") else key for key in HUOPAI_ID_HEADERS}
 # 写入的ID列统一拉到这个宽度: 原表这些列宽只有 6 个字符, 24 位ID会溢出显示到相邻列,
 # 看着像"占用了别的平台ID的位置"
 HUOPAI_ID_COLUMN_WIDTH = 24
@@ -2347,8 +2539,8 @@ def build_huopai_updates(source_path, rows, ids, sku_ids=None):
     return updates, stats
 
 
-def latest_platform_ids(shop_id=None):
-    """商品编码 → {平台: 平台商品ID}，取最近一次发布成功的记录。
+def latest_platform_ids(shop_id=None, mode="live"):
+    """商品编码 → {平台: 平台商品ID}，取最近一次发布成功的记录（默认**只算 live**）。
 
     为什么不只看"当前任务": 运营可能分几次发(分批发布/换批次重新导入/重试),
     货盘表里要登记的是"这个商品在平台上是几号", 所以按商品取最近一次成功记录 ——
@@ -2357,10 +2549,12 @@ def latest_platform_ids(shop_id=None):
     记进 ambiguous, 由前端提示运营确认(仍写入最近一次, 避免整列空着)。
     """
     conn = db()
+    # 回填货盘 ID 只能用真实发布的 ID：mock 的假 ID 写进货盘表会把整个表污染成"看似已发布"
+    where_mode, args = ("", ()) if str(mode) == "all" else (" AND mode=?", (mode,))
     rows = conn.execute(
         "SELECT product_code, platform, platform_product_id, shop_id, finished_at FROM publish_items "
         "WHERE platform_product_id IS NOT NULL AND platform_product_id<>'' "
-        "AND status IN ('success','partial') ORDER BY finished_at"
+        "AND status IN ('success','partial')" + where_mode + " ORDER BY finished_at", args
     ).fetchall()
     conn.close()
     candidates = {}
@@ -2389,16 +2583,13 @@ def platform_sku_ids(platform, product_id, shop_id=None):
     所以行级要填的规格ID只能回平台查:
       微信   GET /products/{pid}   → product.skus[].{sku_id, sku_code}
       小红书 GET /items/{item_id}  → result.skuInfos[].{id, erpCode}
+    路径来自 platform_registry.item_url；**响应的解析必须按平台分别写**（字段名各家不同），
+    新平台不补分支就直接报错 —— 不做"默认按某家解析"的兜底，那会把别家字段当成自己的。
     查不到就抛异常(由调用方记进"查不到"清单, 不影响产品ID的回填)。
     """
-    target = urllib.parse.quote(str(product_id))
-    if platform == "wechat":
-        url = f"{WECHAT_API_BASE}/products/{target}"
-    elif platform == "xhs":
-        url = f"{XHS_API_BASE}/items/{target}"
-    else:
+    if not platform_registry.is_platform(platform):
         raise RuntimeError(f"不支持的平台：{platform}")
-    data = _http_get_json(url, timeout=60, shop_id=shop_id)
+    data = _http_get_json(platform_registry.item_url(platform, product_id), timeout=60, shop_id=shop_id)
     mapping = {}
     if platform == "wechat":
         product = (data.get("result") or {}).get("product") or {}
@@ -2408,7 +2599,7 @@ def platform_sku_ids(platform, product_id, shop_id=None):
                 code = _sku_key(sku.get(key))
                 if code and sku_id:
                     mapping.setdefault(code, sku_id)
-    else:
+    elif platform == "xhs":
         if data.get("ok") is False:
             raise RuntimeError(str(data.get("detail") or data)[:200])
         for sku in (data.get("result") or {}).get("skuInfos") or []:
@@ -2416,6 +2607,8 @@ def platform_sku_ids(platform, product_id, shop_id=None):
             sku_id = str(sku.get("id") or sku.get("skuId") or "").strip()
             if code and sku_id:
                 mapping[code] = sku_id
+    else:
+        raise RuntimeError(f"平台 {platform} 的规格ID解析尚未实现（按接口清单确认响应字段后补分支）")
     return mapping
 
 
@@ -2473,7 +2666,7 @@ def writeback_huopai(job_id: str, body: WritebackBody | None = None, request: Re
                     platform, product_id, (id_shops.get(platform) or {}).get(code) or shop_id)
             except urllib.error.HTTPError as exc:
                 detail = _http_error_detail(exc)
-                markers = _WECHAT_GONE_MARKERS if platform == "wechat" else _XHS_GONE_MARKERS
+                markers = platform_registry.adapter(platform)["gone_markers"]
                 if any(marker.lower() in detail.lower() for marker in markers):
                     # 平台明确说这个商品不存在了(后台删过): 死ID不写进货盘表, 免得运营照着找
                     gone_codes.add(code)
@@ -2870,7 +3063,8 @@ def publish(batch_id: str, body: PublishBody, request: Request):
     cross_shop = target_shop_id != shop_id
     if batch["errors"]: raise HTTPException(400, "仍有校验错误，不能发布")
     # 校验所选平台在**目标店**下都配置了（凭证与店铺参数都按目标店取）
-    platforms = [p for p in body.platforms if p in ("wechat", "xhs")]
+    # 白名单来自注册表：新平台注册后这里自动放行，不需要再改这一行
+    platforms = [p for p in body.platforms if platform_registry.is_platform(p)]
     if not platforms: raise HTTPException(400, "至少选择一个发布平台")
     for p in platforms:
         if not shop_registry.has_platform(target_shop_id, p):
@@ -2900,8 +3094,10 @@ def publish(batch_id: str, body: PublishBody, request: Request):
     pending = []
     for product in products:
         for platform in platforms:
-            # 幂等按**目标店**判断：发给 A 店成功的记录，不该阻止把同一批货发给 B 店
-            row = check_conn.execute("SELECT * FROM publish_items WHERE shop_id=? AND batch_id=? AND product_code=? AND platform=? ORDER BY id DESC LIMIT 1", (target_shop_id, batch_id, product["product_code"], platform)).fetchone()
+            # 幂等按**目标店 + 该平台当前模式**判断：发给 A 店成功的记录不该阻止把同一批货发给 B 店；
+            # 更关键的是 mock 成功（假记录）绝不能拦住真实发布 —— 否则运营"试跑一遍"之后
+            # 正式发布会被静默跳过，平台上什么都没有而界面显示"已发布"。
+            row = check_conn.execute("SELECT * FROM publish_items WHERE shop_id=? AND batch_id=? AND product_code=? AND platform=? AND mode=? ORDER BY id DESC LIMIT 1", (target_shop_id, batch_id, product["product_code"], platform, mock_platform.resolve_mode(platform, target_shop_id))).fetchone()
             # deleted=核对后确认平台商品已被删除, cancelled=人工停掉: 都不算"发过", 必须放行重新发,
             # 否则运营在平台后台删完商品后, 这一批永远卡在"已有发布任务，未重复创建"。
             if row and row["status"] not in ("deleted", "cancelled"):
@@ -2925,14 +3121,643 @@ def publish(batch_id: str, body: PublishBody, request: Request):
     # 任务与任务项写到**目标店**名下（worker 据此用目标店凭证发布，图片素材也传目标店）；
     # params_json 存该店私有参数，执行时覆盖批次里的来源店参数。
     # 批次本身仍属来源店：状态更新按来源店，绝不改批次的 shop_id。
-    conn.execute("INSERT INTO publish_jobs(id,shop_id,batch_id,platforms_json,status,total,operator,created_at,updated_at,params_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (job_id, target_shop_id, batch_id, json.dumps(platforms), "queued", total, operator, now(), now(), json.dumps(body.params or {})))
+    # 模式标签：逐条按「目标店 + 平台」解析（与平台服务内部用的是同一个函数，
+    # 所以标签不会和实际行为打架）。mock 记录默认不进发布状态/失败统计，见 _LIVE_ONLY。
+    job_mode = _mode_scope(platforms, target_shop_id)
+    conn.execute("INSERT INTO publish_jobs(id,shop_id,batch_id,platforms_json,status,total,operator,created_at,updated_at,params_json,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (job_id, target_shop_id, batch_id, json.dumps(platforms), "queued", total, operator, now(), now(), json.dumps(body.params or {}), job_mode))
     for product_code, platform in (pending or [(product["product_code"], platform) for product in products for platform in platforms]):
-        conn.execute("INSERT INTO publish_items(job_id,shop_id,batch_id,product_code,platform,status,priority) VALUES(?,?,?,?,?,?,?)", (job_id, target_shop_id, batch_id, product_code, platform, "queued", priority))
+        conn.execute("INSERT INTO publish_items(job_id,shop_id,batch_id,product_code,platform,status,priority,mode) VALUES(?,?,?,?,?,?,?,?)", (job_id, target_shop_id, batch_id, product_code, platform, "queued", priority, mock_platform.resolve_mode(platform, target_shop_id)))
     conn.execute("UPDATE batches SET status=? WHERE id=? AND shop_id=?", ("发布任务已创建", batch_id, shop_id)); conn.commit(); conn.close(); _invalidate_batch_cache(batch_id)
     message = f"已创建发布任务({len(products)} 件商品 × {len(platforms)} 平台)" if partial else "发布任务已入队，后台将持续执行"
     if cross_shop:
         message += f"（目标店铺：{target_shop_id}）"
     return {"ok": True, "job_id": job_id, "batch_id": batch_id, "platforms": platforms, "partial": partial, "product_count": len(products), "target_shop_id": target_shop_id, "cross_shop": cross_shop, "message": message}
+
+
+# ==================================================================
+# 数据面板：订单日报指标（天 × 店铺 × 平台）
+# ------------------------------------------------------------------
+# 来源：平台服务的只读接口（微信 /orders /aftersales，小红书 /orders /aftersales）。
+# 中台只落**聚合值**，不存订单明细、不落地任何买家信息（合规）。
+# ⚠️ 口径默认值集中在本节常量里；运营确认后只改常量与页面文案，不动表结构。
+# ==================================================================
+# 订单状态分组（口径）：
+#   微信枚举见官方文档「获取订单详情」；
+#   小红书 orderStatus 官方未公开码表（SDK 里只是 int），先留空 →
+#   该平台的"实际收入/实际笔数"暂记 0，页面会标注「码表待核对」，绝不猜。
+ORDER_STATUS_GROUPS = {
+    "wechat": {
+        "unpaid": (10, 12, 13, 17, 250),      # 待付款/礼物待收下/待成团/待核销/已取消
+        "pending_ship": (20,),                # 待发货
+        "shipped": (21, 30),                  # 部分发货 / 待收货（已发货）
+        "finished": (100,),                   # 已完成
+    },
+    "xhs": {"unpaid": (), "pending_ship": (), "shipped": (), "finished": ()},
+}
+# 退款「已完成」的状态值（微信：官方枚举；小红书：字段名带 SUCCESS 语义，待真机核对）
+REFUND_DONE_STATUS = {
+    "wechat": ("MERCHANT_REFUND_SUCCESS", "MERCHANT_RETURN_SUCCESS"),
+}
+# 金额单位：微信=分（官方文档），小红书=元（字段名 refundAmountYuan 暗示「元」，待真机核对）
+# 订单「支付金额」单位：实测小红书订单详情 totalPayAmount 也是**分**（109900 = 1099.00 元）
+ORDER_AMOUNT_UNIT = {"wechat": "cent", "xhs": "cent"}
+# 售后退款金额单位与订单不同：小红书字段名 refundAmountYuan/expectedRefundAmountYuan 带 Yuan → 元
+REFUND_AMOUNT_UNIT = {"wechat": "cent", "xhs": "yuan"}
+ORDER_SYNC_MAX_PAGES = 20          # 单日单平台最多翻 20 页，防止异常时无限翻页
+# 单日单店最多补几条订单详情（小红书列表缺金额/下单时间，只能逐单补；防止把平台限流打满）
+ORDER_DETAIL_LOOKUP_MAX = 30
+ORDER_SYNC_DEFAULT_DAYS = 2        # 手动/自动同步默认覆盖「昨天 + 今天」（T+1 补拉）
+# 自动同步的进程内占位（key=last_order_sync:<店>:<平台>）：多线程 worker 去重用，见 maybe_sync_order_metrics
+_ORDER_SYNC_LOCK = threading.Lock()
+_ORDER_SYNC_INFLIGHT = set()
+
+
+def _to_yuan(platform, value, unit_map=None):
+    """平台金额 → 元（保留 2 位）。unit_map 用于"同一平台不同字段单位不同"的场合。"""
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if (unit_map or ORDER_AMOUNT_UNIT).get(platform) == "cent":
+        amount /= 100
+    return round(amount, 2)
+
+
+def _to_epoch_seconds(value):
+    """平台时间戳 → 秒（拿不到返回 0）。
+
+    实测坑：**小红书的时间戳是毫秒**（如 1791152601107），微信是秒。
+    不归一化就会拿"秒级区间"去比"毫秒值"，结果永远不在区间内 ——
+    线上表现是"小红书订单/售后拉到了、指标全是 0"。
+    """
+    try:
+        ts = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    if ts > 10 ** 11:      # 毫秒（10^11 秒 ≈ 公元 5138 年，秒级不可能超过）
+        ts //= 1000
+    return ts
+
+
+def _day_bounds(stat_date):
+    """'YYYY-MM-DD' → (当日 00:00 的秒级时间戳, 次日 00:00)，本地时区。"""
+    day = datetime.strptime(stat_date, "%Y-%m-%d")
+    start = int(day.timestamp())
+    return start, start + 86400
+
+
+def _order_api_base(platform):
+    return WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
+
+
+def _fetch_orders(platform, shop_id, start, end):
+    """拉某平台某天的订单摘要（平台侧已剔除买家隐私）。"""
+    base = _order_api_base(platform)
+    orders = []
+    if platform == "wechat":
+        next_key = ""
+        for _ in range(ORDER_SYNC_MAX_PAGES):
+            query = {"start": start, "end": end, "page_size": 100}
+            if next_key:
+                query["next_key"] = next_key
+            page = (_http_get_json(f"{base}/orders?{urllib.parse.urlencode(query)}", shop_id=shop_id)
+                    .get("result") or {})
+            orders.extend(page.get("orders") or [])
+            next_key = page.get("next_key") or ""
+            if not page.get("has_more") or not next_key:
+                break
+        return orders
+    page_no = 1
+    for _ in range(ORDER_SYNC_MAX_PAGES):
+        query = {"start": start, "end": end, "page_no": page_no, "page_size": 100}
+        page = (_http_get_json(f"{base}/orders?{urllib.parse.urlencode(query)}", shop_id=shop_id)
+                .get("result") or {})
+        orders.extend(page.get("orders") or [])
+        max_page = int(page.get("max_page_no") or 0)
+        page_no += 1
+        if page_no > max_page:
+            break
+    return orders
+
+
+def _fetch_aftersales(platform, shop_id, start, end):
+    """拉某平台某天的售后（退款）摘要。"""
+    base = _order_api_base(platform)
+    aftersales = []
+    if platform == "wechat":
+        next_key = ""
+        for _ in range(ORDER_SYNC_MAX_PAGES):
+            query = {"begin": start, "end": end, "page_size": 100}
+            if next_key:
+                query["next_key"] = next_key
+            page = (_http_get_json(f"{base}/aftersales?{urllib.parse.urlencode(query)}", shop_id=shop_id)
+                    .get("result") or {})
+            aftersales.extend(page.get("aftersales") or [])
+            next_key = page.get("next_key") or ""
+            if not page.get("has_more") or not next_key:
+                break
+        return aftersales
+    page_no = 1
+    for _ in range(ORDER_SYNC_MAX_PAGES):
+        query = {"start": start, "end": end, "page_no": page_no, "page_size": 100}
+        page = (_http_get_json(f"{base}/aftersales?{urllib.parse.urlencode(query)}", shop_id=shop_id)
+                .get("result") or {})
+        aftersales.extend(page.get("aftersales") or [])
+        max_page = int(page.get("max_page_no") or 0)
+        page_no += 1
+        if page_no > max_page:
+            break
+    return aftersales
+
+
+def _enrich_orders_with_detail(platform, shop_id, orders):
+    """列表里缺「下单时间 / 金额」的订单，逐单补订单详情（目前只有小红书需要）。
+
+    实测：小红书 `order.getOrderList` 的 `createTime` / `actualAmount` / `totalAmount`
+    **全是 null**（只有毫秒级 `updateTime`），而这两个字段是算指标必需的。
+    不补详情 → 该天订单数 > 0 但金额与笔数全 0 —— 这就是线上"小红书没有数据"的真身。
+    返回一行说明写进 notes；不需要补或没补到则返回空串。
+    """
+    if platform != "xhs" or not orders:
+        return ""
+    missing = [order for order in orders
+               if not (order.get("actual_amount") or order.get("total_amount"))
+               or not _to_epoch_seconds(order.get("pay_time") or order.get("create_time"))]
+    if not missing:
+        return ""
+    base = _order_api_base(platform)
+    todo = missing[:ORDER_DETAIL_LOOKUP_MAX]
+    filled = 0
+    failed = 0
+
+    def fetch(order):
+        order_id = order.get("order_id")
+        if not order_id:
+            return None
+        url = f"{base}/order-detail?order_id={urllib.parse.quote(str(order_id))}"
+        try:
+            return order, (_http_get_json(url, shop_id=shop_id).get("result") or {})
+        except Exception:  # noqa: BLE001
+            return order, None
+
+    # 逐单详情互不依赖，限并发避免把平台限流打满（平台侧有频率限制）
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(4, len(todo))) as pool:
+        for order, detail in pool.map(fetch, todo):
+            if detail is None:
+                failed += 1
+                continue
+            for key in ("create_time", "pay_time", "finish_time", "cancel_time", "status",
+                        "update_time", "actual_amount", "total_amount"):
+                if detail.get(key) not in (None, ""):
+                    order[key] = detail[key]
+            filled += 1
+    note = f"订单列表缺金额/下单时间，已逐单补详情 {filled} 单"
+    if failed:
+        note += f"（{failed} 单详情取失败）"
+    if len(missing) > ORDER_DETAIL_LOOKUP_MAX:
+        note += f"；另有 {len(missing) - ORDER_DETAIL_LOOKUP_MAX} 单未补（超过单日上限 {ORDER_DETAIL_LOOKUP_MAX}）"
+    return note
+
+
+def _aggregate_order_day(platform, orders, aftersales, start, end):
+    """把一天的订单/售后聚合成本面板的 7 个指标（金额单位：元）。"""
+    groups = ORDER_STATUS_GROUPS.get(platform) or {}
+    unpaid, pending_ship, shipped = (set(groups.get(k) or ()) for k in ("unpaid", "pending_ship", "shipped"))
+    finished = set(groups.get("finished") or ())
+    paid_orders = dealt_orders = actual_orders = 0
+    paid_amount = actual_income = 0.0
+
+    for order in orders:
+        status = order.get("status")
+        # 金额字段名各平台不同：微信 order_price(分)；小红书详情 totalPayAmount(分)
+        raw_amount = (order.get("order_price") if platform == "wechat"
+                      else order.get("actual_amount") or order.get("total_amount"))
+        amount = _to_yuan(platform, raw_amount)
+        if platform == "xhs":
+            # 小红书**没有公开的状态码表**,所以一律用时间字段判断(实测字段:paidTime/finishTime/
+            # cancelTime,毫秒)——比猜状态码可靠:有 paidTime 就是已支付,有 finishTime 就是已完成。
+            pay_ts = _to_epoch_seconds(order.get("pay_time") or order.get("create_time"))
+            finish_ts = _to_epoch_seconds(order.get("finish_time"))
+            cancel_ts = _to_epoch_seconds(order.get("cancel_time"))
+            if pay_ts and start <= pay_ts < end:
+                paid_orders += 1
+                paid_amount += amount
+            if finish_ts and start <= finish_ts < end:
+                dealt_orders += 1
+            # 在途=已支付且未完成未取消(存量口径,与微信一致)
+            if pay_ts and not finish_ts and not cancel_ts:
+                actual_orders += 1
+                actual_income += amount
+            continue
+        # 支付时间：微信 pay_time（秒）
+        pay_ts = _to_epoch_seconds(order.get("pay_time") or order.get("create_time"))
+        if status not in unpaid and start <= pay_ts < end:
+            paid_orders += 1
+            paid_amount += amount
+        if status in finished:
+            done_ts = _to_epoch_seconds(order.get("confirm_receipt_time"))
+            if start <= done_ts < end:
+                dealt_orders += 1
+        if status in pending_ship or status in shipped:
+            actual_orders += 1
+            actual_income += amount
+
+    done_states = REFUND_DONE_STATUS.get(platform)
+    refund_amount = 0.0
+    unverified_refunds = 0
+    for aftersale in aftersales:
+        status = str(aftersale.get("status") or "")
+        if done_states:
+            done = status in done_states
+        else:
+            # 平台没公开售后状态码表(小红书):**不猜码值**,改为"有金额就计入",
+            # 同时把"状态未校验"这件事件数回报给上层写进 notes(见 unverified_refunds)。
+            done = True
+        if not done:
+            continue
+        unverified_refunds += 0 if done_states else 1
+        done_ts = _to_epoch_seconds(aftersale.get("complete_time") or aftersale.get("refund_time")
+                                    or aftersale.get("update_time"))
+        if start <= done_ts < end:
+            # 小红书实际退款字段常为空、只回"预计退款金额"(实测),这里做字段兜底;
+            # 退款金额单位与订单不同(小红书 refundAmountYuan 是元、订单 totalPayAmount 是分)
+            refund_amount += _to_yuan(platform, aftersale.get("refund_amount")
+                                      or aftersale.get("expected_refund_amount"),
+                                      REFUND_AMOUNT_UNIT)
+
+    refund_rate = round(refund_amount / paid_amount, 4) if paid_amount else 0.0
+    return {
+        "paid_orders": paid_orders, "paid_amount": round(paid_amount, 2),
+        "dealt_orders": dealt_orders, "refund_amount": round(refund_amount, 2),
+        "actual_income": round(actual_income, 2), "actual_orders": actual_orders,
+        "refund_rate": refund_rate, "unverified_refunds": unverified_refunds,
+    }
+
+
+def _fetch_shop_overview(platform, shop_id, stat_date):
+    """拉平台自带的当日数据概览（目前只有微信罗盘有）。没有该能力的平台返回空 dict。"""
+    try:
+        if "stats" not in (platform_registry.adapter(platform).get("supports") or ()):
+            return {}
+    except Exception:  # noqa: BLE001
+        return {}
+    base = _order_api_base(platform)
+    data = _http_get_json(f"{base}/shop-overview?date={stat_date}", shop_id=shop_id)
+    return (data or {}).get("result") or {}
+
+
+def sync_order_metrics(shop_id, platform, stat_date):
+    """同步某店某平台某一天的指标（UPSERT，幂等）。
+
+    同时取两份数据：
+      ① 订单/售后接口聚合（自算口径，两家平台都有）；
+      ② 平台自带数据概览（微信罗盘，官方口径：成交金额/成交人数/商品点击人数…）。
+    前端按"官方口径优先、没有就用自算口径"展示，并在卡片上标明来源。
+    """
+    start, end = _day_bounds(stat_date)
+    groups = ORDER_STATUS_GROUPS.get(platform) or {}
+    status_map_ready = bool(groups.get("shipped"))
+    note_parts = [] if status_map_ready else ["订单状态码表待核对：实际收入/实际笔数暂记 0"]
+    if platform == "xhs":
+        # 小红书未公开订单状态码表 → 改用时间字段判断(paidTime/finishTime/cancelTime),
+        # 口径可靠且可核对,所以这里不再挂"码表待核对"。金额取订单详情 totalPayAmount(分)。
+        status_map_ready = True
+        note_parts = ["小红书按 paidTime/finishTime 判断状态（平台未公开状态码表），"
+                      "支付金额取订单详情 totalPayAmount(分)"]
+    try:
+        orders = _fetch_orders(platform, shop_id, start, end)
+        aftersales = _fetch_aftersales(platform, shop_id, start, end)
+        detail_note = _enrich_orders_with_detail(platform, shop_id, orders)
+        if detail_note:
+            note_parts.append(detail_note)
+        metrics = _aggregate_order_day(platform, orders, aftersales, start, end)
+        if metrics.get("unverified_refunds"):
+            note_parts.append("平台未公开售后状态码表：退款金额按售后单金额计入（未校验状态）")
+        error = None
+    except Exception as exc:  # noqa: BLE001
+        # 同步失败也要留痕（页面能看到"哪天的哪家店没拉成功"），不能静默成 0
+        orders, aftersales, metrics = [], [], {
+            "paid_orders": 0, "paid_amount": 0.0, "dealt_orders": 0, "refund_amount": 0.0,
+            "actual_income": 0.0, "actual_orders": 0, "refund_rate": 0.0,
+        }
+        error = str(exc)[:300]
+    stats, stats_source = {}, None
+    try:
+        stats = _fetch_shop_overview(platform, shop_id, stat_date)
+        if stats:
+            stats_source = "平台数据概览"
+    except Exception as exc:  # noqa: BLE001
+        # 官方口径拉不到不影响自算口径：只是这一行少了个更权威的来源，要说清楚
+        note_parts.append(f"平台数据概览未取到（{str(exc)[:80]}），本行用订单接口聚合口径")
+    conn = db()
+    conn.execute(
+        "INSERT INTO order_daily_metrics (shop_id, platform, stat_date, paid_orders, paid_amount,"
+        " dealt_orders, refund_amount, actual_income, actual_orders, refund_rate, order_count,"
+        " aftersale_count, status_map_ready, notes, pay_gmv, pay_uv, pay_order_cnt, pay_refund_gmv,"
+        " product_click_uv, stats_source, synced_at, sync_error)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(shop_id, platform, stat_date) DO UPDATE SET"
+        " paid_orders=excluded.paid_orders, paid_amount=excluded.paid_amount,"
+        " dealt_orders=excluded.dealt_orders, refund_amount=excluded.refund_amount,"
+        " actual_income=excluded.actual_income, actual_orders=excluded.actual_orders,"
+        " refund_rate=excluded.refund_rate, order_count=excluded.order_count,"
+        " aftersale_count=excluded.aftersale_count, status_map_ready=excluded.status_map_ready,"
+        " notes=excluded.notes, pay_gmv=excluded.pay_gmv, pay_uv=excluded.pay_uv,"
+        " pay_order_cnt=excluded.pay_order_cnt, pay_refund_gmv=excluded.pay_refund_gmv,"
+        " product_click_uv=excluded.product_click_uv, stats_source=excluded.stats_source,"
+        " synced_at=excluded.synced_at, sync_error=excluded.sync_error",
+        (shop_id, platform, stat_date, metrics["paid_orders"], metrics["paid_amount"],
+         metrics["dealt_orders"], metrics["refund_amount"], metrics["actual_income"],
+         metrics["actual_orders"], metrics["refund_rate"], len(orders), len(aftersales),
+         1 if status_map_ready else 0, "；".join(note_parts),
+         int(stats.get("pay_gmv") or 0), int(stats.get("pay_uv") or 0),
+         int(stats.get("pay_order_cnt") or 0), int(stats.get("pay_refund_gmv") or 0),
+         int(stats.get("product_click_uv") or 0), stats_source, now(), error),
+    )
+    conn.commit()
+    conn.close()
+    return {"shop_id": shop_id, "platform": platform, "stat_date": stat_date, **metrics,
+            "order_count": len(orders), "aftersale_count": len(aftersales),
+            "status_map_ready": status_map_ready, "notes": "；".join(note_parts),
+            "stats_source": stats_source, "stats": stats, "sync_error": error}
+
+
+def order_platforms(shop_id):
+    """该店声明了 orders 能力、且确实配了凭证的平台。"""
+    result = []
+    for platform in platform_registry.adapters_with("orders"):
+        try:
+            if shop_registry.has_platform(shop_id, platform):
+                result.append(platform)
+        except Exception:  # noqa: BLE001
+            continue
+    return result
+
+
+def sync_orders_range(shop_id, start_date, end_date, platforms=None):
+    """同步日期区间内的订单指标（逐天 × 逐平台）。返回逐项结果。"""
+    targets = platforms or order_platforms(shop_id)
+    days = []
+    cursor = datetime.strptime(start_date, "%Y-%m-%d").date()
+    last = datetime.strptime(end_date, "%Y-%m-%d").date()
+    while cursor <= last:
+        days.append(cursor.strftime("%Y-%m-%d"))
+        cursor += timedelta(days=1)
+    results = []
+    for platform in targets:
+        for day in days:
+            results.append(sync_order_metrics(shop_id, platform, day))
+    return results
+
+
+def maybe_sync_order_metrics(shop_id, platform=None, days=ORDER_SYNC_DEFAULT_DAYS):
+    """每天最多同步一次（复用 _meta + 当天日期做守卫，不新增调度器）。
+
+    由发布 worker 的空闲分支调用：不阻塞发品，失败只打日志。
+    ⚠️ 同一店同一平台的多个 worker 线程会几乎同时进入本函数，只靠 _meta 判断会出现
+       "6 个线程同时发现今天没同步、于是各跑一遍"的竞态（实测日志里重复 3~6 次，
+       既是白拉平台接口、也可能触发平台限流）。所以这里先用**进程内占位**去重：
+       抢到占位的线程负责同步，其余线程直接跳过。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    for target in ([platform] if platform else order_platforms(shop_id)):
+        if target not in order_platforms(shop_id):
+            continue
+        key = f"last_order_sync:{shop_id}:{target}"
+        with _ORDER_SYNC_LOCK:
+            if key in _ORDER_SYNC_INFLIGHT:
+                continue                      # 别的线程正在同步，跳过
+            conn = db()
+            last = _meta_get(conn, key)
+            conn.close()
+            if last == today:
+                continue
+            _ORDER_SYNC_INFLIGHT.add(key)     # 先占位再干活，避免重复拉取
+        start = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        try:
+            results = sync_orders_range(shop_id, start, today, platforms=[target])
+            failed = [r for r in results if r.get("sync_error")]
+            print(f"[orders] {shop_id}/{target} 同步 {start}~{today}：{len(results) - len(failed)} 天成功"
+                  f"{f'，{len(failed)} 天失败：{failed[0]['sync_error'][:120]}' if failed else ''}", flush=True)
+            conn = db()
+            conn.execute("INSERT INTO _meta(key, value) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, today))
+            conn.commit()
+            conn.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[orders] {shop_id}/{target} 同步异常（不影响发布）：{exc}", flush=True)
+        finally:
+            with _ORDER_SYNC_LOCK:
+                _ORDER_SYNC_INFLIGHT.discard(key)
+
+
+class OrderSyncBody(BaseModel):
+    start: str = ""
+    end: str = ""
+    platforms: list[str] = []
+
+
+@app.post("/orders/sync")
+def orders_sync(body: OrderSyncBody, request: Request):
+    """手动同步订单指标（默认「昨天 + 今天」；可指定日期区间与平台）。"""
+    shop_id = _current_shop_id(request)
+    today = datetime.now().strftime("%Y-%m-%d")
+    start = body.start or (datetime.now() - timedelta(days=ORDER_SYNC_DEFAULT_DAYS - 1)).strftime("%Y-%m-%d")
+    end = body.end or today
+    for value in (start, end):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{value}")
+    if start > end:
+        raise HTTPException(400, "开始日期不能晚于结束日期")
+    targets = [p for p in (body.platforms or order_platforms(shop_id)) if platform_registry.is_platform(p)]
+    if not targets:
+        raise HTTPException(400, "当前店铺没有可同步订单的平台（未配置凭证，或平台未声明 orders 能力）")
+    results = sync_orders_range(shop_id, start, end, platforms=targets)
+    failed = [row for row in results if row.get("sync_error")]
+    return {"ok": True, "result": {"range": {"start": start, "end": end}, "platforms": targets,
+                                   "synced": len(results) - len(failed), "failed": len(failed),
+                                   "items": results}}
+
+
+def _metric_view(row):
+    """一行原始记录 → 面板口径（**平台自带数据概览优先**，没有就用订单接口聚合兜底）。
+
+    这样前端只认一套字段名，不会出现"微信一行叫 pay_gmv、小红书一行叫 paid_amount"的混乱；
+    每行都带 source，卡片上会写清这个数字是哪来的。
+    """
+    row = dict(row)
+    stats_source = str(row.get("stats_source") or "").strip()
+    stats_ready = bool(stats_source) and any(
+        row.get(key) for key in ("pay_gmv", "pay_uv", "pay_order_cnt", "product_click_uv"))
+    if stats_ready:
+        paid_amount = round((row.get("pay_gmv") or 0) / 100, 2)
+        refund_amount = round((row.get("pay_refund_gmv") or 0) / 100, 2)
+        paid_orders = int(row.get("pay_order_cnt") or 0)
+        buyers = int(row.get("pay_uv") or 0)
+        clicks = int(row.get("product_click_uv") or 0)
+        source = stats_source
+    else:
+        paid_amount = round(row.get("paid_amount") or 0, 2)
+        refund_amount = round(row.get("refund_amount") or 0, 2)
+        paid_orders = int(row.get("paid_orders") or 0)
+        buyers = clicks = None            # 平台没给这两个口径 → 显示"—"，不编数
+        source = "订单接口聚合"
+    return {
+        "stat_date": row.get("stat_date"), "platform": row.get("platform"),
+        "paid_amount": paid_amount,
+        "net_paid_amount": round(paid_amount - refund_amount, 2),
+        "refund_amount": refund_amount,
+        "paid_orders": paid_orders,
+        "buyers": buyers, "clicks": clicks,
+        "conversion_rate": round(buyers / clicks, 4) if (buyers is not None and clicks) else None,
+        "avg_order_value": round(paid_amount / paid_orders, 2) if paid_orders else 0.0,
+        "dealt_orders": int(row.get("dealt_orders") or 0),
+        "actual_income": round(row.get("actual_income") or 0, 2),
+        "actual_orders": int(row.get("actual_orders") or 0),
+        "refund_rate": round(refund_amount / paid_amount, 4) if paid_amount else 0.0,
+        "source": source, "stats_ready": stats_ready,
+        "status_map_ready": bool(row.get("status_map_ready")),
+        "notes": row.get("notes") or "", "synced_at": row.get("synced_at"),
+        "sync_error": row.get("sync_error"),
+    }
+
+
+def _bucket_key(stat_date, granularity):
+    """日期 → (分组键, 显示名)。支持 日 / 周 / 月。"""
+    if granularity == "week":
+        year, week, _ = datetime.strptime(stat_date, "%Y-%m-%d").isocalendar()
+        return f"{year}-W{week:02d}", f"{year} 年第 {week} 周"
+    if granularity == "month":
+        return stat_date[:7], stat_date[:7]
+    return stat_date, stat_date
+
+
+def _aggregate_views(views, granularity):
+    """按粒度归并（金额与笔数相加；比率一律用合计值重算，不平均百分比）。"""
+    buckets = {}
+    for view in views:
+        key, label = _bucket_key(view["stat_date"], granularity)
+        item = buckets.setdefault(key, {
+            "bucket": key, "label": label, "days": 0, "platforms": [],
+            "paid_amount": 0.0, "net_paid_amount": 0.0, "refund_amount": 0.0, "actual_income": 0.0,
+            "paid_orders": 0, "dealt_orders": 0, "actual_orders": 0,
+            "buyers": 0, "clicks": 0, "buyers_available": False, "stats_ready": False,
+        })
+        item["days"] += 1
+        if view["platform"] not in item["platforms"]:
+            item["platforms"].append(view["platform"])
+        for money in ("paid_amount", "net_paid_amount", "refund_amount", "actual_income"):
+            item[money] = round(item[money] + view[money], 2)
+        for counter in ("paid_orders", "dealt_orders", "actual_orders"):
+            item[counter] += view[counter]
+        if view["buyers"] is not None:
+            item["buyers"] += view["buyers"]
+            item["clicks"] += view["clicks"] or 0
+            item["buyers_available"] = True
+        item["stats_ready"] = item["stats_ready"] or view["stats_ready"]
+    for item in buckets.values():
+        item["avg_order_value"] = round(item["paid_amount"] / item["paid_orders"], 2) if item["paid_orders"] else 0.0
+        item["refund_rate"] = round(item["refund_amount"] / item["paid_amount"], 4) if item["paid_amount"] else 0.0
+        item["conversion_rate"] = (round(item["buyers"] / item["clicks"], 4)
+                                  if item["buyers_available"] and item["clicks"] else None)
+        if not item["buyers_available"]:
+            item["buyers"] = None
+            item["clicks"] = None
+    return sorted(buckets.values(), key=lambda bucket: bucket["bucket"], reverse=True)
+
+
+def _sum_views(views):
+    """区间合计（用于顶部大数字与"上一周期"对比）。"""
+    total = {key: 0 for key in ("paid_orders", "dealt_orders", "actual_orders")}
+    for money in ("paid_amount", "net_paid_amount", "refund_amount", "actual_income"):
+        total[money] = 0.0
+    buyers = clicks = 0
+    buyers_available = False
+    for view in views:
+        for counter in ("paid_orders", "dealt_orders", "actual_orders"):
+            total[counter] += view[counter]
+        for money in ("paid_amount", "net_paid_amount", "refund_amount", "actual_income"):
+            total[money] = round(total[money] + view[money], 2)
+        if view["buyers"] is not None:
+            buyers += view["buyers"]
+            clicks += view["clicks"] or 0
+            buyers_available = True
+    total["buyers"] = buyers if buyers_available else None
+    total["clicks"] = clicks if buyers_available else None
+    total["avg_order_value"] = round(total["paid_amount"] / total["paid_orders"], 2) if total["paid_orders"] else 0.0
+    total["refund_rate"] = round(total["refund_amount"] / total["paid_amount"], 4) if total["paid_amount"] else 0.0
+    total["conversion_rate"] = round(buyers / clicks, 4) if (buyers_available and clicks) else None
+    return total
+
+
+@app.get("/orders/metrics")
+def orders_metrics(request: Request, start: str = Query(""), end: str = Query(""),
+                   platform: str = Query(""), granularity: str = Query("day")):
+    """读数据面板指标（日期区间 / 粒度 / 平台）。纯本地表读，不打平台。
+
+    · 口径：平台自带数据概览（微信罗盘）优先，缺失时用订单接口聚合兜底，每行都带 source；
+    · 同时返回「上一周期」（紧邻的等长区间）合计，供前端算涨跌幅；
+    · granularity 支持 day / week / month。
+    """
+    shop_id = _current_shop_id(request)
+    today = datetime.now().strftime("%Y-%m-%d")
+    start = start or (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    end = end or today
+    if granularity not in ("day", "week", "month"):
+        raise HTTPException(400, f"granularity 只能是 day/week/month：{granularity}")
+    for value in (start, end):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{value}")
+    if start > end:
+        raise HTTPException(400, "开始日期不能晚于结束日期")
+
+    span = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
+    prev_end = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    prev_start = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=span)).strftime("%Y-%m-%d")
+
+    def load(range_start, range_end):
+        sql = "SELECT * FROM order_daily_metrics WHERE shop_id=? AND stat_date>=? AND stat_date<=?"
+        args = [shop_id, range_start, range_end]
+        if platform:
+            sql += " AND platform=?"
+            args.append(platform)
+        # 注意用显式 close：sqlite3 连接做 with 只会提交/回滚，不会关闭连接
+        conn = db()
+        try:
+            return [_metric_view(row) for row in conn.execute(sql, args)]
+        finally:
+            conn.close()
+
+    views = load(start, end)
+    prev_views = load(prev_start, prev_end)
+    conn = db()
+    try:
+        last_row = conn.execute(
+            "SELECT MAX(synced_at) AS last_synced_at, COUNT(DISTINCT stat_date) AS days "
+            "FROM order_daily_metrics WHERE shop_id=?", (shop_id,)).fetchone()
+    finally:
+        conn.close()
+    return {"ok": True, "result": {
+        "granularity": granularity,
+        "range": {"start": start, "end": end, "days": span},
+        "prev_range": {"start": prev_start, "end": prev_end, "days": span},
+        "rows": _aggregate_views(views, granularity),
+        "totals": _sum_views(views),
+        "prev_totals": _sum_views(prev_views),
+        "daily": sorted(views, key=lambda view: (view["stat_date"], view["platform"])),
+        "platforms": order_platforms(shop_id),
+        "stats_platforms": [p for p in platform_registry.adapters_with("stats")
+                            if shop_registry.has_platform(shop_id, p)],
+        "configured": {p: shop_registry.has_platform(shop_id, p) for p in platform_registry.all_platforms()},
+        "amount_unit": ORDER_AMOUNT_UNIT,
+        "last_synced_at": (last_row["last_synced_at"] if last_row else None),
+        "synced_days": (last_row["days"] if last_row else 0),
+    }}
 
 
 @app.get("/publish-status")
@@ -2949,13 +3774,18 @@ def publish_status(request: Request):
     failed 表示发过但失败; cancelled 是被手动停掉的, 不算发过(前端按 none 处理);
     deleted 是核对后发现平台商品已被删除的, 同样按 none 处理(可以重新发)。
 
+    **模式隔离**：默认只统计 ``mode='live'`` 的记录（mock 是假成功，不能当已发布用），
+    要看模拟记录加 ``?mode=mock``，全都要加 ``?mode=all``。
+
     返回: {商品编码: {"platforms": {平台: {状态: 条数}}, "last_success_at": ISO时间}}
     """
     shop_id = _current_shop_id(request)
+    mode_where, mode_args = _mode_where(request)
     conn = db()
     rows = conn.execute("SELECT product_code, platform, status, COUNT(*) n, MAX(finished_at) last_at "
-                        "FROM publish_items WHERE shop_id=? GROUP BY product_code, platform, status",
-                        (shop_id,)).fetchall()
+                        "FROM publish_items WHERE shop_id=?" + mode_where +
+                        " GROUP BY product_code, platform, status",
+                        (shop_id, *mode_args)).fetchall()
     conn.close()
     result = {}
     for row in rows:
@@ -2964,7 +3794,8 @@ def publish_status(request: Request):
         if row["status"] == "success" and row["last_at"]:
             if not entry["last_success_at"] or row["last_at"] > entry["last_success_at"]:
                 entry["last_success_at"] = row["last_at"]
-    return {"ok": True, "result": result}
+    # mode 回显：前端要据此标注"这批是模拟记录"，避免把 mock 当真实发布
+    return {"ok": True, "result": result, "mode": mode_args[0] if mode_args else "live"}
 
 
 # ==================================================================
@@ -2988,11 +3819,10 @@ ITEM_UNKNOWN = "unknown"  # 查不动(网络/鉴权/其它), 不能据此改状�
 #   一旦把它当删除信号, 权限/参数/路径类报错都会命中 →
 #   批量把 success 改 deleted → 前端变"未发布" → 幂等保护放行 → 运营重发 → 平台上出现重复商品。
 #   所以这里只认"明确指向商品"的文案; 拿不准一律 unknown(状态不变)。
-_WECHAT_GONE_MARKERS = ("10020052", "商品不存在", "商品已删除", "商品在回收站")
-_XHS_GONE_MARKERS = (
-    "商品不存在", "商品已删除",
-    "item not exist", "item_not_exist", "item not found",
-)
+# 实际取值已收敛到 platform_registry 的 gone_markers（各平台一轮核对后只需改注册表）；
+# 下面两个名字保留为旧引用/文档锚点。
+_WECHAT_GONE_MARKERS = platform_registry.adapter("wechat")["gone_markers"]
+_XHS_GONE_MARKERS = platform_registry.adapter("xhs")["gone_markers"]
 
 
 def _http_error_detail(exc):
@@ -3010,19 +3840,18 @@ def platform_item_state(platform, product_id, shop_id=None):
     只有平台**明确**说商品不存在/已删除时才返回 gone; 网络超时、连接失败、鉴权过期
     一律返回 unknown 并保留原状态 —— 否则一次网络抖动就会把在售商品标成"未发布",
     诱导运营重复发布(平台会以「标题重复」拒绝), 反而更麻烦。
+
+    详情路径来自适配器；**响应体判定按平台分别写**（各平台"已删除"的表示方式不同），
+    未实现分支的平台返回 unknown（不下结论），不会误判成"已删除"。
     """
-    target = urllib.parse.quote(str(product_id))
-    if platform == "wechat":
-        url = f"{WECHAT_API_BASE}/products/{target}"
-    elif platform == "xhs":
-        url = f"{XHS_API_BASE}/items/{target}"
-    else:
+    if not platform_registry.is_platform(platform):
         return ITEM_UNKNOWN, f"不支持的平台：{platform}"
+    url = platform_registry.item_url(platform, product_id)
     try:
         data = _http_get_json(url, timeout=30, shop_id=shop_id)
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
-        markers = _WECHAT_GONE_MARKERS if platform == "wechat" else _XHS_GONE_MARKERS
+        markers = platform_registry.adapter(platform)["gone_markers"]
         lowered = str(detail).lower()
         if any(marker.lower() in lowered for marker in markers):
             return ITEM_GONE, detail
@@ -3036,23 +3865,26 @@ def platform_item_state(platform, product_id, shop_id=None):
         if str(product.get("status")) == "6":
             return ITEM_GONE, "商品在平台回收站（后台已删除）"
         return ITEM_EXISTS, ""
-    # 小红书: 200 也要看返回体。商品被后台删掉后, 网关很可能回 200 + 空 result 而不是报错,
-    # 只看"接口有没有报错"会把已删商品一直当成"还在", 核对等于没做(小红书又是失败/删除的重灾区)。
-    # ⚠️ 该判定尚未实测: 请拿一个确实已在后台删掉的小红书 itemId 调一次 GET /items/{id},
-    #    把真实返回(是报错? 空 result? 还是别的结构)补记到本注释, 再确认这条判定可靠。
-    result = data.get("result")
-    if data.get("ok") is False:
-        # 200 但业务失败 → 不下结论(保留原状态)
-        return ITEM_UNKNOWN, f"平台返回业务失败：{str(data.get('detail') or data.get('message') or data)[:200]}"
-    if not result:
-        # 空 result: 平台确实没给商品数据 → 判定已删除(把原始返回带进 error, 便于事后复盘)
-        return ITEM_GONE, f"平台未返回商品数据：{str(data)[:200]}"
-    if not isinstance(result, dict):
-        return ITEM_UNKNOWN, f"返回结构无法识别：{str(result)[:200]}"
-    if not (result.get("itemInfo") or result.get("itemId") or result.get("item_id") or result.get("id")):
-        # 有返回但结构不认识 → 不结论(宁可漏判, 也不要把在售商品误标成未发布)
-        return ITEM_UNKNOWN, f"返回结构无法识别：{str(result)[:200]}"
-    return ITEM_EXISTS, ""
+    if platform == "xhs":
+        # 小红书: 200 也要看返回体。商品被后台删掉后, 网关很可能回 200 + 空 result 而不是报错,
+        # 只看"接口有没有报错"会把已删商品一直当成"还在", 核对等于没做(小红书又是失败/删除的重灾区)。
+        # ⚠️ 该判定尚未实测: 请拿一个确实已在后台删掉的小红书 itemId 调一次 GET /items/{id},
+        #    把真实返回(是报错? 空 result? 还是别的结构)补记到本注释, 再确认这条判定可靠。
+        result = data.get("result")
+        if data.get("ok") is False:
+            # 200 但业务失败 → 不下结论(保留原状态)
+            return ITEM_UNKNOWN, f"平台返回业务失败：{str(data.get('detail') or data.get('message') or data)[:200]}"
+        if not result:
+            # 空 result: 平台确实没给商品数据 → 判定已删除(把原始返回带进 error, 便于事后复盘)
+            return ITEM_GONE, f"平台未返回商品数据：{str(data)[:200]}"
+        if not isinstance(result, dict):
+            return ITEM_UNKNOWN, f"返回结构无法识别：{str(result)[:200]}"
+        if not (result.get("itemInfo") or result.get("itemId") or result.get("item_id") or result.get("id")):
+            # 有返回但结构不认识 → 不结论(宁可漏判, 也不要把在售商品误标成未发布)
+            return ITEM_UNKNOWN, f"返回结构无法识别：{str(result)[:200]}"
+        return ITEM_EXISTS, ""
+    # 未实现判定分支的平台: 不下结论(返回 unknown 比误判"已删除"安全得多)
+    return ITEM_UNKNOWN, f"平台 {platform} 的发布状态判定尚未实现"
 
 
 class VerifyPublishStatusBody(BaseModel):
@@ -3073,8 +3905,12 @@ def verify_publish_status(body: VerifyPublishStatusBody, request: Request):
     """
     shop_id = _current_shop_id(request)
     conn = db()
+    # ⚠️ 固定只看 live：mock 记录里的 platform_product_id 是本地算出来的假 ID，
+    #    拿它去真实网关核对必然"查不到"，会被判成 gone 并把记录改成 deleted ——
+    #    一个纯本地动作就能把模拟记录"核销"掉，之后再也分不清哪些是模拟的。
     sql = ("SELECT id, product_code, platform, platform_product_id, finished_at FROM publish_items "
-           "WHERE shop_id=? AND status IN ('success','partial') AND COALESCE(platform_product_id,'')<>''")
+           "WHERE shop_id=? AND mode='live' AND status IN ('success','partial') "
+           "AND COALESCE(platform_product_id,'')<>''")
     params = [shop_id]
     if body.product_codes:
         codes = list({str(code) for code in body.product_codes})
@@ -3142,7 +3978,8 @@ def job(job_id: str, request: Request):
     if not j: conn.close(); raise HTTPException(404, "发布任务不存在")
     items = [dict(r) for r in conn.execute("SELECT * FROM publish_items WHERE job_id=? AND shop_id=? ORDER BY id", (job_id, shop_id)).fetchall()]
     conn.close()
-    return {"ok": True, "result": {"job_id": job_id, "batch_id": j["batch_id"], "status": j["status"], "total": j["total"], "processed": j["processed"], "success": j["success"], "failed": j["failed"], "items": items}}
+    # mode 随任务/条目一起回传：前端按它标注"模拟"，也用于区分同一任务里的混合模式
+    return {"ok": True, "result": {"job_id": job_id, "batch_id": j["batch_id"], "status": j["status"], "total": j["total"], "processed": j["processed"], "success": j["success"], "failed": j["failed"], "mode": j["mode"], "items": items}}
 
 
 @app.get("/image-cache/stats")
@@ -3296,8 +4133,8 @@ def delete_alias(alias_id: int, request: Request):
 #    而两个平台服务只监听 IPv4，导致每次调用都要先把 ::1 连超时才回退 IPv4
 #    （实测 worker 进程里堆着一排 SYN_SENT 到 [::1]:8000/8010，明显拖慢任务领取与图片上传）。
 #    127.0.0.1 是纯 IPv4，行为确定。
-WECHAT_API_BASE = os.environ.get("WECHAT_API_BASE", "http://127.0.0.1:8000")
-XHS_API_BASE = os.environ.get("XHS_API_BASE", "http://127.0.0.1:8010")
+WECHAT_API_BASE = platform_registry.api_base("wechat")
+XHS_API_BASE = platform_registry.api_base("xhs")
 
 
 def _http_get_json(url, timeout=60, shop_id=None, extra_headers=None):
@@ -3479,7 +4316,8 @@ def import_aliases(body: AliasImportBody, request: Request):
 
 
 if __name__ == "__main__":
-    import uvicorn
     # 启动时一次性建表/迁移：避免第一个请求（或与 worker 进程并发）同时抢 DDL 写锁
     _ensure_db_schema()
-    uvicorn.run(app, host=BULK_API_HOST, port=BULK_API_PORT)
+    # DEV_RELOAD=1 时开热重载（开发机用）；未设置时行为与改造前完全一致
+    runtime_config.run_service(app, "bulk_api", BULK_API_HOST, BULK_API_PORT,
+                               reload_dirs=[os.path.dirname(os.path.abspath(__file__))])
