@@ -3164,8 +3164,10 @@ ORDER_AMOUNT_UNIT = {"wechat": "cent", "xhs": "cent"}
 # 售后退款金额单位与订单不同：小红书字段名 refundAmountYuan/expectedRefundAmountYuan 带 Yuan → 元
 REFUND_AMOUNT_UNIT = {"wechat": "cent", "xhs": "yuan"}
 ORDER_SYNC_MAX_PAGES = 20          # 单日单平台最多翻 20 页，防止异常时无限翻页
-# 单日单店最多补几条订单详情（小红书列表缺金额/下单时间，只能逐单补；防止把平台限流打满）
-ORDER_DETAIL_LOOKUP_MAX = 30
+# 单日单店最多补几条订单详情（小红书列表缺金额/下单时间，只能逐单补；防止把平台限流打满）。
+# 定 200 的原因：实测一天可能有几十单，30 会把大半天数漏成"金额不全"（面板数字偏小且不显眼），
+# 200 足够覆盖日常、又不会在异常时无限调用（超出会在 notes 里点名还剩多少单没补）。
+ORDER_DETAIL_LOOKUP_MAX = 200
 ORDER_SYNC_DEFAULT_DAYS = 2        # 手动/自动同步默认覆盖「昨天 + 今天」（T+1 补拉）
 # 自动同步的进程内占位（key=last_order_sync:<店>:<平台>）：多线程 worker 去重用，见 maybe_sync_order_metrics
 _ORDER_SYNC_LOCK = threading.Lock()
@@ -3369,22 +3371,22 @@ def _aggregate_order_day(platform, orders, aftersales, start, end):
     for aftersale in aftersales:
         status = str(aftersale.get("status") or "")
         if done_states:
-            done = status in done_states
+            if status not in done_states:
+                continue
+            done_ts = _to_epoch_seconds(aftersale.get("complete_time") or aftersale.get("refund_time")
+                                        or aftersale.get("update_time"))
+            if not (start <= done_ts < end):
+                continue
         else:
-            # 平台没公开售后状态码表(小红书):**不猜码值**,改为"有金额就计入",
-            # 同时把"状态未校验"这件事件数回报给上层写进 notes(见 unverified_refunds)。
-            done = True
-        if not done:
-            continue
-        unverified_refunds += 0 if done_states else 1
-        done_ts = _to_epoch_seconds(aftersale.get("complete_time") or aftersale.get("refund_time")
-                                    or aftersale.get("update_time"))
-        if start <= done_ts < end:
-            # 小红书实际退款字段常为空、只回"预计退款金额"(实测),这里做字段兜底;
-            # 退款金额单位与订单不同(小红书 refundAmountYuan 是元、订单 totalPayAmount 是分)
-            refund_amount += _to_yuan(platform, aftersale.get("refund_amount")
-                                      or aftersale.get("expected_refund_amount"),
-                                      REFUND_AMOUNT_UNIT)
+            # 平台没公开售后状态码表(小红书):**不猜码值**,有金额就计入,并把"状态未校验"计数回报;
+            # 而且**不再用完结时间二次过滤**:售后是按「创建时间窗」查回来的,若拿完结时间再筛,
+            # "10-04 创建、10-05 完结"的退款会两天都落空(实测踩到过,退款金额凭空少一笔)。
+            unverified_refunds += 1
+        # 小红书实际退款字段常为空、只回"预计退款金额"(实测),这里做字段兜底;
+        # 退款金额单位与订单不同(小红书 refundAmountYuan 是元、订单 totalPayAmount 是分)
+        refund_amount += _to_yuan(platform, aftersale.get("refund_amount")
+                                  or aftersale.get("expected_refund_amount"),
+                                  REFUND_AMOUNT_UNIT)
 
     refund_rate = round(refund_amount / paid_amount, 4) if paid_amount else 0.0
     return {
@@ -3556,12 +3558,16 @@ class OrderSyncBody(BaseModel):
     start: str = ""
     end: str = ""
     platforms: list[str] = []
+    shop: str = ""      # 数据面板的店铺范围：'all' = 逐店同步（耗时成倍增加）；空 = 跟随当前店铺
 
 
 @app.post("/orders/sync")
 def orders_sync(body: OrderSyncBody, request: Request):
-    """手动同步订单指标（默认「昨天 + 今天」；可指定日期区间与平台）。"""
-    shop_id = _current_shop_id(request)
+    """手动同步订单指标（默认「昨天 + 今天」；可指定日期区间、平台与店铺范围）。
+
+    shop='all' 时逐店同步（面板看全部店铺汇总时用），耗时会随店铺数成倍增加。
+    """
+    shop_ids = _metric_shop_scope(request, body.shop)
     today = datetime.now().strftime("%Y-%m-%d")
     start = body.start or (datetime.now() - timedelta(days=ORDER_SYNC_DEFAULT_DAYS - 1)).strftime("%Y-%m-%d")
     end = body.end or today
@@ -3572,12 +3578,20 @@ def orders_sync(body: OrderSyncBody, request: Request):
             raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{value}")
     if start > end:
         raise HTTPException(400, "开始日期不能晚于结束日期")
-    targets = [p for p in (body.platforms or order_platforms(shop_id)) if platform_registry.is_platform(p)]
-    if not targets:
-        raise HTTPException(400, "当前店铺没有可同步订单的平台（未配置凭证，或平台未声明 orders 能力）")
-    results = sync_orders_range(shop_id, start, end, platforms=targets)
+    results: list[dict] = []
+    synced_platforms: list[str] = []
+    for shop_id in shop_ids:
+        targets = [p for p in (body.platforms or order_platforms(shop_id))
+                   if platform_registry.is_platform(p)]
+        if not targets:
+            continue      # 这家店没配订单平台：跳过，不因为其中一家没配就整批失败
+        synced_platforms.extend(targets)
+        results.extend(sync_orders_range(shop_id, start, end, platforms=targets))
+    if not results:
+        raise HTTPException(400, "所选店铺都没有可同步订单的平台（未配置凭证，或平台未声明 orders 能力）")
     failed = [row for row in results if row.get("sync_error")]
-    return {"ok": True, "result": {"range": {"start": start, "end": end}, "platforms": targets,
+    return {"ok": True, "result": {"range": {"start": start, "end": end},
+                                   "shops": shop_ids, "platforms": sorted(set(synced_platforms)),
                                    "synced": len(results) - len(failed), "failed": len(failed),
                                    "items": results}}
 
@@ -3607,6 +3621,8 @@ def _metric_view(row):
         source = "订单接口聚合"
     return {
         "stat_date": row.get("stat_date"), "platform": row.get("platform"),
+        # 带上店铺：数据面板可以看"全部店铺汇总"，汇总时必须能分清每行/每天属于哪家店
+        "shop_id": row.get("shop_id"), "shop_name": _shop_display_name(row.get("shop_id")),
         "paid_amount": paid_amount,
         "net_paid_amount": round(paid_amount - refund_amount, 2),
         "refund_amount": refund_amount,
@@ -3645,8 +3661,19 @@ def _aggregate_views(views, granularity):
             "paid_amount": 0.0, "net_paid_amount": 0.0, "refund_amount": 0.0, "actual_income": 0.0,
             "paid_orders": 0, "dealt_orders": 0, "actual_orders": 0,
             "buyers": 0, "clicks": 0, "buyers_available": False, "stats_ready": False,
+            # 归并后也要把口径说明/同步失败带上来，否则页面无法提示"这天的金额没取全"
+            "notes": [], "sync_error": "", "sources": [], "shops": [],
         })
         item["days"] += 1
+        if view.get("notes"):
+            item["notes"].append(view["notes"])
+        if view.get("sync_error"):
+            item["sync_error"] = view["sync_error"]
+        if view.get("source"):
+            item["sources"].append(view["source"])
+        shop_name = view.get("shop_name") or view.get("shop_id")
+        if shop_name and shop_name not in item["shops"]:
+            item["shops"].append(shop_name)
         if view["platform"] not in item["platforms"]:
             item["platforms"].append(view["platform"])
         for money in ("paid_amount", "net_paid_amount", "refund_amount", "actual_income"):
@@ -3666,6 +3693,20 @@ def _aggregate_views(views, granularity):
         if not item["buyers_available"]:
             item["buyers"] = None
             item["clicks"] = None
+        # 同一周期里多天/多平台会带来大量重复说明，**按分句去重**再拼。
+        # 只按整串去重不够：各天的说明常常是"前半句相同、后半句不同"，
+        # 结果拼出来是一长串 run-on 文字（页面上实测就是这样）。
+        segments = []
+        for text in item["notes"]:
+            for segment in str(text).split("；"):
+                segment = segment.strip()
+                if segment and segment not in segments:
+                    segments.append(segment)
+        item["notes"] = "；".join(segments)
+        item["source"] = "、".join(dict.fromkeys(item["sources"]))
+        # platforms 保持数组（接口契约不变），另给一个给 Excel/文案用的拼接串
+        item["platform_text"] = "、".join(item["platforms"])
+        item["shop_text"] = "、".join(item["shops"])
     return sorted(buckets.values(), key=lambda bucket: bucket["bucket"], reverse=True)
 
 
@@ -3693,21 +3734,21 @@ def _sum_views(views):
     return total
 
 
-@app.get("/orders/metrics")
-def orders_metrics(request: Request, start: str = Query(""), end: str = Query(""),
-                   platform: str = Query(""), granularity: str = Query("day")):
-    """读数据面板指标（日期区间 / 粒度 / 平台）。纯本地表读，不打平台。
+def _resolve_metric_range(start, end, granularity):
+    """校验日期/粒度，并算出「本周期」与「上一周期」（紧邻在前、天数相同）。
 
-    · 口径：平台自带数据概览（微信罗盘）优先，缺失时用订单接口聚合兜底，每行都带 source；
-    · 同时返回「上一周期」（紧邻的等长区间）合计，供前端算涨跌幅；
-    · granularity 支持 day / week / month。
+    返回 (start, end, prev_start, prev_end, span, granularity)。
+    抽出来共用：页面取数与 Excel 导出必须是同一套区间口径，否则导出来的和屏幕上对不上。
     """
-    shop_id = _current_shop_id(request)
     today = datetime.now().strftime("%Y-%m-%d")
     start = start or (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
     end = end or today
+    # 「自定义」只是界面上的"自选区间"，粒度仍然按天：归一一下，
+    # 免得前端多传一个值就整页报 400（线上已发生：granularity=custom）。
+    if granularity == "custom":
+        granularity = "day"
     if granularity not in ("day", "week", "month"):
-        raise HTTPException(400, f"granularity 只能是 day/week/month：{granularity}")
+        raise HTTPException(400, f"granularity 只能是 day/week/month（自定义区间请用 day）：{granularity}")
     for value in (start, end):
         try:
             datetime.strptime(value, "%Y-%m-%d")
@@ -3715,45 +3756,249 @@ def orders_metrics(request: Request, start: str = Query(""), end: str = Query(""
             raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{value}")
     if start > end:
         raise HTTPException(400, "开始日期不能晚于结束日期")
-
     span = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
     prev_end = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     prev_start = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=span)).strftime("%Y-%m-%d")
+    return start, end, prev_start, prev_end, span, granularity
 
-    def load(range_start, range_end):
-        sql = "SELECT * FROM order_daily_metrics WHERE shop_id=? AND stat_date>=? AND stat_date<=?"
-        args = [shop_id, range_start, range_end]
-        if platform:
-            sql += " AND platform=?"
-            args.append(platform)
-        # 注意用显式 close：sqlite3 连接做 with 只会提交/回滚，不会关闭连接
-        conn = db()
-        try:
-            return [_metric_view(row) for row in conn.execute(sql, args)]
-        finally:
-            conn.close()
 
-    views = load(start, end)
-    prev_views = load(prev_start, prev_end)
+def _shop_display_name(shop_id):
+    """店铺显示名（店铺被停用/删除时退回 shop_id，不让面板因此报错）。"""
+    try:
+        return shop_registry.resolve(shop_id).get("name") or shop_id
+    except Exception:  # noqa: BLE001
+        return shop_id or ""
+
+
+# 数据面板的"店铺范围"取值：全部启用店铺汇总
+METRIC_SHOP_ALL = "all"
+
+
+def _metric_shop_scope(request, shop=""):
+    """解析数据面板的店铺范围，返回 shop_id 列表。
+
+    · 'all'      → 全部启用店铺（面板的"全部店铺汇总"）
+    · 指定 shop  → 单店（会校验店铺存在且启用）
+    · 空         → 跟随请求头 X-Shop-Id（兼容旧调用）
+
+    注意：这是**面板自己的筛选维度**，与发布/商品模块的"当前店铺"解耦——
+    看全店汇总不该顺手把中台的当前店铺也切掉。
+    """
+    value = str(shop or "").strip()
+    if not value:
+        return [_current_shop_id(request)]
+    if value.lower() == METRIC_SHOP_ALL:
+        return [entity["shop_id"] for entity in shop_registry.all_shops(only_enabled=True)]
+    return [_verify_shop(value)["shop_id"]]
+
+
+def _load_order_views(shop_ids, start, end, platform=""):
+    """按区间读订单日报指标（支持多店汇总），转成面板口径。
+
+    注意用显式 close：sqlite3 连接做 with 只会提交/回滚，不会关闭连接。
+    """
+    shop_ids = [sid for sid in (shop_ids or []) if sid]
+    if not shop_ids:
+        return []
+    placeholders = ",".join("?" for _ in shop_ids)
+    sql = (f"SELECT * FROM order_daily_metrics WHERE shop_id IN ({placeholders})"
+           " AND stat_date>=? AND stat_date<=?")
+    args = [*shop_ids, start, end]
+    if platform:
+        sql += " AND platform=?"
+        args.append(platform)
+    conn = db()
+    try:
+        return [_metric_view(row) for row in conn.execute(sql, args)]
+    finally:
+        conn.close()
+
+
+# Excel 导出的列（顺序=列序）：键、表头、格式（money/int/rate 决定数字格式）
+METRIC_EXPORT_COLUMNS = [
+    ("bucket", "周期", None), ("days", "天数", None), ("shop_text", "店铺", None),
+    ("platform_text", "平台", None),
+    ("paid_amount", "支付金额(元)", "money"), ("net_paid_amount", "净支付金额(元)", "money"),
+    ("refund_amount", "退款金额(元)", "money"), ("paid_orders", "支付子订单数", "int"),
+    ("buyers", "支付买家数", "int"), ("clicks", "商品点击人数", "int"),
+    ("conversion_rate", "支付转化率", "rate"), ("avg_order_value", "客单价(元)", "money"),
+    ("dealt_orders", "成交笔数", "int"), ("actual_income", "实际收入(元)", "money"),
+    ("actual_orders", "实际笔数", "int"), ("refund_rate", "退款率", "rate"),
+    ("source", "数据来源", None), ("notes", "说明", None),
+]
+# 列宽（按列键给，避免增删列时位置错位）
+METRIC_EXPORT_WIDTHS = {
+    "bucket": 18, "days": 8, "shop_text": 24, "platform_text": 12,
+    "paid_amount": 14, "net_paid_amount": 16, "refund_amount": 14,
+    "paid_orders": 14, "buyers": 12, "clicks": 14, "conversion_rate": 12,
+    "avg_order_value": 12, "dealt_orders": 12, "actual_income": 14,
+    "actual_orders": 12, "refund_rate": 12, "source": 18, "notes": 60, "stat_date": 12,
+}
+# 导出的「口径说明」页：把每个指标的来源写清楚，避免 Excel 传出去后没人知道数字怎么来的
+EXPORT_METRIC_NOTES = [
+    ("支付金额", "微信：平台数据概览（罗盘「成交金额」）；小红书：订单接口聚合（订单详情 totalPayAmount，单位分→元）"),
+    ("净支付金额", "支付金额 − 退款金额（平台没有这个字段，按公式推算）"),
+    ("退款金额", "微信：罗盘「成交退款金额」；小红书：售后单金额（refundAmountYuan / expectedRefundAmountYuan，单位元）"),
+    ("支付子订单数", "微信：罗盘「成交订单数」；小红书：当日已支付订单数（按 paidTime 判断，平台未公开状态码表）"),
+    ("支付买家数", "仅微信罗盘「成交人数」；小红书接口不提供该维度 → 空"),
+    ("商品点击人数", "仅微信罗盘「商品点击人数」；小红书接口不提供 → 空"),
+    ("支付转化率", "支付买家数 ÷ 商品点击人数（近似口径，平台无官方转化率字段）"),
+    ("客单价", "支付金额 ÷ 支付子订单数（按公式推算）"),
+    ("成交笔数", "确认收货/交易完成的笔数（微信按订单状态，小红书按 finishTime）"),
+    ("实际收入 / 实际笔数", "存量口径：当前在途（已发货+待发货）的金额与笔数，不受所选区间限制"),
+    ("退款率", "退款金额 ÷ 支付金额（金额口径）"),
+    ("本周期 / 上一周期", "上一周期 = 紧接在本周期之前、天数相同的一段；涨跌幅 =（本周期 − 上一周期）÷ 上一周期"),
+    ("数据来源列", "「平台数据概览」= 平台官方口径（微信罗盘）；「订单接口聚合」= 我们用订单/售后接口自算"),
+]
+
+
+@app.get("/orders/metrics/export")
+def orders_metrics_export(request: Request, start: str = Query(""), end: str = Query(""),
+                          platform: str = Query(""), granularity: str = Query("day"),
+                          shop: str = Query("", description="all=全部店铺汇总")):
+    """把当前面板数据导成 Excel：按周期 / 按天 / 口径说明 三张表。
+
+    口径与 GET /orders/metrics 完全一致（共用 _resolve_metric_range 与 _load_order_views），
+    店铺范围也一样（shop=all 导出全部店铺汇总，明细里带店铺列）。
+    """
+    shop_ids = _metric_shop_scope(request, shop)
+    start, end, prev_start, prev_end, span, granularity = _resolve_metric_range(start, end, granularity)
+    views = _load_order_views(shop_ids, start, end, platform)
+    prev_views = _load_order_views(shop_ids, prev_start, prev_end, platform)
+    period_rows = _aggregate_views(views, granularity)
+    totals = _sum_views(views)
+    prev_totals = _sum_views(prev_views)
+    scope_name = "全部店铺汇总" if len(shop_ids) > 1 else _shop_display_name(shop_ids[0])
+    granularity_text = {"day": "按天", "week": "按周", "month": "按月"}.get(granularity, granularity)
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"服务器缺少 openpyxl，无法导出 Excel：{exc}")
+
+    def write_header(sheet, columns):
+        sheet.append([column[1] for column in columns])
+        header_row = sheet.max_row      # 标题行可能占了几行，表头不一定在第 1 行
+        for cell in sheet[header_row]:
+            cell.font = Font(bold=True)
+        sheet.freeze_panes = f"A{header_row + 1}"
+
+    def write_row(sheet, columns, row):
+        # 先 append 完整一行再设格式：append([]) 这种"空行"不会推进行号，
+        # 用它算 max_row 会把数据写回表头那一行（实测踩到：整张表只剩最后一行）。
+        sheet.append(["—" if row.get(key) is None else row.get(key)
+                      for key, _title, _kind in columns])
+        row_index = sheet.max_row
+        for offset, (_key, _title, kind) in enumerate(columns, start=1):
+            cell = sheet.cell(row=row_index, column=offset)
+            if kind == "money":
+                cell.number_format = "#,##0.00"
+            elif kind == "int":
+                cell.number_format = "#,##0"
+            elif kind == "rate" and isinstance(cell.value, (int, float)):
+                cell.number_format = "0.00%"
+
+    # 「按天」页：日期当第一列；"天数"和"周期"对逐日行没有意义，去掉
+    daily_columns = [("stat_date", "日期", None)] + [column for column in METRIC_EXPORT_COLUMNS
+                                                     if column[0] not in ("days", "bucket")]
+
+    def apply_widths(target_sheet, columns):
+        for index, (key, _title, _kind) in enumerate(columns, start=1):
+            target_sheet.column_dimensions[get_column_letter(index)].width = METRIC_EXPORT_WIDTHS.get(key, 14)
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "按周期"
+    sheet.append([f"数据概览 · {scope_name} · {granularity_text}"])
+    sheet["A1"].font = Font(bold=True, size=13)
+    sheet.append([f"本周期 {start} ~ {end}（{span} 天）；上一周期 {prev_start} ~ {prev_end}（同样 {span} 天）"])
+    sheet.append([f"导出时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}；金额单位：元；"
+                  "口径与页面一致，指标来源见「口径说明」页"])
+    sheet.append([""])
+    write_header(sheet, METRIC_EXPORT_COLUMNS)
+    for row in period_rows:
+        # 周期列的取值：按周/月时用「2026 年第 41 周」这种人话，而不是 2026-W41
+        write_row(sheet, METRIC_EXPORT_COLUMNS, {**row, "bucket": row.get("label") or row.get("bucket")})
+    summary = dict(totals)
+    summary.update({"bucket": "合计", "days": span, "shop_text": scope_name,
+                    "platform_text": "、".join(sorted({view["platform"] for view in views})) or "—",
+                    "source": "、".join(sorted({view["source"] for view in views})) or "—",
+                    "notes": f"上一周期支付金额 {prev_totals['paid_amount']} 元 / "
+                             f"{prev_totals['paid_orders']} 笔；退款 {prev_totals['refund_amount']} 元"})
+    write_row(sheet, METRIC_EXPORT_COLUMNS, summary)
+    for cell in sheet[sheet.max_row]:
+        cell.font = Font(bold=True)
+    apply_widths(sheet, METRIC_EXPORT_COLUMNS)
+
+    daily_sheet = workbook.create_sheet("按天")
+    write_header(daily_sheet, daily_columns)
+    for view in sorted(views, key=lambda item: (item["stat_date"], item["shop_id"], item["platform"])):
+        write_row(daily_sheet, daily_columns, {**view, "platform_text": view["platform"],
+                                               "shop_text": view["shop_name"] or view["shop_id"]})
+    apply_widths(daily_sheet, daily_columns)
+
+    note_sheet = workbook.create_sheet("口径说明")
+    write_header(note_sheet, [("metric", "指标", None), ("note", "口径 / 来源", None)])
+    for metric, note in EXPORT_METRIC_NOTES:
+        note_sheet.append([metric, note])
+    note_sheet.column_dimensions["A"].width = 22
+    note_sheet.column_dimensions["B"].width = 90
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename = f"dashboard-{start}_{end}-{granularity}.xlsx"
+    return StreamingResponse(iter([output.read()]),
+                             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+@app.get("/orders/metrics")
+def orders_metrics(request: Request, start: str = Query(""), end: str = Query(""),
+                   platform: str = Query(""), granularity: str = Query("day"),
+                   shop: str = Query("", description="all=全部店铺汇总；不传=跟随当前店铺")):
+    """读数据面板指标（日期区间 / 粒度 / 平台 / 店铺范围）。纯本地表读，不打平台。
+
+    · 口径：平台自带数据概览（微信罗盘）优先，缺失时用订单接口聚合兜底，每行都带 source；
+    · 同时返回「上一周期」（紧邻的等长区间）合计，供前端算涨跌幅；
+    · granularity 支持 day / week / month；
+    · shop 是**面板自己的**店铺范围（all=全部店铺汇总），与中台"当前店铺"解耦。
+    """
+    shop_ids = _metric_shop_scope(request, shop)
+    start, end, prev_start, prev_end, span, granularity = _resolve_metric_range(start, end, granularity)
+    views = _load_order_views(shop_ids, start, end, platform)
+    prev_views = _load_order_views(shop_ids, prev_start, prev_end, platform)
+    placeholders = ",".join("?" for _ in shop_ids)
     conn = db()
     try:
         last_row = conn.execute(
             "SELECT MAX(synced_at) AS last_synced_at, COUNT(DISTINCT stat_date) AS days "
-            "FROM order_daily_metrics WHERE shop_id=?", (shop_id,)).fetchone()
+            f"FROM order_daily_metrics WHERE shop_id IN ({placeholders})", tuple(shop_ids)).fetchone()
     finally:
         conn.close()
+    platforms = sorted({p for sid in shop_ids for p in order_platforms(sid)})
+    stats_platforms = sorted({
+        p for p in platform_registry.adapters_with("stats")
+        if any(shop_registry.has_platform(sid, p) for sid in shop_ids)
+    })
     return {"ok": True, "result": {
         "granularity": granularity,
         "range": {"start": start, "end": end, "days": span},
         "prev_range": {"start": prev_start, "end": prev_end, "days": span},
+        # 面板的店铺范围（前端下拉用它回显，避免只靠请求参数猜）
+        "scope": {"all": len(shop_ids) > 1,
+                  "shops": [{"shop_id": sid, "name": _shop_display_name(sid)} for sid in shop_ids]},
         "rows": _aggregate_views(views, granularity),
         "totals": _sum_views(views),
         "prev_totals": _sum_views(prev_views),
-        "daily": sorted(views, key=lambda view: (view["stat_date"], view["platform"])),
-        "platforms": order_platforms(shop_id),
-        "stats_platforms": [p for p in platform_registry.adapters_with("stats")
-                            if shop_registry.has_platform(shop_id, p)],
-        "configured": {p: shop_registry.has_platform(shop_id, p) for p in platform_registry.all_platforms()},
+        "daily": sorted(views, key=lambda view: (view["stat_date"], view["shop_id"], view["platform"])),
+        # 上一周期的逐日值：趋势图要画"本周期 vs 上一周期"两条线，没有它第二条线只能画成 0
+        "prev_daily": sorted(prev_views, key=lambda view: (view["stat_date"], view["shop_id"], view["platform"])),
+        "platforms": platforms,
+        "stats_platforms": stats_platforms,
+        "configured": {p: any(shop_registry.has_platform(sid, p) for sid in shop_ids)
+                       for p in platform_registry.all_platforms()},
         "amount_unit": ORDER_AMOUNT_UNIT,
         "last_synced_at": (last_row["last_synced_at"] if last_row else None),
         "synced_days": (last_row["days"] if last_row else 0),

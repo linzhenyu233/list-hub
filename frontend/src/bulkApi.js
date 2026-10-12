@@ -73,13 +73,28 @@ export const bulkApi = {
   // 数据面板：订单日报指标（按「天 × 平台」，可选按月/周归并）。纯读本地表，不打平台，切日期很快。
   // platform 可选（wechat / xhs），granularity 可选（day / week / month）。
   // 返回里除 rows/totals 外还带 prev_totals（上一周期）与 daily（按天原始值，用于画趋势图）。
-  orderMetrics: (start = '', end = '', platform = '', granularity = 'day') => {
+  // shop：数据面板**自己的**店铺范围（'all'=全部店铺汇总；不传=跟随当前店铺）。
+  // 与顶栏的当前店铺解耦，所以单独作为参数传，不走 X-Shop-Id。
+  orderMetrics: (start = '', end = '', platform = '', granularity = 'day', shop = '') => {
     const params = {}
     if (start) params.start = start
     if (end) params.end = end
     if (platform) params.platform = platform
     if (granularity) params.granularity = granularity
+    if (shop) params.shop = shop
     return http.get('/orders/metrics', { params })
+  },
+
+  // 数据面板导出 Excel（按周期 / 按天 / 口径说明 三张表）。
+  // responseType=blob：后端直接回文件流，前端存盘时用自己算的中文文件名。
+  orderMetricsExport: (start = '', end = '', platform = '', granularity = 'day', shop = '') => {
+    const params = {}
+    if (start) params.start = start
+    if (end) params.end = end
+    if (platform) params.platform = platform
+    if (granularity) params.granularity = granularity
+    if (shop) params.shop = shop
+    return http.get('/orders/metrics/export', { params, responseType: 'blob' })
   },
   // 手动同步订单指标：拉平台订单/售后算指标后落库（默认「昨天+今天」，T+1 补拉）。
   // 要逐单查平台详情，慢一些，所以给足超时。
