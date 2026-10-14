@@ -47,6 +47,9 @@ bulk_api/_sources/
 # 管易云同步产物（含平台 SKU 绑定映射，敏感）
 **/guanyi_xhs_mapping.json
 **/guanyi_sync_state.json
+# mock 录制产物（MOCK_RECORD=1 时把真实响应录进 <平台>/fixtures/_recorded/）：
+# 已自动脱敏密钥，但仍含真实商品/业务数据，不进仓库；要长期保留的请人工挑出来放进 fixtures/ 顶层
+**/fixtures/_recorded/
 # 预留：第二档会把所有运行时数据统一收进 data/
 data/
 uploads/
