@@ -125,12 +125,13 @@ export const bulkApi = {
   // 不传 jobId 时后端返回"最近一个任务"（同步中刷新页面也能接着看进度）。
   orderSyncStatus: (jobId = '') => http.get('/orders/sync/status', { params: jobId ? { job_id: jobId } : {} }),
 
-  // 商品明细：某一天的**订单级**明细（单日，不是区间）。
-  // 后端不落订单明细表，这里是实时调平台接口（带 5 分钟缓存），小红书还要逐单补详情，
-  // 所以给足超时；否则用默认 60s 会在订单多的时候先超时。
-  orderDetails: (date = '', platform = '', shop = '', keyword = '', limit = 20, offset = 0) => {
+  // 商品明细：**订单级**明细，支持区间（start~end）或单日（start===end 时走 date 参数）。
+  // 后端本地优先：同步过的天直接读库秒回；没同步过的天才实时调平台接口（带 5 分钟缓存、
+  // 并发 + 总超时），小红书还要逐单补详情，所以给足超时；否则默认 60s 会先超时。
+  orderDetails: (start = '', end = '', platform = '', shop = '', keyword = '', limit = 20, offset = 0) => {
     const params = {}
-    if (date) params.date = date
+    if (start && end && start !== end) { params.start = start; params.end = end }
+    else if (start) params.date = start
     if (platform) params.platform = platform
     if (shop) params.shop = shop
     if (keyword) params.keyword = keyword

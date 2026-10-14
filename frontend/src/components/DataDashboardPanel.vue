@@ -57,7 +57,8 @@ const panelShopLabel = computed(() => shopOptions.value
   .find((item) => item.value === panelShop.value)?.label || panelShop.value)
 const scopeAll = computed(() => panelShop.value === PANEL_SHOP_ALL)
 
-// 卡片清单：kind 决定怎么格式化；tip 是口径说明（点 ⓘ 看）；only 表示只有该平台提供了这个口径
+// 卡片清单：kind 决定怎么格式化；tip 是口径说明（点 ⓘ 看）。
+// 卡片显不显示还跟「当前范围有没有这个数」有关，见下面的 visibleMetrics。
 const METRICS = [
   { key: 'paid_amount', label: '支付金额', kind: 'money', tip: '平台数据概览（微信罗盘「成交金额」）优先；小红书用订单接口聚合的当日支付金额' },
   { key: 'net_paid_amount', label: '净支付金额', kind: 'money', tip: '支付金额 − 退款金额。平台接口没有这个字段，是按公式推算的' },
@@ -96,12 +97,72 @@ watch(checkedKeys, (list) => {
     localStorage.setItem(METRIC_PREFS_KEY, JSON.stringify(list))
   } catch { /* 无痕模式写不了就算了，不影响使用 */ }
 })
-// 面板显示哪些卡片 = 勾选了哪些。**没有隐藏状态**：勾上立即出现在面板上。
-const visibleMetrics = computed(() => METRICS.filter((metric) => checkedKeys.value.includes(metric.key)))
+// 面板显示哪些卡片 = 勾选了哪些 ∩ 当前范围**真的有数**的。
+// 「有没有数」按当前区间的真实数据判定（state.daily 是 天×店铺×平台 明细，取不到的指标是 null）：
+//   - 全部店铺汇总：每个出了数据的平台都得有这个指标（取两平台交集），避免汇总卡出现一片「—」；
+//   - 单个店铺：任一平台有就显示（微信店才有支付转化率/商品点击人数，小红书店才有下单人数）；
+//   - 区间里一行数据都没有（还没同步/加载失败）：不做可用性过滤，按勾选照常显示。
+// 刻意不写死「平台 × 指标」表：同平台不同店能力可能不同（比如微信店没开罗盘），
+// 按真实数据判定能自动适配；金额/笔数类字段永远有值，不受影响。
+const metricPlatforms = computed(() => {
+  const map = new Map(METRICS.map((metric) => [metric.key, new Set()]))
+  state.daily.forEach((row) => {
+    METRICS.forEach((metric) => {
+      if (row[metric.key] !== null && row[metric.key] !== undefined) map.get(metric.key).add(row.platform)
+    })
+  })
+  return map
+})
+// 当前范围**真的有数**的指标（与勾选无关，折线图的选择器也用它）
+const availableMetrics = computed(() => {
+  const platforms = new Set(state.daily.map((row) => row.platform))
+  if (!platforms.size) return METRICS
+  const availability = metricPlatforms.value
+  return METRICS.filter((metric) => {
+    const has = availability.get(metric.key)
+    return scopeAll.value
+      ? [...platforms].every((platform) => has.has(platform))   // 全部汇总：两平台交集
+      : [...platforms].some((platform) => has.has(platform))    // 单店：该店平台有就显示
+  })
+})
+const visibleMetrics = computed(() => availableMetrics.value.filter((metric) => checkedKeys.value.includes(metric.key)))
 const allChecked = computed(() => checkedKeys.value.length === METRICS.length)
 function toggleAllMetrics() {
   checkedKeys.value = allChecked.value ? defaultCheckedKeys() : METRICS.map((metric) => metric.key)
 }
+
+// ============ 折线图画哪个指标 ============
+// 选项跟卡片同一套「当前范围有没有数」过滤（availableMetrics，比卡片少一层勾选过滤），
+// 选中结果记住（下次进来还是画同一个指标）。
+const CHART_METRIC_KEY = 'bulk.dashboard.chartMetric'
+function loadChartMetricKey() {
+  try {
+    const saved = localStorage.getItem(CHART_METRIC_KEY)
+    if (saved && METRICS.some((metric) => metric.key === saved)) return saved
+  } catch { /* 无痕模式读不了就算了 */ }
+  return 'paid_amount'
+}
+const chartMetricKey = ref(loadChartMetricKey())
+watch(chartMetricKey, (key) => {
+  try { localStorage.setItem(CHART_METRIC_KEY, key) } catch { /* 写不了不影响 */ }
+})
+// 点哪张指标卡，折线图就画哪个指标（卡片只显示有数的指标，所以点到的都能画）
+function selectChartMetric(key) { chartMetricKey.value = key }
+const chartMetric = computed(() => {
+  const options = availableMetrics.value
+  return options.find((metric) => metric.key === chartMetricKey.value)
+    || options.find((metric) => metric.key === 'paid_amount')
+    || options[0]
+    || METRICS[0]
+})
+// 切了范围后当前指标可能没数了（比如带着「支付转化率」切到小红书店）→ 自动回落到支付金额，
+// 同时保证下拉框里永远是一个有效选项
+watch(availableMetrics, (options) => {
+  if (!options.some((metric) => metric.key === chartMetricKey.value)) chartMetricKey.value = 'paid_amount'
+})
+// 图表里的数值统一走 formatMetric（比率带 %、金额千分位），只有金额再补个「元」
+const chartUnit = computed(() => (chartMetric.value.kind === 'money' ? ' 元' : ''))
+function formatChartValue(value) { return formatMetric(chartMetric.value, value) + chartUnit.value }
 
 const pad2 = (n) => String(n).padStart(2, '0')
 
@@ -215,12 +276,33 @@ const readmeVisible = ref(false)
 // 横轴刻度按天数自动取 6~8 个（原来只写首/中/尾三个，区间一长图表就空得没法看）。
 const CHART_W = 320
 const CHART_BASE = 132          // 0 值所在的 y（viewBox 顶部留 12 给最高点）
-function dailyTotals(rows) {
+// 比率类指标不能把百分比相加：跟后端 _aggregate_views 同一套口径，
+// 分子/分母先按天求和、再重算当天的比率（如退款率 = Σ退款金额 ÷ Σ支付金额）。
+const RATE_COMPONENTS = {
+  conversion_rate: ['buyers', 'clicks'],
+  created_conversion_rate: ['buyers', 'created_buyers'],
+  refund_rate: ['refund_amount', 'paid_amount'],
+}
+function dailyTotals(rows, metricKey) {
+  const rate = RATE_COMPONENTS[metricKey]
   const bucket = new Map()
   ;(rows || []).forEach((row) => {
-    bucket.set(row.stat_date, (bucket.get(row.stat_date) || 0) + Number(row.paid_amount || 0))
+    const item = bucket.get(row.stat_date) || { num: 0, den: 0, hasNum: false }
+    if (rate) {
+      // 分子允许缺数（比如微信某天买家数取不到是 null）→ 只累计有数的行
+      const num = row[rate[0]]
+      if (num !== null && num !== undefined) { item.num += Number(num); item.hasNum = true }
+      item.den += Number(row[rate[1]] || 0)
+    } else {
+      item.num += Number(row[metricKey] || 0)
+    }
+    bucket.set(row.stat_date, item)
   })
-  return bucket
+  const totals = new Map()
+  bucket.forEach((item, day) => {
+    totals.set(day, rate ? (item.hasNum && item.den ? item.num / item.den : 0) : item.num)
+  })
+  return totals
 }
 function seriesOf(rangeStart, rangeEnd, bucket) {
   const days = []
@@ -236,9 +318,12 @@ function seriesOf(rangeStart, rangeEnd, bucket) {
 }
 
 const chart = computed(() => {
-  const days = seriesOf(state.range.start, state.range.end, dailyTotals(state.daily))
-  const prevDays = seriesOf(state.prevRange.start, state.prevRange.end, dailyTotals(state.prevDaily))
-  const peak = Math.max(1, ...days.map((day) => day.value), ...prevDays.map((day) => day.value))
+  const metric = chartMetric.value
+  const days = seriesOf(state.range.start, state.range.end, dailyTotals(state.daily, metric.key))
+  const prevDays = seriesOf(state.prevRange.start, state.prevRange.end, dailyTotals(state.prevDaily, metric.key))
+  // 比率的值都小于 1（3% = 0.03），下限还按 1 兜底会把线压成贴底的一条直线
+  const floor = metric.kind.startsWith('rate') ? 0.01 : 1
+  const peak = Math.max(floor, ...days.map((day) => day.value), ...prevDays.map((day) => day.value))
   const scaleY = (value) => CHART_BASE - (value / peak) * (CHART_BASE - 12)
   days.forEach((day, index) => {
     day.x = days.length > 1 ? index * (CHART_W / (days.length - 1)) : CHART_W / 2
@@ -259,11 +344,15 @@ const chart = computed(() => {
   }
   const sum = days.reduce((acc, day) => acc + day.value, 0)
   const avg = days.length ? sum / days.length : 0
+  // 比率没有"合计"可言：区间整体的比率用后端按分子/分母重算的 totals（拿不到就显示 —）
+  const isRate = metric.kind.startsWith('rate')
+  const total = isRate ? state.totals[metric.key] : sum
+  const totalLabel = isRate ? '本区间整体' : '本区间合计'
   // 折线下方的渐变填充（多边形：左下角 → 沿折线 → 右下角 → 闭合）
   const area = days.length
     ? `0,${CHART_BASE} ${days.map((day) => `${day.x.toFixed(1)},${day.y.toFixed(1)}`).join(' ')} ${CHART_W},${CHART_BASE}`
     : ''
-  return { days, prevDays, peak, ticks, sum, avg, area }
+  return { days, prevDays, peak, ticks, sum, avg, total, totalLabel, area }
 })
 
 function pointsOf(series) {
@@ -302,11 +391,10 @@ async function loadProducts(silent = false) {
   }
 }
 // ============ 交易明细（最下面那块，订单级）============
-// 为什么不跟着上面的区间走：交易明细是**按单日**实时拉平台接口的（后端不落订单明细表），
-// 跟着 28 天的区间会变成几十次平台请求、几百秒。所以它有自己的单日游标，
-// 只共用面板的「店铺范围」，这样口径一致、耗时也可控。
+// 支持**单日或区间**选择：同步过的天由后端直接读本地库（秒回），没同步过的天
+// 后端并发实时拉（有总超时与截断保护）。仍只共用面板的「店铺范围」，口径一致。
 const detail = reactive({
-  day: ymd(new Date()), platform: '', keyword: '',
+  range: [ymd(new Date()), ymd(new Date())], platform: '', keyword: '',
   page: 1, pageSize: 20, rows: [], total: 0, sumPaidAmount: 0,
   notes: [], loading: false, error: '', loaded: false,
 })
@@ -318,31 +406,23 @@ function orderTime(ts) {
   return `${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())} ${pad2(at.getHours())}:${pad2(at.getMinutes())}:${pad2(at.getSeconds())}`
 }
 const orderShopText = (row) => row.shop_name || row.shop_id || '—'
-function shiftDetailDay(step) {
-  const next = new Date(detail.day)
-  if (Number.isNaN(next.getTime())) return
-  next.setDate(next.getDate() + step)
-  if (next > new Date()) return          // 明细是"某一天已发生的订单"，不让选未来
-  detail.day = ymd(next)
-  detail.page = 1
-  loadDetails()
-}
-// 相对今天偏移 n 天（0=今天，-1=昨天，-7=上周同日）
-function jumpDetailDay(offset) {
-  const target = daysAgo(-offset)
-  if (target > new Date()) return
-  if (detail.day === ymd(target)) return   // 已经在这一天就别白拉一次接口
-  detail.day = ymd(target)
-  detail.page = 1
-  loadDetails()
-}
 // 日历里禁掉未来日期：平台当天数据本来就要 T+1 才完整，选未来没意义
 function disableFutureDay(date) {
   return date.getTime() > Date.now()
 }
-function onDetailDayPick(value) {
-  if (!value) return
-  detail.day = value
+// 区间快捷项（el-date-picker 自带的 shortcuts；value 返回 [开始, 结束] 两个 Date）
+const detailShortcuts = [
+  { text: '今天', value: () => { const d = new Date(); return [d, d] } },
+  { text: '昨天', value: () => { const d = daysAgo(1); return [d, d] } },
+  { text: '近 7 天', value: () => [daysAgo(6), new Date()] },
+  { text: '近 30 天', value: () => [daysAgo(29), new Date()] },
+]
+function onDetailRangePick(value) {
+  if (!Array.isArray(value) || value.length !== 2 || !value[0] || !value[1]) return
+  // YYYY-MM-DD 字符串按字典序比较即日期序；万一选反了自动摆正
+  const [a, b] = [...value].sort()
+  if (detail.range[0] === a && detail.range[1] === b) return   // 没变就别白拉一次接口
+  detail.range = [a, b]
   detail.page = 1
   loadDetails()
 }
@@ -350,7 +430,8 @@ async function loadDetails() {
   detail.loading = true
   detail.error = ''
   try {
-    const data = await bulkApi.orderDetails(detail.day, detail.platform, panelShop.value,
+    const data = await bulkApi.orderDetails(detail.range[0], detail.range[1],
+                                             detail.platform, panelShop.value,
                                              detail.keyword.trim(), detail.pageSize,
                                              (detail.page - 1) * detail.pageSize)
     const result = data?.result || {}
@@ -737,7 +818,7 @@ onMounted(async () => {
   }
   await load()
   await loadProducts()
-  await loadDetails()      // 交易明细：按单日实时拉，第一次进页面就把当天明细取回来
+  await loadDetails()      // 交易明细：默认取今天的明细，第一次进页面先取回来
   // 同步过程中刷新页面：接着轮询后台任务，按钮继续显示进度
   try {
     const data = await bulkApi.orderSyncStatus()
@@ -804,7 +885,10 @@ onUnmounted(stopSyncPolling)
 
     <div class="dash-body">
       <section class="metric-grid">
-        <div v-for="metric in visibleMetrics" :key="metric.key" class="metric-card">
+        <div v-for="metric in visibleMetrics" :key="metric.key"
+             :class="['metric-card', { 'metric-card-active': metric.key === chartMetricKey }]"
+             :title="`点击把折线图切换成「${metric.label}」`"
+             @click="selectChartMetric(metric.key)">
           <div class="metric-top">
             <span class="metric-label">{{ metric.label }}</span>
             <el-tooltip :content="metric.tip" placement="top" effect="light">
@@ -823,14 +907,14 @@ onUnmounted(stopSyncPolling)
 
       <aside class="dash-chart">
         <div class="chart-head">
-          <span class="chart-legend"><i class="dot dot-now" />本周期支付金额</span>
+          <span class="chart-legend"><i class="dot dot-now" />本周期{{ chartMetric.label }}</span>
           <span class="chart-legend muted">
             <i class="dot dot-prev" />上一周期 {{ shortDate(state.prevRange.start) }} ~ {{ shortDate(state.prevRange.end) }}
           </span>
         </div>
         <div class="chart-plot" @mousemove="onChartMove" @mouseleave="hoverIndex = -1">
           <svg viewBox="0 0 320 160" preserveAspectRatio="none" class="chart-svg" role="img"
-               aria-label="支付金额按天趋势">
+               :aria-label="chartMetric.label + '按天趋势'">
             <defs>
               <!-- 渐变用 CSS 的 stop-color 定义（SVG 属性不认 var()，写在 class 上） -->
               <linearGradient id="dashAreaFill" x1="0" y1="0" x2="0" y2="1">
@@ -849,9 +933,9 @@ onUnmounted(stopSyncPolling)
                :style="{ left: hoverInfo.pct + '%', top: hoverInfo.prevYPct + '%' }" />
             <i class="chart-dot" :style="{ left: hoverInfo.pct + '%', top: hoverInfo.yPct + '%' }" />
             <div class="chart-tip" :style="{ left: hoverInfo.tipLeft + '%' }">
-              <span class="tip-line now">本周期 {{ hoverInfo.date }}：{{ money(hoverInfo.value) }} 元</span>
+              <span class="tip-line now">本周期 {{ hoverInfo.date }}：{{ formatChartValue(hoverInfo.value) }}</span>
               <span v-if="hoverInfo.prevValue !== null" class="tip-line prev">
-                上一周期 {{ hoverInfo.prevDate }}：{{ money(hoverInfo.prevValue) }} 元
+                上一周期 {{ hoverInfo.prevDate }}：{{ formatChartValue(hoverInfo.prevValue) }}
               </span>
             </div>
           </template>
@@ -863,9 +947,9 @@ onUnmounted(stopSyncPolling)
         </div>
         <!-- 图表卡与三行指标卡等高：多出来的高度给折线区（而不是把卡片撑高或撑开行间距） -->
         <div class="chart-summary">
-          <div class="summary-cell"><span>本区间合计</span><strong>{{ money(chart.sum) }}</strong></div>
-          <div class="summary-cell"><span>日均</span><strong>{{ money(chart.avg) }}</strong></div>
-          <div class="summary-cell"><span>峰值</span><strong>{{ money(chart.peak) }}</strong></div>
+          <div class="summary-cell"><span>{{ chart.totalLabel }}</span><strong>{{ formatChartValue(chart.total) }}</strong></div>
+          <div class="summary-cell"><span>日均</span><strong>{{ formatChartValue(chart.avg) }}</strong></div>
+          <div class="summary-cell"><span>峰值</span><strong>{{ formatChartValue(chart.peak) }}</strong></div>
         </div>
 
       </aside>
@@ -998,7 +1082,7 @@ onUnmounted(stopSyncPolling)
     </section>
 
     <!-- 交易明细：订单级明细。与上面同一个 .dash-page 内、紧邻其下，共用店铺范围；
-         数据是按单日**实时**拉平台接口（后端不落订单明细表），有 5 分钟缓存。 -->
+         支持单日或区间：同步过的天读本地库，没同步的天由后端并发实时拉（有超时保护）。 -->
     <section class="dash-orders">
       <div class="dash-head">
         <h1>交易明细</h1>
@@ -1010,21 +1094,13 @@ onUnmounted(stopSyncPolling)
             <el-option value="wechat" label="微信小店" />
             <el-option value="xhs" label="小红书" />
           </el-select>
-          <span class="dash-time">统计时间</span>
-          <el-date-picker v-model="detail.day" type="date" value-format="YYYY-MM-DD"
-                          format="YYYY-MM-DD" size="small" class="day-picker"
+          <span class="dash-time">统计区间</span>
+          <el-date-picker v-model="detail.range" type="daterange" value-format="YYYY-MM-DD"
+                          format="YYYY-MM-DD" size="small" class="range-picker"
                           :clearable="false" :disabled-date="disableFutureDay"
-                          placeholder="选择日期" @change="onDetailDayPick" />
-          <el-button-group>
-            <el-button size="small" :icon="ArrowLeft" @click="shiftDetailDay(-1)" title="前一天" />
-            <el-button size="small" :icon="ArrowRight" @click="shiftDetailDay(1)" title="后一天" />
-          </el-button-group>
-          <!-- 只有前后按钮时翻一天要一直点，所以再给三个"一步到位"的跳转 -->
-          <el-button-group class="day-quick">
-            <el-button size="small" @click="jumpDetailDay(0)">今天</el-button>
-            <el-button size="small" @click="jumpDetailDay(-1)">昨天</el-button>
-            <el-button size="small" @click="jumpDetailDay(-7)">上周同日</el-button>
-          </el-button-group>
+                          :shortcuts="detailShortcuts" range-separator="→"
+                          start-placeholder="开始日期" end-placeholder="结束日期"
+                          @change="onDetailRangePick" />
         </div>
       </div>
       <el-alert v-if="detail.error" type="error" show-icon :closable="false" class="dash-alert"
@@ -1033,7 +1109,7 @@ onUnmounted(stopSyncPolling)
         <span v-for="(note, index) in detail.notes" :key="index">{{ note }}<template v-if="index < detail.notes.length - 1">；</template></span>
       </p>
       <el-table v-loading="detail.loading" :data="detail.rows" size="small"
-                empty-text="该日期没有订单明细">
+                empty-text="该区间没有订单明细">
         <!-- 列宽用 min-width：容器多出来的宽度会由 el-table 按比例分给各列，表格能撑满
              （写死 width 的话右侧会空一大块）。表头一律走 .col-head（已带 nowrap），
              中文不会在窄列里被压成"确认收/货金/额"竖排。 -->
@@ -1099,7 +1175,7 @@ onUnmounted(stopSyncPolling)
     </section>
 
     <el-dialog v-model="pickerVisible" title="自定义指标" width="440px" append-to-body>
-      <p class="dialog-tip">勾选后立即显示在面板上（默认展示前 8 个平台后台同款指标），选择会被记住。</p>
+      <p class="dialog-tip">勾选后立即显示在面板上（默认展示前 8 个平台后台同款指标），选择会被记住。面板只显示当前范围有数的指标：全部店铺汇总 = 两个平台都有的口径；单个店铺 = 该店平台给得出的口径，没数的卡片会自动隐藏。</p>
       <el-checkbox-group v-model="checkedKeys">
         <el-checkbox v-for="metric in METRICS" :key="metric.key" :value="metric.key">{{ metric.label }}</el-checkbox>
       </el-checkbox-group>
@@ -1172,8 +1248,16 @@ onUnmounted(stopSyncPolling)
   background: var(--gem-surface); border: 1px solid var(--gem-border);
   border-radius: var(--gem-radius-md); box-shadow: var(--gem-shadow-sm);
   transition: box-shadow .12s ease-out, border-color .12s ease-out;
+  cursor: pointer; /* 点卡片 = 切换折线图指标 */
 }
 .metric-card:hover { border-color: var(--gem-border-strong); box-shadow: var(--gem-shadow-md); }
+/* 当前正在画折线图的指标卡：品牌色描边 + 内圈高亮，一眼看出「点的是哪张」 */
+.metric-card.metric-card-active,
+.metric-card.metric-card-active:hover {
+  border-color: var(--gem-brand);
+  box-shadow: inset 0 0 0 1px var(--gem-brand), var(--gem-shadow-sm);
+}
+.metric-card-active .metric-label { color: var(--gem-brand); }
 .metric-top { display: flex; align-items: center; gap: 6px; color: var(--gem-text-2); font-size: 13px; }
 .metric-info { color: var(--gem-text-4); cursor: help; font-size: 13px; }
 .metric-value { font-size: 26px; line-height: 1.2; color: var(--gem-text); font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -1258,7 +1342,7 @@ onUnmounted(stopSyncPolling)
 .dash-orders .col-head { white-space: nowrap; }
 .dash-orders .col-info { flex: 0 0 auto; }
 .order-search { width: 190px; }
-.day-picker { width: 140px; }
+.range-picker { width: 250px; }
 .platform-select { width: 120px; }
 .order-shop, .order-time { color: var(--gem-text-2); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* 订单号 22 位、店铺名又长：都按单行省略，别把行高撑成两行三行 */

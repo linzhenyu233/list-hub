@@ -8,6 +8,8 @@ import {
   Collection,
   Connection,
   EditPen,
+  Expand,
+  Fold,
   Goods,
   More,
   Picture,
@@ -75,6 +77,16 @@ const editLoading = ref(false)
 const editProductId = ref('')
 const editProductData = ref(null)
 const apiDisplay = import.meta.env.VITE_API_BASE_URL || '/api（代理至 http://127.0.0.1:8000）'
+
+// 侧边栏折叠：折叠后收成 72px 图标窄栏，状态记忆在 localStorage，下次进来保持上次的宽窄
+const SIDEBAR_COLLAPSED_KEY = 'shininghouse.sidebarCollapsed'
+const sidebarCollapsed = ref((() => {
+  try { return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1' } catch { return false }
+})())
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  try { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed.value ? '1' : '0') } catch { /* 写不了不影响 */ }
+}
 
 // 搜索栏筛选条件（微信 API 不支持服务端筛选，在前端对已拉取列表做本地过滤）
 const searchForm = ref({ ids: '', codes: '', keyword: '', minPrice: null, maxPrice: null, minStock: null, maxStock: null })
@@ -547,7 +559,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <el-container class="app-shell">
+  <el-container class="app-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
     <el-aside width="224px" class="sidebar">
       <div class="brand">
         <div class="brand-mark"><img :src="brandMark" alt="SHINING HOUSE" /></div>
@@ -555,19 +567,19 @@ onMounted(async () => {
       </div>
       <el-menu :default-active="activeView" class="nav-menu" @select="activeView = $event">
         <el-menu-item-group title="微信小店">
-          <el-menu-item index="products" @click="selectPlatform('wechat')"><el-icon><Goods /></el-icon><span>微信商品</span></el-menu-item>
-          <el-menu-item index="create" @click="platform = 'wechat'"><el-icon><CirclePlus /></el-icon><span>发布微信商品</span></el-menu-item>
+          <el-menu-item index="products" :title="sidebarCollapsed ? '微信商品' : null" @click="selectPlatform('wechat')"><el-icon><Goods /></el-icon><span>微信商品</span></el-menu-item>
+          <el-menu-item index="create" :title="sidebarCollapsed ? '发布微信商品' : null" @click="platform = 'wechat'"><el-icon><CirclePlus /></el-icon><span>发布微信商品</span></el-menu-item>
         </el-menu-item-group>
         <el-menu-item-group title="小红书">
-          <el-menu-item index="xhs-products" @click="selectPlatform('xhs')"><el-icon><Notebook /></el-icon><span>小红书商品</span></el-menu-item>
-          <el-menu-item index="xhs-create" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
+          <el-menu-item index="xhs-products" :title="sidebarCollapsed ? '小红书商品' : null" @click="selectPlatform('xhs')"><el-icon><Notebook /></el-icon><span>小红书商品</span></el-menu-item>
+          <el-menu-item index="xhs-create" :title="sidebarCollapsed ? '发布小红书商品' : null" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
         </el-menu-item-group>
         <el-menu-item-group title="批量与配置">
-          <el-menu-item index="bulk-publish" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
-          <el-menu-item index="category-aliases" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
-          <el-menu-item index="data-dashboard" @click="platform = 'bulk'"><el-icon><TrendCharts /></el-icon><span>数据面板</span></el-menu-item>
-          <el-menu-item index="shops"><el-icon><Shop /></el-icon><span>店铺管理</span></el-menu-item>
-          <el-menu-item index="settings"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
+          <el-menu-item index="bulk-publish" :title="sidebarCollapsed ? '批量发布商品' : null" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
+          <el-menu-item index="category-aliases" :title="sidebarCollapsed ? '类目映射' : null" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
+          <el-menu-item index="data-dashboard" :title="sidebarCollapsed ? '数据面板' : null" @click="platform = 'bulk'"><el-icon><TrendCharts /></el-icon><span>数据面板</span></el-menu-item>
+          <el-menu-item index="shops" :title="sidebarCollapsed ? '店铺管理' : null"><el-icon><Shop /></el-icon><span>店铺管理</span></el-menu-item>
+          <el-menu-item index="settings" :title="sidebarCollapsed ? '接口设置' : null"><el-icon><Setting /></el-icon><span>接口设置</span></el-menu-item>
         </el-menu-item-group>
       </el-menu>
       <div class="sidebar-footer">
@@ -578,7 +590,10 @@ onMounted(async () => {
 
     <el-container>
       <el-header class="topbar">
-        <div>
+        <div class="topbar-title">
+          <el-tooltip :content="sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'" placement="bottom">
+            <el-button class="sidebar-toggle" text circle :icon="sidebarCollapsed ? Expand : Fold" @click="toggleSidebar" />
+          </el-tooltip>
           <span class="breadcrumb">运营中心 /</span>
           <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : activeView === 'data-dashboard' ? '数据面板' : activeView === 'shops' ? '店铺管理' : '连接设置' }}</strong>
         </div>
