@@ -822,6 +822,40 @@ def test_order_mock_shells():
     print("  [OK] mock 订单/售后壳结构正确且按天稳定")
 
 
+def test_product_dimension_metrics():
+    """商品明细：金额按订单实付等比分摊 → 各商品之和必须等于订单实付之和。
+
+    纯函数用例，不联网。线上已核对过：小红书 2026-10-04 两个商品 2274.90 + 1099.00
+    = 3373.90，正好等于这两笔订单的实付之和（优惠/运费摊过后依然对得上）。
+    """
+    p = _new_db_path()
+    m = _boot(p)
+    start, end = m._day_bounds("2026-10-10")
+    noon = start + 12 * 3600
+    orders = [
+        {"order_id": "o1", "status": 100, "pay_time": noon, "order_price": 10000,
+         "products": [{"product_id": "p1", "sku_id": "s1", "title": "A", "sku_code": "C1",
+                       "product_cnt": 2, "real_price": 5000}]},
+        {"order_id": "o2", "status": 100, "pay_time": noon + 60, "order_price": 3000,
+         "products": [{"product_id": "p2", "sku_id": "s2", "title": "B", "sku_code": "C2",
+                       "product_cnt": 1, "real_price": 3000}]},
+    ]
+    rows, unnamed = m._aggregate_product_day("wechat", orders, start, end)
+    assert unnamed == 0 and len(rows) == 2, (rows, unnamed)
+    assert round(sum(row["paid_amount"] for row in rows), 2) == 130.0, \
+        f"商品金额之和必须等于订单实付之和(130.00 元): {rows}"
+    top = rows[0]
+    assert (top["product_id"], top["sku_code"], top["paid_qty"], top["paid_amount"]) \
+        == ("p1", "C1", 2, 100.0), rows
+
+    # 没带商品信息的订单要单独计数，不能悄悄消失（否则总览有金额、拆解里却看不到）
+    rows2, unnamed2 = m._aggregate_product_day(
+        "wechat", [{"order_id": "o3", "status": 100, "pay_time": noon, "order_price": 100}],
+        start, end)
+    assert unnamed2 == 1 and not rows2, (rows2, unnamed2)
+    print("  [OK] 商品维度：金额等比分摊、无名订单单独计数")
+
+
 def main():
     print("多店铺中台回归测试：")
     test_migration_idempotent()
@@ -838,6 +872,7 @@ def main():
     test_gateway_json_post_keeps_params()
     test_order_metrics_aggregation()
     test_order_mock_shells()
+    test_product_dimension_metrics()
     print("\n全部通过 OK")
 
 

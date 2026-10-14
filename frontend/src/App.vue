@@ -16,7 +16,6 @@ import {
   Remove,
   Setting,
   Shop,
-  ShoppingBag,
   Warning,
   Notebook,
   Upload,
@@ -25,6 +24,8 @@ import {
 import { storeApi } from './api'
 import { xhsApi } from './xhsApi'
 import { useIsMobile } from './useResponsive'
+// 侧边栏品牌图标：SHINING HOUSE 图形标记（从 logo 裁出的白色透明底 PNG，深色侧边栏上才看得见）
+import brandMark from './assets/shining-house-mark.png'
 // 视图级组件按需异步加载：仅当切换到对应标签时才下载并执行其代码块
 // 首屏只保留商品列表所需的 ProductSearchBar / EllipsisText 同步引入
 const ProductForm = defineAsyncComponent(() => import('./components/ProductForm.vue'))
@@ -549,7 +550,7 @@ onMounted(async () => {
   <el-container class="app-shell">
     <el-aside width="224px" class="sidebar">
       <div class="brand">
-        <div class="brand-mark"><el-icon><ShoppingBag /></el-icon></div>
+        <div class="brand-mark"><img :src="brandMark" alt="SHINING HOUSE" /></div>
         <div><strong>商品中台</strong><span>多平台运营</span></div>
       </div>
       <el-menu :default-active="activeView" class="nav-menu" @select="activeView = $event">

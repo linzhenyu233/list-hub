@@ -399,6 +399,10 @@ class XhsStore:
     #
     # ⚠️ 合规:订单/售后响应里有收件人姓名、电话、地址、买家ID 等隐私,**一律不透出**;
     #    下面 summarize_* 用「白名单提取」,只挑选算指标要用的键。
+    #    唯一的例外是 buyer_key(买家标识):它**不落库、不返回给前端**,只在同步当天
+    #    内存里用来去重算「支付买家数/下单人数」,算完只留个数(见 bulk_api 的
+    #    _aggregate_order_day)。真机实测(2026-10-13):列表接口 26 个字段里就有
+    #    xhsOpenId(50 笔订单去重出 5 个买家),订单详情里另有 userId。
     # ⚠️ 参数一律用 camelCase(pageNo/pageSize/timeType/startTime/endTime):
     #    小红书网关按 camelCase 校验,传 snake_case 会报 required param check 或 -9020。
     # ⚠️ 时间区间限制:timeType=1(按创建时间)跨度 ≤ 24 小时;timeType=2(按更新时间)≤ 30 分钟。
@@ -447,6 +451,8 @@ class XhsStore:
             "total_amount": cls._pick(order, "totalAmount", "total_amount"),
             "actual_amount": cls._pick(order, "actualAmount", "actual_amount"),
             "after_sale_status": cls._pick(order, "orderAfterSalesStatus", "afterSalesStatus"),
+            # 买家标识:只给「当天去重计数」用(见文件头合规说明),中台不落库、不透出
+            "buyer_key": cls._pick(order, "xhsOpenId", "userId", "buyerId"),
         }
 
     def get_order_detail(self, order_id):
@@ -460,7 +466,10 @@ class XhsStore:
 
     @classmethod
     def summarize_order_detail(cls, payload):
-        """订单详情 → 指标要用的字段(收件人/买家等隐私字段一律丢弃)。"""
+        """订单详情 → 指标要用的字段(收件人/买家等隐私字段一律丢弃)。
+
+        ⚠️ buyer_key 例外:见文件头说明,只用于当天内存去重计数,不落库不透出。
+        """
         payload = payload or {}
         order = payload.get("orderInfo") or payload.get("order") or payload
         return {
@@ -476,7 +485,55 @@ class XhsStore:
             "actual_amount": cls._pick(order, "totalPayAmount", "actualAmount", "actual_amount"),
             "total_amount": cls._pick(order, "totalPayAmount", "totalAmount", "total_amount"),
             "merchant_receive_amount": cls._pick(order, "merchantActualReceiveAmount"),
+            "buyer_key": cls._pick(order, "xhsOpenId", "userId", "buyerId"),
+            "items": cls._order_items(order),
         }
+
+    @staticmethod
+    def _order_items(order):
+        """订单里的商品条目（数据面板按单个商品拆解要用）。
+
+        skuList[].skuName =商品名、totalPaidAmount =实付(分)、erpcode =商家编码；
+        skuDetailList[].skuId + quantity 拆到单品。只有单品订单能从发货单取到 itemId，
+        多品订单不做猜测（宁可 product_id 为空，也不要给错商品）。
+        """
+        items = []
+        for sku in (order.get("skuList") or []):
+            sku = sku or {}
+            details = [one for one in (sku.get("skuDetailList") or []) if isinstance(one, dict)]
+            quantity = 0
+            for one in details:
+                try:
+                    quantity += int(one.get("quantity") or 0)
+                except (TypeError, ValueError):
+                    quantity += 1
+            first = details[0] if details else {}
+            items.append({
+                # 真机实测(2026-10-13)：skuList[].itemId 才是**真正的商品ID**。
+                # 旧代码取的是发货单 simpleDeliveryOrderList[].itemIdList，
+                # 而那个字段实测**填的是 skuId**（与同层 skuIdList 完全相同）——
+                # 拿 SKU ID 去商品列表里找图永远找不到，
+                # 表现就是“商品明细”里小红书商品全部「无图」。
+                "product_id": sku.get("itemId"),
+                "sku_id": first.get("skuId") or sku.get("skuId"),
+                "title": sku.get("skuName") or sku.get("itemName"),
+                "sku_code": sku.get("erpcode") or first.get("erpCode") or first.get("scSkuCode"),
+                "product_cnt": quantity or 1,
+                "paid_amount": sku.get("totalPaidAmount"),
+                "aftersale_status": sku.get("skuAfterSaleStatus"),
+                # 订单里就直接带着 SKU 级主图（实测 skuImage 以 // 开头，需补 https:）。
+                # 把它一并落库，店铺已下架的商品也有图，不再只能靠商品列表反查。
+                "image": XhsStore._abs_image(sku.get("skuImage")),
+            })
+        return items
+
+    @staticmethod
+    def _abs_image(url):
+        """小红书图片字段常以 // 开头（协议相对地址），补成 https 否则浏览器拒绝加载。"""
+        url = str(url or "").strip()
+        if url.startswith("//"):
+            return "https:" + url
+        return url
 
     def list_aftersales(self, start_time, end_time, time_type=1, page_no=1, page_size=20):
         """按时间区间拉售后单列表(旧版接口 afterSale.listAfterSaleApi,实测可用)。"""

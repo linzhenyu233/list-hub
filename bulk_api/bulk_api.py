@@ -20,6 +20,7 @@ import uuid
 import zipfile
 import time
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -235,6 +236,9 @@ def _ensure_db_schema():
             _migrate_add_job_params(conn)
             _migrate_add_publish_mode(conn)
             _migrate_add_order_stats_columns(conn)
+            _migrate_add_order_buyer_columns(conn)
+            _migrate_add_product_image_column(conn)
+            _migrate_add_product_stats_columns(conn)
             _rebuild_multishop_tables(conn)
             _reassign_legacy_shop(conn)
             _create_indexes(conn)
@@ -316,9 +320,60 @@ def _create_tables(conn):
         pay_gmv INTEGER NOT NULL DEFAULT 0, pay_uv INTEGER NOT NULL DEFAULT 0,
         pay_order_cnt INTEGER NOT NULL DEFAULT 0, pay_refund_gmv INTEGER NOT NULL DEFAULT 0,
         product_click_uv INTEGER NOT NULL DEFAULT 0, stats_source TEXT,
+        -- 自算的「人数」口径：按订单里的买家标识当天去重计数。
+        -- 平台没有官方人数接口时（小红书）就用它；微信优先用罗盘 pay_uv。
+        -- ⚠️ 只落**个数**，买家标识本身不落库、不返回（合规边界同"不存订单明细"）。
+        paid_buyers INTEGER NOT NULL DEFAULT 0, created_buyers INTEGER NOT NULL DEFAULT 0,
         synced_at TEXT, sync_error TEXT,
         PRIMARY KEY(shop_id, platform, stat_date)
     )""")
+    # 商品级日报（数据面板下方的「商品明细」用）：
+    # 只存**商品级聚合**，不含任何买家/收件人信息（与 order_daily_metrics 同一合规口径）。
+    # 金额单位统一「元」。refund_* 暂为 0：平台没给"哪个商品退了多少"，
+    # 要拆退款必须再调售后详情（接口能拿到，属下一步），口径会在页面/导出里注明。
+    # product_click_* / product_pay_* / product_create_uv / product_refund_amount 是
+    # **平台商品级接口**（微信罗盘）的原值口径，只有 stats_source 有值时才可信；
+    # 平台没这能力时留 0，前端显示「—」。
+    # product_create_uv = 罗盘「下单人数」：用来补「点击 → 下单 → 支付」漏斗中间那一环。
+    #   之所以有它而没有「加购」：已核对罗盘商品级接口返回的全部 31 个字段，无 cart/add_cart
+    #   任何形态的加购指标，订单接口也拿不到（加购发生在成单之前），故加购列直接删掉。
+    conn.execute("""CREATE TABLE IF NOT EXISTS product_daily_metrics (
+        shop_id TEXT NOT NULL, platform TEXT NOT NULL, stat_date TEXT NOT NULL,
+        product_id TEXT NOT NULL DEFAULT '', sku_id TEXT NOT NULL DEFAULT '',
+        product_name TEXT, sku_code TEXT,
+        paid_qty INTEGER NOT NULL DEFAULT 0, paid_amount REAL NOT NULL DEFAULT 0,
+        refund_qty INTEGER NOT NULL DEFAULT 0, refund_amount REAL NOT NULL DEFAULT 0,
+        order_count INTEGER NOT NULL DEFAULT 0, image_url TEXT,
+        product_click_uv INTEGER NOT NULL DEFAULT 0, product_click_cnt INTEGER NOT NULL DEFAULT 0,
+        product_pay_uv INTEGER NOT NULL DEFAULT 0, product_pay_cnt INTEGER NOT NULL DEFAULT 0,
+        product_create_uv INTEGER NOT NULL DEFAULT 0,
+        product_refund_amount REAL NOT NULL DEFAULT 0, stats_source TEXT,
+        notes TEXT, synced_at TEXT,
+        PRIMARY KEY(shop_id, platform, stat_date, product_id, sku_id)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_product_metrics_range"
+                 " ON product_daily_metrics(shop_id, platform, stat_date)")
+    # 订单级明细（导出的「交易清单」与页面上的「商品明细」面板都靠它）。
+    # 为什么以前不落、现在落：以前导出交易清单只能**实时**打平台接口逐笔拉，
+    # 小红书光补详情一个店一天就要十几秒，导出动辄半分钟起步；落库后导出/页面都是本地读，
+    # **秒出**。而且这些数据同步时本来就拉过（sync_order_metrics 里），只是之前用完就丢，
+    # 所以落库**不增加任何平台调用**。
+    # ⚠️ 合规：与前两张表同一口径——**不落任何买家标识/收件人信息**，只留交易维度。
+    conn.execute("""CREATE TABLE IF NOT EXISTS order_items (
+        shop_id TEXT NOT NULL, platform TEXT NOT NULL, stat_date TEXT NOT NULL,
+        order_no TEXT NOT NULL DEFAULT '', order_id TEXT NOT NULL DEFAULT '',
+        create_ts INTEGER NOT NULL DEFAULT 0, pay_ts INTEGER NOT NULL DEFAULT 0,
+        paid_amount REAL NOT NULL DEFAULT 0, status_code INTEGER, status_text TEXT,
+        confirm_amount REAL, item_qty INTEGER NOT NULL DEFAULT 0, item_count INTEGER NOT NULL DEFAULT 0,
+        item_title TEXT, shop_name TEXT, synced_at TEXT,
+        PRIMARY KEY(shop_id, platform, stat_date, order_no)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_order_items_range"
+                 " ON order_items(shop_id, platform, stat_date)")
+
+
+# 订单明细保留天数：导出与页面只需要近期和历史对比，超期就清，避免库无限变大
+ORDER_ITEMS_KEEP_DAYS = 180
 
 
 def _migrate_add_order_stats_columns(conn):
@@ -336,6 +391,45 @@ def _migrate_add_order_stats_columns(conn):
         "stats_source TEXT",
     ):
         _safe_add_column(conn, "order_daily_metrics", col_def)
+
+
+def _migrate_add_order_buyer_columns(conn):
+    """给 order_daily_metrics 补「自算人数」两列（老库升级用）。
+
+    单独一个函数并显式挂进 _ensure_db_schema，理由同 _migrate_add_order_stats_columns：
+    老库走到这里表已存在，塞进别的迁移函数会因提前 return 而补不上列。
+    """
+    for col_def in (
+        "paid_buyers INTEGER NOT NULL DEFAULT 0",
+        "created_buyers INTEGER NOT NULL DEFAULT 0",
+    ):
+        _safe_add_column(conn, "order_daily_metrics", col_def)
+
+
+def _migrate_add_product_image_column(conn):
+    """给 product_daily_metrics 补 image_url 列（商品/SKU 主图）。
+
+    单独一个函数并显式挂进确保流程：老库走到这里时表已存在。
+    """
+    _safe_add_column(conn, "product_daily_metrics", "image_url TEXT")
+
+
+def _migrate_add_product_stats_columns(conn):
+    """给 product_daily_metrics 补「平台商品级数据」列（老库升级用）。
+
+    单独一个函数并显式挂进 _ensure_db_schema，理由同 _migrate_add_order_stats_columns：
+    老库走到这里表已存在，塞进别的迁移函数会因提前 return 而补不上列。
+    """
+    for col_def in (
+        "product_click_uv INTEGER NOT NULL DEFAULT 0",
+        "product_click_cnt INTEGER NOT NULL DEFAULT 0",
+        "product_pay_uv INTEGER NOT NULL DEFAULT 0",
+        "product_pay_cnt INTEGER NOT NULL DEFAULT 0",
+        "product_create_uv INTEGER NOT NULL DEFAULT 0",
+        "product_refund_amount REAL NOT NULL DEFAULT 0",
+        "stats_source TEXT",
+    ):
+        _safe_add_column(conn, "product_daily_metrics", col_def)
 
 
 def _create_indexes(conn):
@@ -2132,6 +2226,20 @@ def maintain_database():
             print(f"[db] 已清理 {removed} 个过期批次（>{BATCH_TTL_DAYS} 天，约 {freed / 1024 / 1024:.1f} MB）")
     except Exception as exc:
         print(f"[db] 清理过期批次失败: {exc}")
+    # 订单明细只保留近期：导出与页面用它，但一年前的逐笔订单没人会再翻，
+    # 不清的话这张表会随着时间一直涨（每天几笔就是一年十几万行）。
+    try:
+        conn = db()
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=ORDER_ITEMS_KEEP_DAYS)).date().isoformat()
+            dropped = conn.execute("DELETE FROM order_items WHERE stat_date < ?", (cutoff,)).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        if dropped and dropped > 0:
+            print(f"[db] 已清理 {dropped} 行过期订单明细（>{ORDER_ITEMS_KEEP_DAYS} 天）")
+    except Exception as exc:
+        print(f"[db] 清理过期订单明细失败: {exc}")
     conn = db()
     try:
         free_pages = conn.execute("PRAGMA freelist_count").fetchone()[0]
@@ -3168,6 +3276,16 @@ ORDER_SYNC_MAX_PAGES = 20          # 单日单平台最多翻 20 页，防止异
 # 定 200 的原因：实测一天可能有几十单，30 会把大半天数漏成"金额不全"（面板数字偏小且不显眼），
 # 200 足够覆盖日常、又不会在异常时无限调用（超出会在 notes 里点名还剩多少单没补）。
 ORDER_DETAIL_LOOKUP_MAX = 200
+# 小红书取图：拉商品列表建映射时最多翻多少页（100 页/页，店内商品实测 155 条，2 页就够）
+XHS_ITEM_IMAGE_MAX_PAGES = 20
+# 商品图取图失败（平台没返回头图 / 上游服务当时没起来）后多久才允许重试：
+# 失败不能像成功那样永久缓存 —— 否则一次"上游没启动"会被固化，面板长期无图。
+IMAGE_FAILURE_RETRY_SECONDS = 600
+# 商品级数据（微信罗盘）单日单店最多查几个商品：接口**只支持一个商品+一个单日**，
+# 没批量，所以是"商品数 × 2 天"次请求。定 300 是覆盖日常有销量的商品，又避免异常时把限流打满。
+PRODUCT_STATS_MAX_ITEMS = 300
+# 并发查商品级数据的线程数：接口是纯读、单次很轻，给 4 个并发把 N 次串行的等待摊掉。
+PRODUCT_STATS_WORKERS = 4
 ORDER_SYNC_DEFAULT_DAYS = 2        # 手动/自动同步默认覆盖「昨天 + 今天」（T+1 补拉）
 # 自动同步的进程内占位（key=last_order_sync:<店>:<平台>）：多线程 worker 去重用，见 maybe_sync_order_metrics
 _ORDER_SYNC_LOCK = threading.Lock()
@@ -3210,6 +3328,178 @@ def _day_bounds(stat_date):
 
 def _order_api_base(platform):
     return WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
+
+
+# —— 「商品明细」面板的订单级数据 ————————————————————————————————
+# 中台**不落订单明细表**（order_daily_metrics/product_daily_metrics 都只存聚合值，
+# 见建表注释），所以明细只能实时调平台订单接口现取现用。
+# 代价是慢：小红书列表不返回金额，还得逐单补详情（并发 4，上限 ORDER_DETAIL_LOOKUP_MAX）。
+# 因此加一层**短 TTL 内存缓存**：翻页、换关键词、切走再切回来都命中缓存，
+# 不重复打平台（平台有限流，重复打有风险）。
+ORDER_DETAIL_CACHE_TTL = 300          # 秒。当天订单基本不变，但也不能一直用旧数据
+ORDER_DETAIL_MAX_ORDERS = 300         # 单店单平台单次最多列多少笔（超出会明说，不静默截断）
+_ORDER_DETAIL_CACHE_LOCK = threading.Lock()
+_ORDER_DETAIL_CACHE: dict = {}        # '店|平台|日期' → (取回时间戳, 行列表, 备注)
+
+
+def _order_detail_cache_get(key):
+    with _ORDER_DETAIL_CACHE_LOCK:
+        hit = _ORDER_DETAIL_CACHE.get(key)
+    if not hit:
+        return None
+    fetched_at, rows, notes = hit
+    if time.time() - fetched_at > ORDER_DETAIL_CACHE_TTL:
+        return None
+    return rows, notes
+
+
+def _order_detail_cache_put(key, rows, notes):
+    with _ORDER_DETAIL_CACHE_LOCK:
+        _ORDER_DETAIL_CACHE[key] = (time.time(), rows, notes)
+        # 只留最近的若干个键，避免长期运行把内存吃满
+        if len(_ORDER_DETAIL_CACHE) > 200:
+            oldest = sorted(_ORDER_DETAIL_CACHE, key=lambda k: _ORDER_DETAIL_CACHE[k][0])
+            for stale in oldest[:80]:
+                _ORDER_DETAIL_CACHE.pop(stale, None)
+
+
+# 微信官方有订单状态码表；小红书未公开（SDK 里只是 int），所以那边按时间字段判断，
+# 与 _aggregate_order_day 的口径保持一致（实测比猜状态码可靠）
+WECHAT_ORDER_STATUS_TEXT = {
+    10: "待付款", 20: "待发货", 21: "部分发货", 30: "待收货",
+    100: "已完成", 200: "售后取消", 250: "未付款取消",
+}
+
+
+def _order_status_text(platform, order):
+    """订单状态 → 中文文案（导出的「交易清单」用；不认识的码原样标出来，不编）。"""
+    status = order.get("status")
+    if platform == "wechat":
+        if status in WECHAT_ORDER_STATUS_TEXT:
+            return WECHAT_ORDER_STATUS_TEXT[status]
+        try:
+            return WECHAT_ORDER_STATUS_TEXT.get(int(status), f"状态码 {status}")
+        except (TypeError, ValueError):
+            return "—"
+    if _to_epoch_seconds(order.get("finish_time")):
+        return "已完成"
+    if _to_epoch_seconds(order.get("pay_time")):
+        return "已支付"
+    if _to_epoch_seconds(order.get("cancel_time")):
+        return "已取消"
+    return "待付款"
+
+
+def _order_detail_row(platform, shop_id, order):
+    """一条订单摘要 → 交易明细的一行。
+
+    金额统一「元」（两平台订单接口都是分，必须过 _to_yuan）；时间统一成**本地时区**
+    的秒级时间戳，前端直接 new Date() 就能按本地时间显示（库里 synced_at 那类是 UTC，
+    这里刻意不存字符串、避免又出现差 8 小时的问题）。
+    """
+    raw_amount = (order.get("order_price") if platform == "wechat"
+                  else order.get("actual_amount") or order.get("total_amount"))
+    paid_amount = _to_yuan(platform, raw_amount)
+    create_ts = _to_epoch_seconds(order.get("create_time"))
+    pay_ts = _to_epoch_seconds(order.get("pay_time"))
+    # 「确认收货」判定：微信有状态码 100 和确认收货时间；小红书码表未公开，按 finishTime
+    confirm_ts = _to_epoch_seconds(order.get("confirm_receipt_time") or order.get("finish_time"))
+    confirmed = bool(confirm_ts) or (platform == "wechat" and order.get("status") == 100)
+    items = order.get("items") if isinstance(order.get("items"), list) else []
+    if not items and isinstance(order.get("product_infos"), list):
+        items = order.get("product_infos")
+    quantity = 0
+    for item in items:
+        try:
+            quantity += int((item or {}).get("product_cnt") or (item or {}).get("quantity") or 0)
+        except (TypeError, ValueError):
+            quantity += 1
+    return {
+        # 订单编号：小红书有独立的 order_no（人看的单号），微信只有 order_id
+        "order_no": str(order.get("order_no") or order.get("order_id") or ""),
+        "order_id": str(order.get("order_id") or ""),
+        "platform": platform, "shop_id": shop_id,
+        "shop_name": _shop_display_name(shop_id),
+        "create_ts": create_ts, "pay_ts": pay_ts,
+        "paid": bool(pay_ts), "paid_amount": paid_amount,
+        # 确认收货金额：平台没有这个字段，用「已完成订单的实付额」近似，未完成给 None
+        "confirm_amount": paid_amount if confirmed else None,
+        "status": order.get("status"),
+        "status_text": _order_status_text(platform, order),
+        "item_count": len(items), "item_qty": quantity or len(items),
+        "item_title": (str((items[0] or {}).get("title") or "")[:40]
+                       if items else ""),
+    }
+
+
+def _write_order_items(conn, shop_id, platform, stat_date, orders):
+    """把当天的订单级明细落库（导出的交易清单 / 页面商品明细都读它）。
+
+    只写交易维度，**不写买家标识**：买家信息同步时只用于内存去重，不落库（见 xhs_store 白名单）。
+    同一次同步里订单可能被重复处理（幂等重跑），所以先删当天这个店这个平台的旧行再写。
+    """
+    conn.execute("DELETE FROM order_items WHERE shop_id=? AND platform=? AND stat_date=?",
+                 (shop_id, platform, stat_date))
+    payload = []
+    for order in orders:
+        row = _order_detail_row(platform, shop_id, order)
+        payload.append((shop_id, platform, stat_date, row["order_no"], row["order_id"],
+                        row["create_ts"] or 0, row["pay_ts"] or 0, row["paid_amount"],
+                        row["status"], row["status_text"], row["confirm_amount"],
+                        row["item_qty"], row["item_count"], row["item_title"],
+                        row["shop_name"], now()))
+    if payload:
+        conn.executemany(
+            "INSERT OR REPLACE INTO order_items (shop_id, platform, stat_date, order_no, order_id,"
+            " create_ts, pay_ts, paid_amount, status_code, status_text, confirm_amount,"
+            " item_qty, item_count, item_title, shop_name, synced_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", payload)
+    return len(payload)
+
+
+def _local_order_rows(shop_id, platform, stat_date):
+    """读本地已落的订单明细；没有就返回空列表（调用方决定要不要实时去拉）。"""
+    conn = db()
+    try:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM order_items WHERE shop_id=? AND platform=? AND stat_date=?"
+            " ORDER BY COALESCE(pay_ts, create_ts) DESC", (shop_id, platform, stat_date))]
+    finally:
+        conn.close()
+
+
+def _order_detail_rows(platform, shop_id, stat_date):
+    """某店某平台某天的订单明细行 + 备注。
+
+    **本地优先**：同步时已经把明细落库了，所以这里直接读 SQLite（毫秒级）。
+    只有"还没同步过的日子"才实时打平台接口（带短 TTL 缓存）——这正是导出变慢的根源。
+    """
+    local = _local_order_rows(shop_id, platform, stat_date)
+    if local:
+        return local, []
+    key = f"{shop_id}|{platform}|{stat_date}"
+    cached = _order_detail_cache_get(key)
+    if cached:
+        return cached
+    start, end = _day_bounds(stat_date)
+    notes = []
+    try:
+        orders = _fetch_orders(platform, shop_id, start, end)
+        detail_note = _enrich_orders_with_detail(platform, shop_id, orders)
+        if detail_note:
+            notes.append(detail_note)
+    except Exception as exc:  # noqa: BLE001
+        return [], [f"{_shop_display_name(shop_id)}/{platform}：订单拉取失败（{str(exc)[:80]}）"]
+    if len(orders) > ORDER_DETAIL_MAX_ORDERS:
+        total = len(orders)
+        orders = orders[:ORDER_DETAIL_MAX_ORDERS]
+        notes.append(f"当天订单 {total} 笔，超过单次 {ORDER_DETAIL_MAX_ORDERS} 笔上限，"
+                     f"明细只列最近 {ORDER_DETAIL_MAX_ORDERS} 笔（完整数据看上方「数据概览」）")
+    rows = [_order_detail_row(platform, shop_id, order) for order in orders]
+    # 按支付时间倒序；没付款的排在最后但仍按创建时间排
+    rows.sort(key=lambda row: (row["pay_ts"] or row["create_ts"] or 0), reverse=True)
+    _order_detail_cache_put(key, rows, notes)
+    return rows, notes
 
 
 def _fetch_orders(platform, shop_id, start, end):
@@ -3310,7 +3600,7 @@ def _enrich_orders_with_detail(platform, shop_id, orders):
                 failed += 1
                 continue
             for key in ("create_time", "pay_time", "finish_time", "cancel_time", "status",
-                        "update_time", "actual_amount", "total_amount"):
+                        "update_time", "actual_amount", "total_amount", "items", "buyer_key"):
                 if detail.get(key) not in (None, ""):
                     order[key] = detail[key]
             filled += 1
@@ -3323,28 +3613,43 @@ def _enrich_orders_with_detail(platform, shop_id, orders):
 
 
 def _aggregate_order_day(platform, orders, aftersales, start, end):
-    """把一天的订单/售后聚合成本面板的 7 个指标（金额单位：元）。"""
+    """把一天的订单/售后聚合成本面板的指标（金额单位：元）。
+
+    人数口径：按订单里的买家标识(buyer_key)**当天去重**计数，只落个数、不落标识。
+    平台没有官方人数接口时（小红书）就用这个自算值；微信优先用罗盘 pay_uv。
+    """
     groups = ORDER_STATUS_GROUPS.get(platform) or {}
     unpaid, pending_ship, shipped = (set(groups.get(k) or ()) for k in ("unpaid", "pending_ship", "shipped"))
     finished = set(groups.get("finished") or ())
     paid_orders = dealt_orders = actual_orders = 0
     paid_amount = actual_income = 0.0
+    paid_buyer_keys, created_buyer_keys = set(), set()
 
     for order in orders:
         status = order.get("status")
+        buyer_key = str(order.get("buyer_key") or "").strip()
         # 金额字段名各平台不同：微信 order_price(分)；小红书详情 totalPayAmount(分)
         raw_amount = (order.get("order_price") if platform == "wechat"
                       else order.get("actual_amount") or order.get("total_amount"))
         amount = _to_yuan(platform, raw_amount)
+        # 下单时间：两平台都是"订单创建时间"，用来算下单人数（含未支付/已取消）
+        create_ts = _to_epoch_seconds(order.get("create_time"))
+        if buyer_key and create_ts and start <= create_ts < end:
+            created_buyer_keys.add(buyer_key)
+        # ⚠️ 支付件数/金额**只认 pay_time**：原来的 `pay_time or create_time` 兜底会把
+        #    没付款的订单也算成已支付（金额为 0，所以金额看着对、件数虚高）；
+        #    微信那边"未付款取消"的单还会把挂牌价算进支付金额。
         if platform == "xhs":
             # 小红书**没有公开的状态码表**,所以一律用时间字段判断(实测字段:paidTime/finishTime/
             # cancelTime,毫秒)——比猜状态码可靠:有 paidTime 就是已支付,有 finishTime 就是已完成。
-            pay_ts = _to_epoch_seconds(order.get("pay_time") or order.get("create_time"))
+            pay_ts = _to_epoch_seconds(order.get("pay_time"))
             finish_ts = _to_epoch_seconds(order.get("finish_time"))
             cancel_ts = _to_epoch_seconds(order.get("cancel_time"))
             if pay_ts and start <= pay_ts < end:
                 paid_orders += 1
                 paid_amount += amount
+                if buyer_key:
+                    paid_buyer_keys.add(buyer_key)
             if finish_ts and start <= finish_ts < end:
                 dealt_orders += 1
             # 在途=已支付且未完成未取消(存量口径,与微信一致)
@@ -3353,10 +3658,12 @@ def _aggregate_order_day(platform, orders, aftersales, start, end):
                 actual_income += amount
             continue
         # 支付时间：微信 pay_time（秒）
-        pay_ts = _to_epoch_seconds(order.get("pay_time") or order.get("create_time"))
-        if status not in unpaid and start <= pay_ts < end:
+        pay_ts = _to_epoch_seconds(order.get("pay_time"))
+        if status not in unpaid and pay_ts and start <= pay_ts < end:
             paid_orders += 1
             paid_amount += amount
+            if buyer_key:
+                paid_buyer_keys.add(buyer_key)
         if status in finished:
             done_ts = _to_epoch_seconds(order.get("confirm_receipt_time"))
             if start <= done_ts < end:
@@ -3394,19 +3701,193 @@ def _aggregate_order_day(platform, orders, aftersales, start, end):
         "dealt_orders": dealt_orders, "refund_amount": round(refund_amount, 2),
         "actual_income": round(actual_income, 2), "actual_orders": actual_orders,
         "refund_rate": refund_rate, "unverified_refunds": unverified_refunds,
+        # 自算人数：当天去重的买家个数。0 表示这天没取到买家标识（平台没这字段），
+        # 调用方要靠"是 0 还是没有"区分，别把它当成"0 个买家"。
+        "paid_buyers": len(paid_buyer_keys), "created_buyers": len(created_buyer_keys),
     }
+
+
+def _aggregate_product_day(platform, orders, start, end):
+    """把一天的订单按「商品」聚合（金额单位：元）。
+
+    金额**按订单实付等比分摊**到各商品条目：平台给的"商品单价 × 数量"之和常常不等于
+    订单实付（优惠、运费、跨店满减都在里面），直接相加会和总览的支付金额对不上。
+    这里用比例分摊，保证 Σ商品金额 === Σ订单实付，页面/导出都能自洽。
+    返回 (rows, unnamed)：无名商品的订单数（平台没给商品名时无法归类）。
+    """
+    groups = ORDER_STATUS_GROUPS.get(platform) or {}
+    unpaid = set(groups.get("unpaid") or ())
+    buckets = {}
+    unnamed = 0
+    for order in orders:
+        # 商品条目：微信服务的键是 product_infos，小红书是 items（都兼容，别写死）
+        items = order.get("product_infos") or order.get("products") or order.get("items") or []
+        status = order.get("status")
+        pay_ts = _to_epoch_seconds(order.get("pay_time") or order.get("create_time"))
+        if not items or status in unpaid or not pay_ts or not (start <= pay_ts < end):
+            if not items:
+                unnamed += 1
+            continue
+        raw_amount = (order.get("order_price") if platform == "wechat"
+                      else order.get("actual_amount") or order.get("total_amount"))
+        order_amount = _to_yuan(platform, raw_amount)
+        weights = []
+        for item in items:
+            try:
+                qty = int(item.get("product_cnt") or 0) or 1
+            except (TypeError, ValueError):
+                qty = 1
+            unit = item.get("real_price") or item.get("sale_price") or item.get("paid_amount") or 0
+            try:
+                unit_value = float(unit)
+            except (TypeError, ValueError):
+                unit_value = 0.0
+            weights.append((qty, max(unit_value, 0.0) * qty))
+        total_weight = sum(weight for _qty, weight in weights)
+        for item, (qty, weight) in zip(items, weights):
+            key = (str(item.get("product_id") or ""), str(item.get("sku_id") or ""))
+            bucket = buckets.setdefault(key, {
+                "product_id": key[0], "sku_id": key[1],
+                "product_name": item.get("title") or "",
+                "image_url": item.get("image") or "",
+                "sku_code": item.get("sku_code") or "",
+                "paid_qty": 0, "paid_amount": 0.0, "order_count": 0,
+            })
+            bucket["paid_qty"] += qty
+            bucket["order_count"] += 1
+            bucket["paid_amount"] += (order_amount if total_weight <= 0
+                                      else order_amount * weight / total_weight)
+            if not bucket["product_name"] and item.get("title"):
+                bucket["product_name"] = item["title"]
+            if not bucket["image_url"] and item.get("image"):
+                bucket["image_url"] = item["image"]
+            if not bucket["sku_code"] and item.get("sku_code"):
+                bucket["sku_code"] = item["sku_code"]
+    rows = []
+    for bucket in buckets.values():
+        bucket["paid_amount"] = round(bucket["paid_amount"], 2)
+        rows.append(bucket)
+    rows.sort(key=lambda row: row["paid_amount"], reverse=True)
+    return rows, unnamed
+
+
+def _write_product_metrics(conn, shop_id, platform, stat_date, rows):
+    """整天的商品行先删再写：商品集合会变（改名/下架），只 UPSERT 会留下已经不存在的旧行。"""
+    conn.execute("DELETE FROM product_daily_metrics WHERE shop_id=? AND platform=? AND stat_date=?",
+                 (shop_id, platform, stat_date))
+    if not rows:
+        return 0
+    note = "退款仍按订单口径，未用商品级退款金额（平台商品级接口只回成交退款，口径不同）"
+    conn.executemany(
+        "INSERT INTO product_daily_metrics (shop_id, platform, stat_date, product_id, sku_id,"
+        " product_name, sku_code, paid_qty, paid_amount, order_count, image_url,"
+        " product_click_uv, product_click_cnt, product_pay_uv, product_pay_cnt,"
+        " product_create_uv, product_refund_amount, stats_source, notes, synced_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(shop_id, platform, stat_date, row["product_id"], row["sku_id"], row["product_name"],
+          row["sku_code"], row["paid_qty"], row["paid_amount"], row["order_count"],
+          row.get("image_url") or "",
+          int(row.get("product_click_uv") or 0), int(row.get("product_click_cnt") or 0),
+          int(row.get("product_pay_uv") or 0), int(row.get("product_pay_cnt") or 0),
+          int(row.get("product_create_uv") or 0),
+          float(row.get("product_refund_amount") or 0.0),
+          row.get("stats_source") or None, note, now())
+         for row in rows])
+    return len(rows)
+
+
+def _supports_stats(platform):
+    """该平台是否提供了「自带数据概览」能力（微信=罗盘；小红书没有）。"""
+    try:
+        return "stats" in (platform_registry.adapter(platform).get("supports") or ())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _fetch_shop_overview(platform, shop_id, stat_date):
     """拉平台自带的当日数据概览（目前只有微信罗盘有）。没有该能力的平台返回空 dict。"""
-    try:
-        if "stats" not in (platform_registry.adapter(platform).get("supports") or ()):
-            return {}
-    except Exception:  # noqa: BLE001
+    if not _supports_stats(platform):
         return {}
     base = _order_api_base(platform)
     data = _http_get_json(f"{base}/shop-overview?date={stat_date}", shop_id=shop_id)
     return (data or {}).get("result") or {}
+
+
+def _fetch_product_overview(platform, shop_id, stat_date, product_id):
+    """拉平台自带的**商品级**单日数据（目前只有微信罗盘有）。
+
+    罗盘商品接口限制（实测）：
+      · 一次只支持**一个商品 + 一个单日**，没有批量/区间 —— 覆盖 N 商品 × D 天就是 N×D 次请求；
+      · 官方标注「仅历史数据，暂无当日数据」，所以调用方要保证 stat_date 不是今天；
+      · 商品不在该店/已删除时返回不了数据 → 调用方按"没取到"处理，不要写 0 冒充。
+    返回归一化后的 dict（金额单位：分），拿不到返回空 dict。
+    """
+    if not product_id or not _supports_stats(platform):
+        return {}
+    base = _order_api_base(platform)
+    query = urllib.parse.urlencode({"date": stat_date, "product_id": product_id})
+    try:
+        data = _http_get_json(f"{base}/product-overview?{query}", shop_id=shop_id, timeout=20)
+    except Exception:  # noqa: BLE001
+        # 商品已删除/不在本店时平台报错 → 上层把这一行当"没有数据"（显示「—」），
+        # 不要因为个别商品查不到就把整天的同步打断。
+        return {}
+    return (data or {}).get("result") or {}
+
+
+def _attach_product_stats(platform, shop_id, stat_date, rows):
+    """给当天的商品行补「平台商品级」流量/成交数据（原地写入 row）。返回一条 notes 说明。
+
+    只对支持 stats 的平台做（目前 = 微信）；小红书整列保持 0 且不写 stats_source，
+    前端据此显示「—」（用 0 冒充"没有访客"是错的：分不清"真的 0 人"和"平台没这数据"）。
+
+    ⚠️ 只把数据挂在该商品的**一行**上（该商品多 SKU 时选第一行）：
+    罗盘口径是「商品级」，同商品的每个 SKU 行都挂一遍，下游 merge 求和会成倍虚高。
+    单商品失败不影响整体：跳过该商品即可，最后在 notes 里点名取到几个。
+    """
+    if not rows or not _supports_stats(platform):
+        return ""
+    if stat_date >= datetime.now().strftime("%Y-%m-%d"):
+        # 罗盘商品级接口官方标注"仅历史数据，暂无当日数据"，今天拉只会拿到空/未就绪值
+        return "商品级流量/成交为平台历史口径：当天数据要 T+1 才有（今天的行暂不显示）"
+
+    # 每个商品只挑一行承载数据（也是唯一的请求对象，避免同商品重复调用）
+    carriers = {}
+    for row in rows:
+        pid = row.get("product_id")
+        if pid and pid not in carriers:
+            carriers[pid] = row
+    targets = list(carriers.items())[:PRODUCT_STATS_MAX_ITEMS]
+
+    def fetch(item):
+        pid, row = item
+        try:
+            return row, _fetch_product_overview(platform, shop_id, stat_date, pid)
+        except Exception:  # noqa: BLE001
+            return row, {}
+
+    got = 0
+    with ThreadPoolExecutor(max_workers=PRODUCT_STATS_WORKERS) as pool:
+        for row, stats in pool.map(fetch, targets):
+            if not stats:
+                continue
+            row["product_click_uv"] = int(stats.get("product_click_uv") or 0)
+            row["product_click_cnt"] = int(stats.get("product_click_cnt") or 0)
+            # 罗盘「下单人数/下单件数」：点击到支付之间那一环（下单未支付也计）
+            row["product_create_uv"] = int(stats.get("create_uv") or 0)
+            row["product_pay_uv"] = int(stats.get("pay_uv") or 0)
+            row["product_pay_cnt"] = int(stats.get("pay_cnt") or 0)
+            # 罗盘退款金额单位是分，库里商品表统一「元」
+            row["product_refund_amount"] = round(int(stats.get("pay_refund_gmv") or 0) / 100, 2)
+            row["stats_source"] = "平台商品数据"
+            got += 1
+    if not got:
+        return "平台商品级数据未取到（商品可能已下架或不在本店），流量列按「无数据」显示"
+    note = f"商品级流量/成交取自平台商品数据（{got}/{len(targets)} 个商品有数据）"
+    if len(carriers) > PRODUCT_STATS_MAX_ITEMS:
+        note += f"；超过单日上限 {PRODUCT_STATS_MAX_ITEMS}，其余商品未取"
+    return note
+
 
 
 def sync_order_metrics(shop_id, platform, stat_date):
@@ -3442,6 +3923,7 @@ def sync_order_metrics(shop_id, platform, stat_date):
         orders, aftersales, metrics = [], [], {
             "paid_orders": 0, "paid_amount": 0.0, "dealt_orders": 0, "refund_amount": 0.0,
             "actual_income": 0.0, "actual_orders": 0, "refund_rate": 0.0,
+            "paid_buyers": 0, "created_buyers": 0,
         }
         error = str(exc)[:300]
     stats, stats_source = {}, None
@@ -3457,8 +3939,8 @@ def sync_order_metrics(shop_id, platform, stat_date):
         "INSERT INTO order_daily_metrics (shop_id, platform, stat_date, paid_orders, paid_amount,"
         " dealt_orders, refund_amount, actual_income, actual_orders, refund_rate, order_count,"
         " aftersale_count, status_map_ready, notes, pay_gmv, pay_uv, pay_order_cnt, pay_refund_gmv,"
-        " product_click_uv, stats_source, synced_at, sync_error)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " product_click_uv, stats_source, paid_buyers, created_buyers, synced_at, sync_error)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(shop_id, platform, stat_date) DO UPDATE SET"
         " paid_orders=excluded.paid_orders, paid_amount=excluded.paid_amount,"
         " dealt_orders=excluded.dealt_orders, refund_amount=excluded.refund_amount,"
@@ -3468,6 +3950,7 @@ def sync_order_metrics(shop_id, platform, stat_date):
         " notes=excluded.notes, pay_gmv=excluded.pay_gmv, pay_uv=excluded.pay_uv,"
         " pay_order_cnt=excluded.pay_order_cnt, pay_refund_gmv=excluded.pay_refund_gmv,"
         " product_click_uv=excluded.product_click_uv, stats_source=excluded.stats_source,"
+        " paid_buyers=excluded.paid_buyers, created_buyers=excluded.created_buyers,"
         " synced_at=excluded.synced_at, sync_error=excluded.sync_error",
         (shop_id, platform, stat_date, metrics["paid_orders"], metrics["paid_amount"],
          metrics["dealt_orders"], metrics["refund_amount"], metrics["actual_income"],
@@ -3475,13 +3958,25 @@ def sync_order_metrics(shop_id, platform, stat_date):
          1 if status_map_ready else 0, "；".join(note_parts),
          int(stats.get("pay_gmv") or 0), int(stats.get("pay_uv") or 0),
          int(stats.get("pay_order_cnt") or 0), int(stats.get("pay_refund_gmv") or 0),
-         int(stats.get("product_click_uv") or 0), stats_source, now(), error),
+         int(stats.get("product_click_uv") or 0), stats_source,
+         int(metrics.get("paid_buyers") or 0), int(metrics.get("created_buyers") or 0),
+         now(), error),
     )
+    # 商品级聚合（数据面板下方「商品明细」的数据源）
+    product_rows, unnamed_products = _aggregate_product_day(platform, orders, start, end)
+    # 再补平台自带的商品级流量/成交（微信罗盘；小红书没有 → 整列留 0 让前端显示「—」）
+    product_stats_note = _attach_product_stats(platform, shop_id, stat_date, product_rows)
+    _write_product_metrics(conn, shop_id, platform, stat_date, product_rows)
+    # 订单级明细一并落库：这些订单上面刚从平台拉过，直接存下来，
+    # 导出交易清单/页面商品明细就能本地读，不必再逐笔去打平台接口（导出从半分钟变秒出）
+    item_count = _write_order_items(conn, shop_id, platform, stat_date, orders)
     conn.commit()
     conn.close()
     return {"shop_id": shop_id, "platform": platform, "stat_date": stat_date, **metrics,
-            "order_count": len(orders), "aftersale_count": len(aftersales),
+            "order_count": len(orders), "item_rows": item_count, "aftersale_count": len(aftersales),
+            "product_count": len(product_rows), "unnamed_product_orders": unnamed_products,
             "status_map_ready": status_map_ready, "notes": "；".join(note_parts),
+            "product_stats_note": product_stats_note,
             "stats_source": stats_source, "stats": stats, "sync_error": error}
 
 
@@ -3497,8 +3992,12 @@ def order_platforms(shop_id):
     return result
 
 
-def sync_orders_range(shop_id, start_date, end_date, platforms=None):
-    """同步日期区间内的订单指标（逐天 × 逐平台）。返回逐项结果。"""
+def sync_orders_range(shop_id, start_date, end_date, platforms=None, on_progress=None):
+    """同步日期区间内的订单指标（逐天 × 逐平台）。返回逐项结果。
+
+    on_progress(shop_id, platform, stat_date, result)：每同步完一天回调一次，
+    给后台同步任务汇报进度用（不传就按老样子只返回最终结果）。
+    """
     targets = platforms or order_platforms(shop_id)
     days = []
     cursor = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -3509,7 +4008,13 @@ def sync_orders_range(shop_id, start_date, end_date, platforms=None):
     results = []
     for platform in targets:
         for day in days:
-            results.append(sync_order_metrics(shop_id, platform, day))
+            item = sync_order_metrics(shop_id, platform, day)
+            results.append(item)
+            if on_progress:
+                try:
+                    on_progress(shop_id, platform, day, item)
+                except Exception:  # noqa: BLE001  汇报进度出问题不该影响同步本身
+                    pass
     return results
 
 
@@ -3561,11 +4066,103 @@ class OrderSyncBody(BaseModel):
     shop: str = ""      # 数据面板的店铺范围：'all' = 逐店同步（耗时成倍增加）；空 = 跟随当前店铺
 
 
+# —— 手动同步任务注册表 ————————————————————————————————————————————
+# 同步要逐天 × 逐平台打平台接口（还要逐单拉订单详情），一次几十秒到几分钟。
+# 原来 POST /orders/sync 同步阻塞：请求一直挂着，前端按钮只能干转圈，看不到卡在哪天，
+# 于是改成「POST 只登记任务 → 后台线程干活 → GET /orders/sync/status 读进度」。
+# 任务只存内存（不建表）：服务重启后旧任务自然消失，前端拿到 idle 按"已结束"处理。
+_ORDER_SYNC_JOBS_LOCK = threading.Lock()
+_ORDER_SYNC_JOBS: dict = {}          # job_id → 任务字典（字段见 _sync_job_create）
+_ORDER_SYNC_JOBS_SEQ: list = []      # 按创建顺序（取"最近一个任务"、淘汰老任务用）
+_ORDER_SYNC_JOBS_KEEP = 20           # 只留最近这么多个，避免内存无限涨
+_ORDER_SYNC_JOB_ERRORS = 5           # 任务详情里最多带几条失败明细（够前端提示就行）
+
+
+def _sync_job_days(start, end):
+    """区间天数（含首尾）。"""
+    cursor = datetime.strptime(start, "%Y-%m-%d").date()
+    last = datetime.strptime(end, "%Y-%m-%d").date()
+    return max((last - cursor).days + 1, 0)
+
+
+def _sync_job_public(job):
+    """任务字典 → 接口返回（只给前端要看的字段）。"""
+    return {
+        "job_id": job["job_id"], "status": job["status"],
+        "range": job["range"], "shops": job["shops"], "platforms": job["platforms"],
+        "total": job["total"], "done": job["done"], "current": job["current"],
+        "percent": round(job["done"] * 100 / job["total"], 1) if job["total"] else 0.0,
+        "synced": job["synced"], "failed": job["failed"],
+        "errors": job["errors"], "message": job["message"],
+        "started_at": job["started_at"], "finished_at": job["finished_at"],
+    }
+
+
+def _sync_job_create(start, end, shop_ids, targets_by_shop):
+    """登记一个手动同步任务（status=running）。"""
+    job_id = uuid.uuid4().hex[:12]
+    platforms = sorted({p for targets in targets_by_shop.values() for p in targets})
+    job = {
+        "job_id": job_id, "status": "running",
+        "range": {"start": start, "end": end},
+        "shops": list(shop_ids), "platforms": platforms,
+        # 总步数 = Σ(每家平台数 × 天数)，前端拿它算百分比
+        "total": sum(len(targets) * _sync_job_days(start, end) for targets in targets_by_shop.values()),
+        "done": 0, "current": "", "synced": 0, "failed": 0, "errors": [],
+        "message": "", "started_at": now(), "finished_at": "",
+    }
+    with _ORDER_SYNC_JOBS_LOCK:
+        _ORDER_SYNC_JOBS[job_id] = job
+        _ORDER_SYNC_JOBS_SEQ.append(job_id)
+        for stale in _ORDER_SYNC_JOBS_SEQ[:-_ORDER_SYNC_JOBS_KEEP]:
+            _ORDER_SYNC_JOBS.pop(stale, None)
+        del _ORDER_SYNC_JOBS_SEQ[:-_ORDER_SYNC_JOBS_KEEP]
+    return job
+
+
+def _run_sync_job(job_id, targets_by_shop, start, end):
+    """后台线程：逐店逐平台逐天同步，进度写回任务字典。"""
+    with _ORDER_SYNC_JOBS_LOCK:
+        job = _ORDER_SYNC_JOBS.get(job_id)
+    if not job:
+        return
+
+    def on_progress(shop_id, platform, stat_date, item):
+        with _ORDER_SYNC_JOBS_LOCK:
+            job["done"] += 1
+            job["current"] = f"{_shop_display_name(shop_id)}/{platform}/{stat_date}"
+            if item.get("sync_error"):
+                job["failed"] += 1
+                if len(job["errors"]) < _ORDER_SYNC_JOB_ERRORS:
+                    job["errors"].append({
+                        "shop_id": shop_id, "platform": platform, "stat_date": stat_date,
+                        "error": str(item.get("sync_error") or "")[:300],
+                    })
+            else:
+                job["synced"] += 1
+
+    try:
+        for shop_id, targets in targets_by_shop.items():
+            sync_orders_range(shop_id, start, end, platforms=targets, on_progress=on_progress)
+        job["status"] = "done"
+    except Exception as exc:  # noqa: BLE001  任务级失败也要落状态，别让前端一直转
+        job["status"] = "failed"
+        job["message"] = str(exc)[:300]
+    finally:
+        job["finished_at"] = now()
+        job["current"] = ""
+        print(f"[orders] 手动同步任务 {job_id} 结束：{job['status']}"
+              f"（{job['range']['start']}~{job['range']['end']}，成功 {job['synced']} 天、"
+              f"失败 {job['failed']} 天）", flush=True)
+
+
 @app.post("/orders/sync")
 def orders_sync(body: OrderSyncBody, request: Request):
-    """手动同步订单指标（默认「昨天 + 今天」；可指定日期区间、平台与店铺范围）。
+    """手动同步订单指标：登记后台任务后**立即返回**，进度用 GET /orders/sync/status 读。
 
+    默认「昨天 + 今天」；可指定日期区间、平台与店铺范围。
     shop='all' 时逐店同步（面板看全部店铺汇总时用），耗时会随店铺数成倍增加。
+    同一时刻只跑一个手动同步：重复点击直接复用正在跑的那个任务。
     """
     shop_ids = _metric_shop_scope(request, body.shop)
     today = datetime.now().strftime("%Y-%m-%d")
@@ -3578,22 +4175,40 @@ def orders_sync(body: OrderSyncBody, request: Request):
             raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{value}")
     if start > end:
         raise HTTPException(400, "开始日期不能晚于结束日期")
-    results: list[dict] = []
-    synced_platforms: list[str] = []
+    # 逐店解析目标平台：某家店没配订单平台就跳过，不因为其中一家没配就整批失败
+    targets_by_shop = {}
     for shop_id in shop_ids:
         targets = [p for p in (body.platforms or order_platforms(shop_id))
                    if platform_registry.is_platform(p)]
-        if not targets:
-            continue      # 这家店没配订单平台：跳过，不因为其中一家没配就整批失败
-        synced_platforms.extend(targets)
-        results.extend(sync_orders_range(shop_id, start, end, platforms=targets))
-    if not results:
+        if targets:
+            targets_by_shop[shop_id] = targets
+    if not targets_by_shop:
         raise HTTPException(400, "所选店铺都没有可同步订单的平台（未配置凭证，或平台未声明 orders 能力）")
-    failed = [row for row in results if row.get("sync_error")]
-    return {"ok": True, "result": {"range": {"start": start, "end": end},
-                                   "shops": shop_ids, "platforms": sorted(set(synced_platforms)),
-                                   "synced": len(results) - len(failed), "failed": len(failed),
-                                   "items": results}}
+    with _ORDER_SYNC_JOBS_LOCK:
+        running = [job for job in _ORDER_SYNC_JOBS.values() if job["status"] == "running"]
+    if running:
+        return {"ok": True, "result": {**_sync_job_public(running[0]), "reused": True}}
+    job = _sync_job_create(start, end, shop_ids, targets_by_shop)
+    threading.Thread(target=_run_sync_job, args=(job["job_id"], targets_by_shop, start, end),
+                     name=f"order-sync-{job['job_id']}", daemon=True).start()
+    print(f"[orders] 手动同步任务 {job['job_id']} 启动：{start}~{end}，"
+          f"店铺 {len(targets_by_shop)} 家，总步数 {job['total']}", flush=True)
+    return {"ok": True, "result": _sync_job_public(job)}
+
+
+@app.get("/orders/sync/status")
+def orders_sync_status(job_id: str = Query("", description="不传 = 最近一个任务")):
+    """读手动同步任务的进度（前端轮询用）。
+
+    不传 job_id 时返回最近一个任务：同步过程中刷新页面，前端接着轮询就能继续看进度。
+    任务只在内存里，服务重启后这里没有任务 → status=idle，前端按"已结束"处理。
+    """
+    with _ORDER_SYNC_JOBS_LOCK:
+        job = (_ORDER_SYNC_JOBS.get(job_id) if job_id
+               else (_ORDER_SYNC_JOBS.get(_ORDER_SYNC_JOBS_SEQ[-1]) if _ORDER_SYNC_JOBS_SEQ else None))
+        public = _sync_job_public(job) if job else None
+    return {"ok": True, "result": public or {"status": "idle", "done": 0, "total": 0,
+                                             "synced": 0, "failed": 0, "errors": []}}
 
 
 def _metric_view(row):
@@ -3617,8 +4232,14 @@ def _metric_view(row):
         paid_amount = round(row.get("paid_amount") or 0, 2)
         refund_amount = round(row.get("refund_amount") or 0, 2)
         paid_orders = int(row.get("paid_orders") or 0)
-        buyers = clicks = None            # 平台没给这两个口径 → 显示"—"，不编数
+        # 平台没给官方人数时用**自算的去重买家数**（小红书就是这样：订单里有买家标识，
+        # 但平台没开放人数接口）。真的取不到（0）才显示"—"，别把"没数据"显示成 0。
+        buyers = int(row.get("paid_buyers") or 0) or None
+        clicks = None                     # 访客/点击任何平台都没有可自算的来源 → 不编数
         source = "订单接口聚合"
+    # 下单人数：店铺级官方口径两个平台都拿不到（微信罗盘店铺概览只回 7 个字段，
+    # 下单人数 create_uv 只在**商品级**接口里），所以统一用自算的去重下单人数。
+    created_buyers = int(row.get("created_buyers") or 0) or None
     return {
         "stat_date": row.get("stat_date"), "platform": row.get("platform"),
         # 带上店铺：数据面板可以看"全部店铺汇总"，汇总时必须能分清每行/每天属于哪家店
@@ -3629,6 +4250,11 @@ def _metric_view(row):
         "paid_orders": paid_orders,
         "buyers": buyers, "clicks": clicks,
         "conversion_rate": round(buyers / clicks, 4) if (buyers is not None and clicks) else None,
+        "created_buyers": created_buyers,
+        # 下单后转化率 = 支付买家数 ÷ 下单人数。这是**下单之后**的转化，
+        # 和上面那个"支付 ÷ 点击"（下单之前）不是一回事，面板上分开列、分开写口径。
+        "created_conversion_rate": (round(buyers / created_buyers, 4)
+                                    if (buyers is not None and created_buyers) else None),
         "avg_order_value": round(paid_amount / paid_orders, 2) if paid_orders else 0.0,
         "dealt_orders": int(row.get("dealt_orders") or 0),
         "actual_income": round(row.get("actual_income") or 0, 2),
@@ -3661,6 +4287,8 @@ def _aggregate_views(views, granularity):
             "paid_amount": 0.0, "net_paid_amount": 0.0, "refund_amount": 0.0, "actual_income": 0.0,
             "paid_orders": 0, "dealt_orders": 0, "actual_orders": 0,
             "buyers": 0, "clicks": 0, "buyers_available": False, "stats_ready": False,
+            # 下单人数（自算去重）单独一套可用性标记：微信拿不到 → 只有小红书那几行有数
+            "created_buyers": 0, "created_buyers_available": False,
             # 归并后也要把口径说明/同步失败带上来，否则页面无法提示"这天的金额没取全"
             "notes": [], "sync_error": "", "sources": [], "shops": [],
         })
@@ -3684,6 +4312,9 @@ def _aggregate_views(views, granularity):
             item["buyers"] += view["buyers"]
             item["clicks"] += view["clicks"] or 0
             item["buyers_available"] = True
+        if view.get("created_buyers") is not None:
+            item["created_buyers"] += view["created_buyers"]
+            item["created_buyers_available"] = True
         item["stats_ready"] = item["stats_ready"] or view["stats_ready"]
     for item in buckets.values():
         item["avg_order_value"] = round(item["paid_amount"] / item["paid_orders"], 2) if item["paid_orders"] else 0.0
@@ -3693,6 +4324,13 @@ def _aggregate_views(views, granularity):
         if not item["buyers_available"]:
             item["buyers"] = None
             item["clicks"] = None
+        # 下单后转化率（支付买家 ÷ 下单人数）；拿不到下单人数就显示 —，别拿 0 充数
+        item["created_conversion_rate"] = (
+            round(item["buyers"] / item["created_buyers"], 4)
+            if (item["buyers_available"] and item["created_buyers_available"]
+                and item["created_buyers"]) else None)
+        if not item["created_buyers_available"]:
+            item["created_buyers"] = None
         # 同一周期里多天/多平台会带来大量重复说明，**按分句去重**再拼。
         # 只按整串去重不够：各天的说明常常是"前半句相同、后半句不同"，
         # 结果拼出来是一长串 run-on 文字（页面上实测就是这样）。
@@ -3717,6 +4355,8 @@ def _sum_views(views):
         total[money] = 0.0
     buyers = clicks = 0
     buyers_available = False
+    created_buyers = 0
+    created_buyers_available = False
     for view in views:
         for counter in ("paid_orders", "dealt_orders", "actual_orders"):
             total[counter] += view[counter]
@@ -3726,11 +4366,18 @@ def _sum_views(views):
             buyers += view["buyers"]
             clicks += view["clicks"] or 0
             buyers_available = True
+        if view.get("created_buyers") is not None:
+            created_buyers += view["created_buyers"]
+            created_buyers_available = True
     total["buyers"] = buyers if buyers_available else None
     total["clicks"] = clicks if buyers_available else None
+    total["created_buyers"] = created_buyers if created_buyers_available else None
     total["avg_order_value"] = round(total["paid_amount"] / total["paid_orders"], 2) if total["paid_orders"] else 0.0
     total["refund_rate"] = round(total["refund_amount"] / total["paid_amount"], 4) if total["paid_amount"] else 0.0
     total["conversion_rate"] = round(buyers / clicks, 4) if (buyers_available and clicks) else None
+    total["created_conversion_rate"] = (
+        round(buyers / created_buyers, 4)
+        if (buyers_available and created_buyers_available and created_buyers) else None)
     return total
 
 
@@ -3814,135 +4461,415 @@ def _load_order_views(shop_ids, start, end, platform=""):
         conn.close()
 
 
-# Excel 导出的列（顺序=列序）：键、表头、格式（money/int/rate 决定数字格式）
-METRIC_EXPORT_COLUMNS = [
-    ("bucket", "周期", None), ("days", "天数", None), ("shop_text", "店铺", None),
-    ("platform_text", "平台", None),
-    ("paid_amount", "支付金额(元)", "money"), ("net_paid_amount", "净支付金额(元)", "money"),
-    ("refund_amount", "退款金额(元)", "money"), ("paid_orders", "支付子订单数", "int"),
-    ("buyers", "支付买家数", "int"), ("clicks", "商品点击人数", "int"),
-    ("conversion_rate", "支付转化率", "rate"), ("avg_order_value", "客单价(元)", "money"),
-    ("dealt_orders", "成交笔数", "int"), ("actual_income", "实际收入(元)", "money"),
+# —— 导出 Excel 的列定义 ————————————————————————————————————————
+# 结构对齐运营给的《日销售数据统计表》：① 汇总页（周期×平台）② 每个平台一张日销售
+# ③ 每个平台一张交易清单（逐笔订单）④ 口径说明。
+# 三个键：列键、列名、数字格式（money/int/rate/date/datetime；None=原样写出）。
+PLATFORM_DISPLAY = {"wechat": "微信小店", "xhs": "小红书"}
+EXPORT_SUMMARY_COLUMNS = [
+    ("seq", "序号", None), ("period", "日期", None), ("week_seg", "周段", None),
+    ("platform", "平台", None), ("visits", "访客流量", "int"),
+    ("create_amount", "下单金额", "money"), ("paid_amount", "支付金额", "money"),
+    ("created_buyers", "下单买家数", "int"), ("paid_orders", "支付笔数", "int"),
+    ("sum_paid", "汇总支付金额", "money"), ("sum_dealt", "汇总成交笔数", "int"),
+    ("refund_amount", "退款金额", "money"),
+    ("actual_income", "实际收入（已发货+待发货）", "money"),
     ("actual_orders", "实际笔数", "int"), ("refund_rate", "退款率", "rate"),
-    ("source", "数据来源", None), ("notes", "说明", None),
+    ("analysis", "经营情况分析", None),
 ]
-# 列宽（按列键给，避免增删列时位置错位）
-METRIC_EXPORT_WIDTHS = {
-    "bucket": 18, "days": 8, "shop_text": 24, "platform_text": 12,
-    "paid_amount": 14, "net_paid_amount": 16, "refund_amount": 14,
-    "paid_orders": 14, "buyers": 12, "clicks": 14, "conversion_rate": 12,
-    "avg_order_value": 12, "dealt_orders": 12, "actual_income": 14,
-    "actual_orders": 12, "refund_rate": 12, "source": 18, "notes": 60, "stat_date": 12,
+EXPORT_DAILY_COLUMNS = [
+    ("stat_date", "日期", "date"), ("visits", "访客数", "int"),
+    ("paid_amount", "支付金额", "money"), ("paid_orders", "支付订单数", "int"),
+    ("refund_amount", "退款金额", "money"), ("conversion_rate", "支付转化率", "rate"),
+    ("ad_cost", "推广费", "money"), ("actual_income", "实际收入", "money"),
+    ("actual_orders", "实际笔数", "int"),
+]
+EXPORT_ORDER_COLUMNS = [
+    ("seq", "序号", None), ("month_seg", "月段", None), ("week_seg", "周段", None),
+    ("create_time", "订单创建时间", "datetime"), ("order_no", "订单编号", None),
+    ("paid_amount", "订单金额", "money"), ("item_qty", "购买数量", "int"),
+    ("item_title", "商品", None), ("status_text", "订单状态", None),
+    ("refund_reason", "退款原因", None), ("remark", "备注", None),
+]
+EXPORT_COLUMN_WIDTHS = {
+    "seq": 6, "period": 18, "week_seg": 10, "platform": 12, "visits": 12,
+    "create_amount": 12, "paid_amount": 14, "created_buyers": 12, "paid_orders": 12,
+    "sum_paid": 14, "sum_dealt": 14, "refund_amount": 12, "actual_income": 20,
+    "actual_orders": 12, "refund_rate": 10, "analysis": 28, "stat_date": 12,
+    "conversion_rate": 12, "ad_cost": 10, "month_seg": 8, "create_time": 20,
+    "order_no": 24, "item_qty": 10, "item_title": 40, "status_text": 12,
+    "refund_reason": 14, "remark": 16,
 }
-# 导出的「口径说明」页：把每个指标的来源写清楚，避免 Excel 传出去后没人知道数字怎么来的
+# 没有数据源的列：**保留列名但不填**（运营表里留着位置，接上数据源后自己就能补）
+EXPORT_EMPTY_COLUMNS = {
+    "create_amount": "下单金额：平台未开放「下单金额」口径，且订单接口只给已付金额 → 留空",
+    "ad_cost": "推广费：未接广告投放数据（各平台广告后台单独导出）→ 留空",
+    "analysis": "经营情况分析：留给人填写，中台不自动生成结论",
+    "refund_reason": "退款原因：售后接口未返回原因字段 → 留空",
+    "remark": "备注：留给人填写",
+}
+# 导出的「口径说明」页：每条只对应**导出里真实存在的列**，避免留下一堆没有的列名
+#让人以为漏了数（之前混进了净支付金额/客单价/下单后转化率等已经不导出的指标）。
 EXPORT_METRIC_NOTES = [
-    ("支付金额", "微信：平台数据概览（罗盘「成交金额」）；小红书：订单接口聚合（订单详情 totalPayAmount，单位分→元）"),
-    ("净支付金额", "支付金额 − 退款金额（平台没有这个字段，按公式推算）"),
-    ("退款金额", "微信：罗盘「成交退款金额」；小红书：售后单金额（refundAmountYuan / expectedRefundAmountYuan，单位元）"),
-    ("支付子订单数", "微信：罗盘「成交订单数」；小红书：当日已支付订单数（按 paidTime 判断，平台未公开状态码表）"),
-    ("支付买家数", "仅微信罗盘「成交人数」；小红书接口不提供该维度 → 空"),
-    ("商品点击人数", "仅微信罗盘「商品点击人数」；小红书接口不提供 → 空"),
-    ("支付转化率", "支付买家数 ÷ 商品点击人数（近似口径，平台无官方转化率字段）"),
-    ("客单价", "支付金额 ÷ 支付子订单数（按公式推算）"),
-    ("成交笔数", "确认收货/交易完成的笔数（微信按订单状态，小红书按 finishTime）"),
-    ("实际收入 / 实际笔数", "存量口径：当前在途（已发货+待发货）的金额与笔数，不受所选区间限制"),
-    ("退款率", "退款金额 ÷ 支付金额（金额口径）"),
-    ("本周期 / 上一周期", "上一周期 = 紧接在本周期之前、天数相同的一段；涨跌幅 =（本周期 − 上一周期）÷ 上一周期"),
-    ("数据来源列", "「平台数据概览」= 平台官方口径（微信罗盘）；「订单接口聚合」= 我们用订单/售后接口自算"),
-]
+    ("支付金额", "微信：平台数据概览（罗盘「成交金额」）；小红书：订单接口聚合（订单详情 totalPayAmount，分→元）"),
+    ("退款金额", "微信：罗盘「成交退款金额」；小红书：售后单金额（平台未公开状态码，按金额计入）"),
+    ("支付笔数", "微信：罗盘「成交订单数」；小红书：当日**已支付**（有支付时间）的订单数"),
+    ("访客流量 / 访客数", "仅微信罗盘「商品点击人数」；小红书没有流量接口 → 显示「—」，不编数"),
+    ("下单买家数", "按订单创建时间去重买家自算（两个平台都没有店铺级的官方人数接口）"),
+    ("支付买家数", "微信取罗盘「成交人数」；小红书用订单里的买家标识当天去重自算（不落库）"),
+    ("支付转化率", "支付买家数 ÷ 商品点击人数（**下单之前**的转化，近似口径；小红书分母缺失 → 「—」）"),
+    ("汇总支付金额 / 汇总成交笔数", "同一周期内**各平台合计**（表内已纵向合并）"),
+    ("实际收入 / 实际笔数", "存量口径：该日创建、**截至最近一次同步**仍未完成的订单金额与笔数。"
+                    "所以只在当天/次日同步时抓得到；事后补同步会显示 0（订单早已完成或退款）"),
+    ("退款率", "退款金额 ÷ 支付金额"),
+    ("订单状态", "微信按官方状态码（待发货/部分发货/待收货/已完成/售后取消）；"
+             "小红书未公开码表，按支付/完成/取消时间判定"),
+    ("商品 / 购买数量", "取该订单的第一个商品名称与总件数（订单里含多个商品时只显示第一个）"),
+    ("月段 / 周段", "月段=订单创建月份；周段按几号分旬（1~7 第一周、8~14 第二周…），仅便于分档查看"),
+    ("人数去重口径", "按天去重后相加：同一个人在不同天各算一次；买家标识只用于当天内存去重，不落库、不导出"),
+] + [(key, note) for key, note in EXPORT_EMPTY_COLUMNS.items()]
+
+
+def _excel_date(value):
+    """'YYYY-MM-DD' → datetime.date（Excel 里显示成真日期，不是文本）。"""
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return value
+
+
+def _excel_datetime(value):
+    """'YYYY-MM-DD HH:MM:SS' → datetime.datetime。"""
+    try:
+        return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return value
+
+
+def _month_week_seg(day):
+    """参考表里的「周段」：按**几号**分旬（1~7 第一周、8~14 第二周…），跨月各自从第一周起算。"""
+    if not day:
+        return None
+    return "第%s周" % "一二三四五六"[(min(day.day, 28) - 1) // 7]
+
+
+def _export_summary_rows(views, granularity):
+    """汇总页的数据行：周期 × 平台一行，外加「汇总支付金额/汇总成交笔数」的合并区间。
+
+    返回 (rows, [(列键, 起始行号, 结束行号)])；行号是**从表头下一行**开始数的相对行号，
+    调用方写完表头后按 first_data_row 平移。
+    """
+    groups = {}
+    for view in views:
+        key = (_bucket_key(view["stat_date"], granularity)[0], view["platform"])
+        groups.setdefault(key, []).append(view)
+    buckets = sorted({bucket for bucket, _p in groups})
+    rows, merge_ranges = [], []
+    for index, bucket in enumerate(buckets, start=1):
+        period_views = [v for (b, p), items in groups.items() if b == bucket for v in items]
+        first_label = min(v["stat_date"] for v in period_views)
+        last_label = max(v["stat_date"] for v in period_views)
+        if granularity == "week":
+            period = "%d月%d日 - %d月%d日" % (
+                int(first_label[5:7]), int(first_label[8:10]),
+                int(last_label[5:7]), int(last_label[8:10]))
+            # 周段 = 这是导出区间里的第几个周（第一周、第二周…）
+            week_seg = "第%s周" % ("一二三四五六"[index - 1] if index <= 6 else str(index))
+        elif granularity == "month":
+            period = first_label[:7]
+            week_seg = None          # 按月导出时谈"第几周"没有意义，留空
+        else:
+            period = "%d月%d日" % (int(first_label[5:7]), int(first_label[8:10]))
+            week_seg = None          # 同理：按天导出不能把每一天叫成"第一周"（实测踩过）
+        bucket_platforms = sorted(p for (b, p) in groups if b == bucket)
+        bucket_start = len(rows) + 1
+        for offset, platform in enumerate(bucket_platforms):
+            items = groups[(bucket, platform)]
+            totals = _sum_views(items)
+            visits_available = any(item["clicks"] is not None for item in items)
+            rows.append({
+                # 同一周期的这几列**只在第一行写值**，其余留空由调用方合并单元格
+                # （参考表就是这么做的：序号/日期/周段/汇总各占一个合并格，不逐行重复）
+                "seq": (len(rows) + 1 if offset == 0 else None),
+                "period": (period if offset == 0 else None),
+                "week_seg": (week_seg if offset == 0 else None),
+                "platform": PLATFORM_DISPLAY.get(platform, platform),
+                "visits": (sum(item["clicks"] or 0 for item in items) if visits_available else None),
+                "create_amount": None,             # 未开放该口径 → 留空
+                "paid_amount": totals["paid_amount"],
+                "created_buyers": totals["created_buyers"],
+                "paid_orders": totals["paid_orders"],
+                "refund_amount": totals["refund_amount"],
+                "actual_income": totals["actual_income"],
+                "actual_orders": totals["actual_orders"],
+                "refund_rate": totals["refund_rate"],
+                "analysis": None,                  # 留给人填
+            })
+        # 跨平台合计：只在每组第一行写值，其余留空，由调用方合并单元格
+        bucket_totals = _sum_views(period_views)
+        rows[bucket_start - 1]["sum_paid"] = bucket_totals["paid_amount"]
+        rows[bucket_start - 1]["sum_dealt"] = bucket_totals["dealt_orders"]
+        if len(bucket_platforms) > 1:
+            for key in ("seq", "period", "week_seg", "sum_paid", "sum_dealt", "analysis"):
+                merge_ranges.append((key, bucket_start, len(rows)))
+    return rows, merge_ranges
+
+
+# 交易清单最多拉多少个「店 × 天」：小红书补一次详情约 15 秒，不设上限的话
+# 一个月的区间能把导出拖到好几分钟（前端也会先超时）。
+EXPORT_ORDER_DETAIL_MAX = 20
+# 缺本地明细时，实时去拉的**并发数与总超时**：导出不能被平台接口拖死，
+# 超时就跳过这些天并在表里写明（宁可清单少几天，也不要让人等十分钟）。
+EXPORT_DETAIL_FETCH_WORKERS = 6
+EXPORT_DETAIL_FETCH_TIMEOUT = 45
+
+
+def _export_order_rows(shop_ids, platform, start, end):
+    """导出用：某平台逐笔订单行。
+
+    优先读本地已落库的明细（同步时写的，毫秒级）；只有"从没同步过的店×天"才实时
+    去平台拉 —— 这类天**并发**拉、且有总超时，绝不让导出无限期等下去。
+    """
+    notes = []
+    # 只保留**配了该平台**的店铺：否则会给没配凭证的店打接口，平台直接 400，
+    # 导出里就会多出一堆"订单拉取失败"的噪音（实测踩过）。
+    targets = [sid for sid in shop_ids if platform in (order_platforms(sid) or [])]
+    if not targets:
+        return [], []
+    placeholders = ",".join("?" for _ in targets)
+    conn = db()
+    try:
+        days = [row[0] for row in conn.execute(
+            f"SELECT DISTINCT stat_date FROM order_daily_metrics WHERE shop_id IN ({placeholders})"
+            " AND platform=? AND stat_date>=? AND stat_date<=? AND paid_orders>0"
+            " ORDER BY stat_date", [*targets, platform, start, end])]
+    finally:
+        conn.close()
+    pairs = [(shop_id, day) for shop_id in targets for day in days]
+    if len(pairs) > EXPORT_ORDER_DETAIL_MAX:
+        pairs = pairs[:EXPORT_ORDER_DETAIL_MAX]
+        notes.append(f"交易清单：只取了前 {EXPORT_ORDER_DETAIL_MAX} 个「店×天」（上限），"
+                     f"其余请缩小日期区间或分批导出")
+    rows, notes_all, live_pairs = [], [], []
+    for shop_id, day in pairs:
+        local = _local_order_rows(shop_id, platform, day)
+        if local:
+            rows.extend(local)
+        else:
+            live_pairs.append((shop_id, day))
+    if live_pairs:
+        notes.append(f"交易清单：有 {len(live_pairs)} 个「店×天」没有本地明细（这些天没点过同步），"
+                     f"正在实时向平台拉取；先点一次「同步数据」再导出即可秒出")
+        deadline = time.time() + EXPORT_DETAIL_FETCH_TIMEOUT
+        with ThreadPoolExecutor(max_workers=EXPORT_DETAIL_FETCH_WORKERS) as pool:
+            futures = {pool.submit(_order_detail_rows, platform, shop_id, day): (shop_id, day)
+                       for shop_id, day in live_pairs}
+            for future in as_completed(futures, timeout=max(1, deadline - time.time())):
+                shop_id, day = futures[future]
+                try:
+                    day_rows, day_notes = future.result()
+                except Exception as exc:  # noqa: BLE001  单天失败不影响整张表
+                    day_rows, day_notes = [], [f"{_shop_display_name(shop_id)}/{day} 明细拉取失败（{str(exc)[:60]}）"]
+                rows.extend(day_rows)
+                notes_all.extend(day_notes)
+        # 超时未返回的 future 直接忽略（线程池退出时会等它们，但导出不再空等）
+        if any(not future.done() for future in futures):
+            notes.append(f"交易清单：{sum(1 for f in futures if not f.done())} 个「店×天」拉取超时"
+                         f"（超过 {EXPORT_DETAIL_FETCH_TIMEOUT} 秒）已跳过，完整数据请点「同步数据」后重导")
+    notes.extend(notes_all)
+    return sorted(rows, key=lambda row: row.get("pay_ts") or row.get("create_ts") or 0,
+                  reverse=True), notes
 
 
 @app.get("/orders/metrics/export")
 def orders_metrics_export(request: Request, start: str = Query(""), end: str = Query(""),
                           platform: str = Query(""), granularity: str = Query("day"),
                           shop: str = Query("", description="all=全部店铺汇总")):
-    """把当前面板数据导成 Excel：按周期 / 按天 / 口径说明 三张表。
+    """导出 Excel：结构对齐运营给的《日销售数据统计表》。
 
-    口径与 GET /orders/metrics 完全一致（共用 _resolve_metric_range 与 _load_order_views），
-    店铺范围也一样（shop=all 导出全部店铺汇总，明细里带店铺列）。
+    四类页：① 汇总页（周期 × 平台，含"汇总支付金额"这类跨平台合计列）
+    ② 每个平台一张日销售（逐日一行）③ 每个平台一张交易清单（逐笔订单，**不带商品图**）
+    ④ 口径说明。
+
+    汇总/日销售的口径与 GET /orders/metrics 完全一致（共用 _resolve_metric_range 与
+    _load_order_views），店铺范围也一样（shop=all 导出全部店铺汇总）。
+    ⚠️ 交易清单要**逐笔**订单，只能实时打平台接口（带 5 分钟缓存），所以：
+       只拉「当天有订单」的那些天，且总店·天数有上限，截断了会在表里写明。
     """
     shop_ids = _metric_shop_scope(request, shop)
     start, end, prev_start, prev_end, span, granularity = _resolve_metric_range(start, end, granularity)
     views = _load_order_views(shop_ids, start, end, platform)
-    prev_views = _load_order_views(shop_ids, prev_start, prev_end, platform)
-    period_rows = _aggregate_views(views, granularity)
     totals = _sum_views(views)
-    prev_totals = _sum_views(prev_views)
     scope_name = "全部店铺汇总" if len(shop_ids) > 1 else _shop_display_name(shop_ids[0])
-    granularity_text = {"day": "按天", "week": "按周", "month": "按月"}.get(granularity, granularity)
+    export_notes = []
     try:
         import openpyxl
-        from openpyxl.styles import Font
+        from openpyxl.styles import Alignment, Font
         from openpyxl.utils import get_column_letter
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"服务器缺少 openpyxl，无法导出 Excel：{exc}")
 
-    def write_header(sheet, columns):
+    def write_header(sheet, columns, freeze=True):
         sheet.append([column[1] for column in columns])
         header_row = sheet.max_row      # 标题行可能占了几行，表头不一定在第 1 行
         for cell in sheet[header_row]:
             cell.font = Font(bold=True)
-        sheet.freeze_panes = f"A{header_row + 1}"
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if freeze:
+            sheet.freeze_panes = f"A{header_row + 1}"
 
-    def write_row(sheet, columns, row):
+    def write_row(sheet, columns, row, bold=False):
         # 先 append 完整一行再设格式：append([]) 这种"空行"不会推进行号，
         # 用它算 max_row 会把数据写回表头那一行（实测踩到：整张表只剩最后一行）。
-        sheet.append(["—" if row.get(key) is None else row.get(key)
-                      for key, _title, _kind in columns])
+        # 没有数据源的列**留空**（不写"—"）：表里干净，原因在「口径说明」页写明。
+        sheet.append([row.get(key) for key, _title, _kind in columns])
         row_index = sheet.max_row
-        for offset, (_key, _title, kind) in enumerate(columns, start=1):
+        for offset, (key, _title, kind) in enumerate(columns, start=1):
             cell = sheet.cell(row=row_index, column=offset)
+            if bold:
+                cell.font = Font(bold=True)
             if kind == "money":
                 cell.number_format = "#,##0.00"
             elif kind == "int":
                 cell.number_format = "#,##0"
             elif kind == "rate" and isinstance(cell.value, (int, float)):
                 cell.number_format = "0.00%"
-
-    # 「按天」页：日期当第一列；"天数"和"周期"对逐日行没有意义，去掉
-    daily_columns = [("stat_date", "日期", None)] + [column for column in METRIC_EXPORT_COLUMNS
-                                                     if column[0] not in ("days", "bucket")]
+            elif kind == "date" and isinstance(cell.value, str):
+                cell.value = _excel_date(cell.value)
+                cell.number_format = "yyyy-mm-dd"
+            elif kind == "datetime" and isinstance(cell.value, str):
+                cell.value = _excel_datetime(cell.value)
+                cell.number_format = "yyyy-mm-dd hh:mm:ss"
 
     def apply_widths(target_sheet, columns):
         for index, (key, _title, _kind) in enumerate(columns, start=1):
-            target_sheet.column_dimensions[get_column_letter(index)].width = METRIC_EXPORT_WIDTHS.get(key, 14)
+            target_sheet.column_dimensions[get_column_letter(index)].width = EXPORT_COLUMN_WIDTHS.get(key, 14)
 
+    platforms = sorted({view["platform"] for view in views})
     workbook = openpyxl.Workbook()
+
+    # ——————————————— ① 汇总页（周期 × 平台）—————————————————————
+    # 参考表是「每周」口径；面板也能按天/按月导出，所以表名跟着粒度走，别叫"每周"却按天。
     sheet = workbook.active
-    sheet.title = "按周期"
-    sheet.append([f"数据概览 · {scope_name} · {granularity_text}"])
-    sheet["A1"].font = Font(bold=True, size=13)
-    sheet.append([f"本周期 {start} ~ {end}（{span} 天）；上一周期 {prev_start} ~ {prev_end}（同样 {span} 天）"])
-    sheet.append([f"导出时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}；金额单位：元；"
-                  "口径与页面一致，指标来源见「口径说明」页"])
-    sheet.append([""])
-    write_header(sheet, METRIC_EXPORT_COLUMNS)
-    for row in period_rows:
-        # 周期列的取值：按周/月时用「2026 年第 41 周」这种人话，而不是 2026-W41
-        write_row(sheet, METRIC_EXPORT_COLUMNS, {**row, "bucket": row.get("label") or row.get("bucket")})
-    summary = dict(totals)
-    summary.update({"bucket": "合计", "days": span, "shop_text": scope_name,
-                    "platform_text": "、".join(sorted({view["platform"] for view in views})) or "—",
-                    "source": "、".join(sorted({view["source"] for view in views})) or "—",
-                    "notes": f"上一周期支付金额 {prev_totals['paid_amount']} 元 / "
-                             f"{prev_totals['paid_orders']} 笔；退款 {prev_totals['refund_amount']} 元"})
-    write_row(sheet, METRIC_EXPORT_COLUMNS, summary)
-    for cell in sheet[sheet.max_row]:
-        cell.font = Font(bold=True)
-    apply_widths(sheet, METRIC_EXPORT_COLUMNS)
+    sheet.title = "每周数据统计" if granularity == "week" else "数据汇总"
+    # 不加"销售数据统计 · 什么范围 · 导出时间"这类大标题：参考表没有，
+    # 区间/范围/导出时间在**文件名**里已经有了（数据概览_范围_起_止_粒度.xlsx）。
+    # 列定义跟着粒度走：按周导出保留「周段」；按天/按月导出时这一列没意义（实测踩过：
+    # 按天导出曾把每一天标成"第一周、第二周…"），整列去掉，"日期"列也只写一个日期。
+    if granularity == "week":
+        summary_columns = list(EXPORT_SUMMARY_COLUMNS)
+    else:
+        summary_columns = [column for column in EXPORT_SUMMARY_COLUMNS if column[0] != "week_seg"]
+    period_title = {"month": "月份", "day": "日期"}.get(granularity, "日期")
+    summary_columns = [(key, (period_title if key == "period" else title), kind)
+                       for key, title, kind in summary_columns]
+    write_header(sheet, summary_columns)
+    summary_rows, merge_ranges = _export_summary_rows(views, granularity)
+    first_data_row = sheet.max_row + 1
+    for row in summary_rows:
+        write_row(sheet, summary_columns, row)
+    # 同一周期的「序号 / 日期 / 周段 / 汇总金额 / 汇总笔数 / 经营情况分析」按参考表那样
+    # 纵向合并成一个格（不逐行重复写"第一周"），并垂直居中
+    column_index = {column[0]: index for index, column in enumerate(summary_columns, start=1)}
+    merge_keys = ("seq", "period", "week_seg", "sum_paid", "sum_dealt", "analysis")
+    merge_ranges = [item for item in merge_ranges if item[0] in column_index]
+    for col_key, first_row, last_row in merge_ranges:
+        if last_row <= first_row:
+            continue
+        # ⚠️ merge_ranges 里的行号是**相对第一行数据**的（1 起算），必须加上表头占的行数，
+        #    否则会合并到表头上（实测踩过：表头"序号"和第一行数据一起被吞掉）。
+        start_row = first_data_row + first_row - 1
+        end_row = first_data_row + last_row - 1
+        letter = get_column_letter(column_index[col_key])
+        sheet.merge_cells(f"{letter}{start_row}:{letter}{end_row}")
+        sheet[f"{letter}{start_row}"].alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True)
+    # 合计行
+    total_row = {"seq": None, "period": "合计", "week_seg": "", "platform": "、".join(
+        PLATFORM_DISPLAY.get(p, p) for p in platforms) or "—",
+        "visits": (sum(row["visits"] for row in summary_rows
+                       if isinstance(row["visits"], (int, float))) or None),
+        "create_amount": None, "paid_amount": totals["paid_amount"],
+        "created_buyers": (sum(row["created_buyers"] for row in summary_rows
+                               if isinstance(row["created_buyers"], (int, float))) or None),
+        "paid_orders": totals["paid_orders"], "sum_paid": totals["paid_amount"],
+        "sum_dealt": totals["dealt_orders"], "refund_amount": totals["refund_amount"],
+        "actual_income": totals["actual_income"], "actual_orders": totals["actual_orders"],
+        "refund_rate": totals["refund_rate"], "analysis": None}
+    write_row(sheet, summary_columns, total_row, bold=True)
+    apply_widths(sheet, summary_columns)
 
-    daily_sheet = workbook.create_sheet("按天")
-    write_header(daily_sheet, daily_columns)
-    for view in sorted(views, key=lambda item: (item["stat_date"], item["shop_id"], item["platform"])):
-        write_row(daily_sheet, daily_columns, {**view, "platform_text": view["platform"],
-                                               "shop_text": view["shop_name"] or view["shop_id"]})
-    apply_widths(daily_sheet, daily_columns)
+    # ——————————————— ② 每个平台一张日销售 ————————————————————————
+    for target in platforms:
+        daily_sheet = workbook.create_sheet(f"{PLATFORM_DISPLAY.get(target, target)}-日销售")
+        write_header(daily_sheet, EXPORT_DAILY_COLUMNS)
+        by_day = {view["stat_date"]: view for view in views if view["platform"] == target}
+        day = datetime.strptime(start, "%Y-%m-%d").date()
+        last = datetime.strptime(end, "%Y-%m-%d").date()
+        while day <= last:
+            view = by_day.get(day.strftime("%Y-%m-%d"))
+            write_row(daily_sheet, EXPORT_DAILY_COLUMNS, {
+                "stat_date": day.strftime("%Y-%m-%d"),
+                "visits": (view or {}).get("clicks"),
+                "paid_amount": (view or {}).get("paid_amount", 0.0),
+                "paid_orders": (view or {}).get("paid_orders", 0),
+                "refund_amount": (view or {}).get("refund_amount", 0.0),
+                "conversion_rate": (view or {}).get("conversion_rate"),
+                "ad_cost": None,                       # 未接广告数据 → 留空
+                "actual_income": (view or {}).get("actual_income", 0.0),
+                "actual_orders": (view or {}).get("actual_orders", 0),
+            })
+            day += timedelta(days=1)
+        apply_widths(daily_sheet, EXPORT_DAILY_COLUMNS)
 
+    # ——————————————— ③ 每个平台一张交易清单（逐笔，不带图）——————————————
+    detail_platforms = [platform] if platform else (
+        [p for p in platforms] if platforms else
+        sorted({p for sid in shop_ids for p in order_platforms(sid)}))
+    for target in detail_platforms:
+        order_sheet = workbook.create_sheet(f"{PLATFORM_DISPLAY.get(target, target)}交易清单")
+        # 只留参考表那样的一行说明（原来还带了范围/区间，交给文件名和口径说明页）
+        order_sheet.append(["仅统计真实成交且已支付的订单"])
+        order_sheet["A1"].font = Font(bold=True, size=12)
+        order_sheet.merge_cells(start_row=1, start_column=1, end_row=1,
+                                end_column=len(EXPORT_ORDER_COLUMNS))
+        orders, order_notes = _export_order_rows(shop_ids, target, start, end)
+        export_notes.extend(order_notes)
+        write_header(order_sheet, EXPORT_ORDER_COLUMNS)
+        amount_sum = 0.0
+        qty_sum = 0
+        for index, row in enumerate(orders, start=1):
+            created = datetime.fromtimestamp(row["create_ts"]) if row.get("create_ts") else None
+            amount_sum += row.get("paid_amount") or 0.0
+            qty_sum += int(row.get("item_qty") or 0)
+            write_row(order_sheet, EXPORT_ORDER_COLUMNS, {
+                "seq": index,
+                "month_seg": f"{created.month}月" if created else None,
+                "week_seg": _month_week_seg(created),
+                "create_time": created.strftime("%Y-%m-%d %H:%M:%S") if created else None,
+                "order_no": row.get("order_no") or None,
+                "paid_amount": row.get("paid_amount") or 0.0,
+                "item_qty": row.get("item_qty") or 0,
+                "item_title": row.get("item_title") or None,
+                "status_text": row.get("status_text") or None,
+                "refund_reason": None,              # 售后接口没返回原因 → 留空
+                "remark": row.get("shop_name") or None,
+            })
+        write_row(order_sheet, EXPORT_ORDER_COLUMNS, {
+            "seq": None, "month_seg": None, "week_seg": None, "create_time": None,
+            "order_no": f"合计（{len(orders)} 笔）", "paid_amount": round(amount_sum, 2),
+            "item_qty": qty_sum, "item_title": None, "status_text": None,
+            "refund_reason": None, "remark": None}, bold=True)
+        apply_widths(order_sheet, EXPORT_ORDER_COLUMNS)
+
+    # ——————————————— ④ 口径说明 ————————————————————————
     note_sheet = workbook.create_sheet("口径说明")
-    write_header(note_sheet, [("metric", "指标", None), ("note", "口径 / 来源", None)])
+    write_header(note_sheet, [("metric", "指标 / 列", None), ("note", "口径 / 来源", None)], freeze=False)
     for metric, note in EXPORT_METRIC_NOTES:
         note_sheet.append([metric, note])
-    note_sheet.column_dimensions["A"].width = 22
+    for extra in export_notes:
+        note_sheet.append(["导出说明", extra])
+    note_sheet.column_dimensions["A"].width = 24
     note_sheet.column_dimensions["B"].width = 90
 
     output = io.BytesIO()
@@ -3952,6 +4879,328 @@ def orders_metrics_export(request: Request, start: str = Query(""), end: str = Q
     return StreamingResponse(iter([output.read()]),
                              media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                              headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+def _xhs_item_image_map(shop_id):
+    """小红书商品 ID -> 主图。
+
+    为什么不能单查：小红书**没有**“按 itemId 查单品”的接口——
+    实测 `GET /items/{item_id}` 会**忽略路径参数**、直接把商品列表 `itemDetailV3s` 整包返回，
+    所以单查必然拿不到图（就是之前小红书全“无图”的真因）。
+    可商品列表的每条里就带 `id`(=itemId) 与 `images`(主图数组)，
+    拉一次全量建映射即可（店内商品实测 155 条），结果按天落本地缓存。
+    """
+    cache_path = os.path.join(BASE_DIR, "_cache_xhs_item_images.json")
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        with open(cache_path, encoding="utf-8") as fp:
+            stored = json.load(fp) or {}
+    except Exception:  # noqa: BLE001
+        stored = {}
+    cached = stored.get(shop_id) or {}
+    if cached.get("day") == today and isinstance(cached.get("map"), dict) and cached["map"]:
+        return cached["map"], ""
+    base = _order_api_base("xhs")
+    page_size = 100
+    mapping = {}
+    for page in range(1, XHS_ITEM_IMAGE_MAX_PAGES + 1):
+        result = (_http_get_json(f"{base}/items?page_no={page}&page_size={page_size}",
+                                 shop_id=shop_id).get("result") or {})
+        batch = result.get("itemDetailV3s") or result.get("itemList") or []
+        for item in batch:
+            item_id = str(item.get("id") or item.get("itemId") or "")
+            images = item.get("images") or item.get("imageList") or []
+            first = images[0] if images else ""
+            url = str(first.get("url") if isinstance(first, dict) else first or "")
+            if item_id and url:
+                mapping[item_id] = url
+        total = int(result.get("total") or 0)
+        if len(batch) < page_size or (total and page * page_size >= total):
+            break
+    stored[shop_id] = {"day": today, "count": len(mapping), "map": mapping}
+    try:
+        with open(cache_path, "w", encoding="utf-8") as fp:
+            json.dump(stored, fp, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+    return mapping, "" if mapping else "小红书商品列表为空，未能建立商品图映射"
+
+
+@app.get("/orders/product-image")
+def order_product_image(request: Request, platform: str = Query(..., description="wechat / xhs"),
+                        product_id: str = Query(..., description="平台商品ID"),
+                        shop: str = Query("", description="店铺范围"),
+                        shop_id: str = Query("", description="该商品所属店铺（最准）")):
+    """商品头图（数据面板「商品明细」的商品图列用）。
+
+    为什么走平台接口而不是我们自己的图片缓存：商品维度的 product_id 是**平台商品ID**，
+    与货盘里的本地图片路径没有可靠对应关系（同一商品可能由不同批次/不同店发布）。
+    结果落本地缓存文件 —— 同一个商品只调一次平台接口，之后直接读缓存。
+    取不到时返回空 url（前端显示占位图），不报错、不阻塞面板。
+    """
+    if not platform_registry.is_platform(platform):
+        raise HTTPException(400, f"未知平台：{platform}")
+    product_id = str(product_id or "").strip()
+    if not product_id:
+        return {"ok": True, "result": {"url": "", "source": "无商品ID"}}
+    # 取图必须用**这件商品所属的店**的凭证：同一平台下多家店的商品互不通用，
+    # 用别的店去查会拿不到图（实测：取图回退到“商品列表里没有这个商品ID”，
+    # 因为被选中的是另一家店，它的商品列表里没有这个 item）。
+    # 优先用前端传来的行内 shop_id，其次才是“范围内第一个搭了该平台的店”。
+    explicit_shop = str(shop_id or "").strip()
+    candidates = [sid for sid in _metric_shop_scope(request, shop)
+                  if shop_registry.has_platform(sid, platform)]
+    shop_id = (explicit_shop or (candidates[0] if candidates else "")
+               or _current_shop_id(request))
+    cache_path = os.path.join(BASE_DIR, "_cache_product_images.json")
+    cache = {}
+    try:
+        with open(cache_path, encoding="utf-8") as fp:
+            cache = json.load(fp)
+    except Exception:  # noqa: BLE001
+        cache = {}
+    key = f"{shop_id}|{platform}|{product_id}"
+    cached = cache.get(key)
+    if isinstance(cached, dict) and cached.get("url"):
+        return {"ok": True, "result": cached | {"cached": True}}
+    # 只有真正取到图才算缓存命中。失败条目仅短期抑制重复请求，过期即重试：
+    # 老逻辑把失败也当永久缓存，于是"取图那一刻上游服务恰好在重启"会被永久固化，面板一直无图。
+    if isinstance(cached, dict) and (
+            time.time() - float(cached.get("ts") or 0) < IMAGE_FAILURE_RETRY_SECONDS):
+        return {"ok": True, "result": cached | {"cached": True}}
+    url, note = "", ""
+    try:
+        base = _order_api_base(platform)
+        if platform == "wechat":
+            detail = (_http_get_json(f"{base}/products/{urllib.parse.quote(product_id)}",
+                                     shop_id=shop_id).get("result") or {})
+            images = (detail.get("product") or {}).get("head_imgs") or []
+            url = str(images[0]) if images else ""
+            note = "" if url else "平台未返回头图"
+        else:
+            mapping, map_note = _xhs_item_image_map(shop_id)
+            url = mapping.get(product_id, "")
+            note = map_note or ("" if url else
+                    "商品列表里没有这个商品ID（订单里的 ID 可能是 SKU id）")
+    except Exception as exc:  # noqa: BLE001
+        note = f"取图失败：{str(exc)[:80]}"
+    entry = {"url": url, "note": note, "product_id": product_id, "platform": platform}
+    # 失败的条目带 ts 落盘（短期不再打接口），成功的条目不带 —— 命中判定见函数开头
+    cache[key] = entry if url else {**entry, "ts": time.time()}
+    try:
+        with open(cache_path, "w", encoding="utf-8") as fp:
+            json.dump(cache, fp, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "result": entry}
+
+
+def _product_stats_note(rows):
+    """给「商品明细」面板写一句口径说明（按平台分别说清访客/转化从哪来）。"""
+    platforms = []
+    for row in rows:
+        if row["platform"] not in platforms:
+            platforms.append(row["platform"])
+    parts = []
+    for platform in platforms:
+        try:
+            label = platform_registry.platform_label(platform)
+        except Exception:  # noqa: BLE001
+            label = platform
+        if _supports_stats(platform):
+            parts.append(f"{label}：访客/下单/转化取自平台商品数据（官方标注仅历史数据，当天要 T+1）")
+        else:
+            parts.append(f"{label}：平台未开放商品级流量接口，访客/下单/转化显示「—」")
+    if not parts:
+        parts.append("访客/下单/转化来自平台商品数据接口（仅历史数据，当天要 T+1）")
+    return "；".join(parts)
+
+
+@app.get("/orders/details")
+def orders_details(request: Request, date: str = Query("", description="YYYY-MM-DD；不传=今天"),
+                   platform: str = Query("", description="wechat / xhs；不传=该店已配的全部平台"),
+                   shop: str = Query("", description="店铺范围：all=全部店铺汇总；不传=跟随当前店铺"),
+                   keyword: str = Query("", description="按订单编号/订单号模糊搜"),
+                   limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0)):
+    """【商品明细】某一天的**订单级**明细（面板下方那张表的数据源）。
+
+    和 /orders/metrics 的区别：那个是按天聚合的日报，这个是逐笔订单。
+    ⚠️ 中台不落订单明细表，所以这里是**实时**调平台订单接口（带 5 分钟内存缓存，
+       翻页/搜单号不会重复打平台）。小红书还要逐单补详情，会明显慢一点。
+    店铺范围沿用面板自己的 shop 参数（'all'=全部店铺汇总），与顶栏当前店铺解耦。
+    """
+    stat_date = date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        datetime.strptime(stat_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{stat_date}")
+    if platform and not platform_registry.is_platform(platform):
+        raise HTTPException(400, f"未知平台：{platform}")
+    shop_ids = _metric_shop_scope(request, shop)
+    rows, notes = [], []
+    for shop_id in shop_ids:
+        targets = [platform] if platform else order_platforms(shop_id)
+        for target in targets:
+            day_rows, day_notes = _order_detail_rows(target, shop_id, stat_date)
+            rows.extend(day_rows)
+            notes.extend(day_notes)
+    keyword = str(keyword or "").strip()
+    if keyword:
+        low = keyword.lower()
+        rows = [row for row in rows
+                if low in row["order_no"].lower() or low in row["order_id"].lower()
+                or low in str(row["shop_name"]).lower()]
+    total = len(rows)
+    page = rows[offset:offset + limit]
+    return {"ok": True, "result": {
+        "date": stat_date, "rows": page, "total": total,
+        "limit": limit, "offset": offset,
+        "platforms": sorted({row["platform"] for row in rows}),
+        "shops": sorted({row["shop_id"] for row in rows}),
+        "notes": list(dict.fromkeys(notes)),
+        "amount_unit": ORDER_AMOUNT_UNIT,
+        # 实付金额合计只统计当前这一页之外的**全量**，前端用来对一下总额对不对
+        "sum_paid_amount": round(sum(row["paid_amount"] for row in rows), 2),
+    }}
+
+
+@app.get("/orders/product-metrics")
+def orders_product_metrics(request: Request, start: str = Query(""), end: str = Query(""),
+                           platform: str = Query(""), shop: str = Query(""),
+                           keyword: str = Query(""), sort: str = Query("amount"),
+                           limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    """商品明细：把总览的支付金额/件数按**单个商品**拆开（数据面板下方那块）。
+
+    · 金额按订单实付等比分摊到商品（见 _aggregate_product_day），因此各商品之和 = 总览支付金额；
+    · 访客/转化/商品级退款取自平台商品数据接口（微信罗盘；小红书无此能力 → 整列显示「—」）；
+      「商品访客数」用的是罗盘的**商品点击人数**（平台没有"详情页访客数"这个口径）；
+    · 支持按名称/编码搜索、按金额/件数/订单数排序，返回占比与上一周期对比。
+    """
+    shop_ids = _metric_shop_scope(request, shop)
+    start, end, prev_start, prev_end, span, _gran = _resolve_metric_range(start, end, "day")
+
+    def load(begin, finish):
+        placeholders = ",".join("?" for _ in shop_ids)
+        sql = (f"SELECT MIN(shop_id) AS shop_id, platform, product_id, sku_id,"
+               f" product_name, sku_code,"
+               f" MAX(image_url) AS image_url,"
+               f" SUM(paid_qty) AS paid_qty, ROUND(SUM(paid_amount), 2) AS paid_amount,"
+               f" SUM(order_count) AS order_count,"
+               f" SUM(product_click_uv) AS product_click_uv,"
+               f" SUM(product_click_cnt) AS product_click_cnt,"
+               f" SUM(product_create_uv) AS product_create_uv,"
+               f" SUM(product_pay_uv) AS product_pay_uv,"
+               f" SUM(product_pay_cnt) AS product_pay_cnt,"
+               f" ROUND(SUM(product_refund_amount), 2) AS product_refund_amount,"
+               f" MAX(stats_source) AS stats_source FROM product_daily_metrics"
+               f" WHERE shop_id IN ({placeholders}) AND stat_date>=? AND stat_date<=?")
+        args = [*shop_ids, begin, finish]
+        if platform:
+            sql += " AND platform=?"
+            args.append(platform)
+        # 必须 GROUP BY：否则 SQLite 会把区间内所有商品聚成一行（实测踩过：2 个商品显示成 1 个）
+        sql += " GROUP BY platform, product_id, sku_id, product_name, sku_code"
+        conn = db()
+        try:
+            return [dict(row) for row in conn.execute(sql, args)]
+        finally:
+            conn.close()
+
+    def merge(raw_rows):
+        """按「平台 + 商品」合并（同商品多 SKU 合并成一行；无 product_id 时退回用 sku_id 当键）。"""
+        merged = {}
+        for row in raw_rows:
+            key = (row["platform"], row.get("product_id") or row.get("sku_id") or "")
+            item = merged.get(key)
+            if item is None:
+                item = merged[key] = {
+                    "shop_id": row.get("shop_id") or "",
+                    "platform": row["platform"], "product_id": row.get("product_id") or "",
+                    "product_name": "", "sku_code": "", "sku_count": 0,
+                    "image_url": row.get("image_url") or "",
+                    "paid_qty": 0, "paid_amount": 0.0, "order_count": 0,
+                    "product_click_uv": 0, "product_click_cnt": 0,
+                    "product_create_uv": 0,
+                    "product_pay_uv": 0, "product_pay_cnt": 0,
+                    "product_refund_amount": 0.0, "stats_source": "",
+                }
+            item["paid_qty"] += int(row.get("paid_qty") or 0)
+            item["paid_amount"] = round(item["paid_amount"] + float(row.get("paid_amount") or 0), 2)
+            item["order_count"] += int(row.get("order_count") or 0)
+            # 平台商品级数据：写库时只挂在同商品的一行上（见 _attach_product_stats），
+            # 这里求和不会重复计数；SKU 行若也带了值，求和的语义就是"该商品各口径之和"。
+            for stat_key in ("product_click_uv", "product_click_cnt", "product_create_uv",
+                             "product_pay_uv", "product_pay_cnt"):
+                item[stat_key] += int(row.get(stat_key) or 0)
+            item["product_refund_amount"] = round(
+                item["product_refund_amount"] + float(row.get("product_refund_amount") or 0), 2)
+            if not item["stats_source"] and row.get("stats_source"):
+                item["stats_source"] = row["stats_source"]
+            if row.get("product_id"):
+                item["sku_count"] += 1
+            if not item["product_name"] and row.get("product_name"):
+                item["product_name"] = row["product_name"]
+            if not item["sku_code"] and row.get("sku_code"):
+                item["sku_code"] = row["sku_code"]
+        return list(merged.values())
+
+    rows = merge(load(start, end))
+    prev_index = {(row["platform"], row["product_id"] or ""): row for row in merge(load(prev_start, prev_end))}
+    total_amount = round(sum(row["paid_amount"] for row in rows), 2)
+    total_qty = sum(row["paid_qty"] for row in rows)
+
+    keyword = str(keyword or "").strip().lower()
+    if keyword:
+        rows = [row for row in rows
+                if keyword in str(row["product_name"]).lower()
+                or keyword in str(row["sku_code"]).lower()
+                or keyword in str(row["product_id"]).lower()]
+    sorters = {
+        "amount": lambda row: -row["paid_amount"],
+        "qty": lambda row: -row["paid_qty"],
+        "orders": lambda row: -row["order_count"],
+        "name": lambda row: str(row["product_name"]),
+    }
+    rows.sort(key=sorters.get(sort) or sorters["amount"])
+
+    for row in rows:
+        prev = prev_index.get((row["platform"], row["product_id"] or "")) or {}
+        row["share"] = round(row["paid_amount"] / total_amount, 4) if total_amount else 0.0
+        row["prev_amount"] = prev.get("paid_amount", 0.0)
+        row["prev_qty"] = prev.get("paid_qty", 0)
+        prev_amount = row["prev_amount"]
+        row["delta"] = (round((row["paid_amount"] - prev_amount) / prev_amount, 4)
+                        if prev_amount else None)
+        # 平台商品级流量/转化：只有统计接口有返回(stats_source 非空)时才算数，
+        # 否则是 0 —— 前端必须靠 stats_source 判断"显示 —"还是"显示 0"。
+        row["visits_available"] = bool(row.get("stats_source"))
+        row["visits"] = int(row.get("product_click_uv") or 0)
+        row["clicks"] = row["visits"]
+        # 下单人数：点击之后、支付之前那一环（罗盘「下单人数」，下单未支付也算）
+        row["create_uv"] = int(row.get("product_create_uv") or 0)
+        row["buyers"] = int(row.get("product_pay_uv") or 0)
+        row["conversion_rate"] = (round(row["buyers"] / row["visits"], 4)
+                                  if row["visits"] else None)
+        row["refund_amount_stats"] = round(float(row.get("product_refund_amount") or 0), 2)
+    stats_note = _product_stats_note(rows)
+    return {"ok": True, "result": {
+        "range": {"start": start, "end": end, "days": span},
+        "prev_range": {"start": prev_start, "end": prev_end, "days": span},
+        "rows": rows[offset:offset + limit],
+        "product_total": len(rows),
+        "stats_note": stats_note,
+        "totals": {"paid_amount": total_amount, "paid_qty": total_qty,
+                   "order_count": sum(row["order_count"] for row in rows),
+                   "products": len(rows),
+                   "visits": sum(row["visits"] for row in rows if row["visits_available"]),
+                   "create_uv": sum(row["create_uv"] for row in rows if row["visits_available"]),
+                   "buyers": sum(row["buyers"] for row in rows if row["visits_available"])},
+        "prev_totals": {"paid_amount": round(sum(row["prev_amount"] for row in rows), 2),
+                        "paid_qty": sum(row["prev_qty"] for row in rows)},
+        "sort": sort if sort in sorters else "amount",
+        "amount_unit": ORDER_AMOUNT_UNIT,
+        "refund_split": False,
+    }}
 
 
 @app.get("/orders/metrics")

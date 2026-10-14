@@ -85,8 +85,8 @@ export const bulkApi = {
     return http.get('/orders/metrics', { params })
   },
 
-  // 数据面板导出 Excel（按周期 / 按天 / 口径说明 三张表）。
-  // responseType=blob：后端直接回文件流，前端存盘时用自己算的中文文件名。
+  // 数据面板导出 Excel（汇总 + 各平台日销售 + 各平台交易清单 + 口径说明）。
+  // 交易清单要逐笔实时拉平台接口（小红书补详情很慢），所以给足超时。
   orderMetricsExport: (start = '', end = '', platform = '', granularity = 'day', shop = '') => {
     const params = {}
     if (start) params.start = start
@@ -94,9 +94,48 @@ export const bulkApi = {
     if (platform) params.platform = platform
     if (granularity) params.granularity = granularity
     if (shop) params.shop = shop
-    return http.get('/orders/metrics/export', { params, responseType: 'blob' })
+    return http.get('/orders/metrics/export', { params, responseType: 'blob', timeout: 300000 })
   },
+  // 商品明细：把总览的支付金额/件数按**单个商品**拆开（数据面板下方那块）。
+  // 金额按订单实付等比分摊到商品，所以各商品之和 = 总览支付金额；退款暂未拆到商品。
+  orderProductMetrics: (start = '', end = '', platform = '', shop = '',
+                        keyword = '', sort = 'amount', limit = 50, offset = 0) => {
+    const params = {}
+    if (start) params.start = start
+    if (end) params.end = end
+    if (platform) params.platform = platform
+    if (shop) params.shop = shop
+    if (keyword) params.keyword = keyword
+    if (sort) params.sort = sort
+    params.limit = limit
+    params.offset = offset
+    return http.get('/orders/product-metrics', { params })
+  },
+
+  // 商品头图（商品维度列表用；后端带本地缓存，同一商品只调一次平台接口）
+  orderProductImage: (platform, productId, shop = '', shopId = '') => http.get('/orders/product-image', {
+    params: { platform, product_id: productId, shop, shop_id: shopId }
+  }),
+
   // 手动同步订单指标：拉平台订单/售后算指标后落库（默认「昨天+今天」，T+1 补拉）。
   // 要逐单查平台详情，慢一些，所以给足超时。
   orderSync: (body = {}) => http.post('/orders/sync', body, { timeout: 900000 }),
+
+  // 同步进度：POST /orders/sync 现在只登记任务、立即返回，进度轮询这个接口。
+  // 不传 jobId 时后端返回"最近一个任务"（同步中刷新页面也能接着看进度）。
+  orderSyncStatus: (jobId = '') => http.get('/orders/sync/status', { params: jobId ? { job_id: jobId } : {} }),
+
+  // 商品明细：某一天的**订单级**明细（单日，不是区间）。
+  // 后端不落订单明细表，这里是实时调平台接口（带 5 分钟缓存），小红书还要逐单补详情，
+  // 所以给足超时；否则用默认 60s 会在订单多的时候先超时。
+  orderDetails: (date = '', platform = '', shop = '', keyword = '', limit = 20, offset = 0) => {
+    const params = {}
+    if (date) params.date = date
+    if (platform) params.platform = platform
+    if (shop) params.shop = shop
+    if (keyword) params.keyword = keyword
+    params.limit = limit
+    params.offset = offset
+    return http.get('/orders/details', { params, timeout: 180000 })
+  },
 }

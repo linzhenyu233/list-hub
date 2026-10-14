@@ -575,6 +575,21 @@ def shop_overview(request: Request,
     return ok_or_400(lambda: store.get_shop_overview(str(date).replace("-", "")))
 
 
+@app.get("/product-overview")
+def product_overview(request: Request,
+                     date: str = Query(..., description="日期 YYYY-MM-DD(罗盘只支持按日查询)"),
+                     product_id: str = Query(..., description="商品ID")):
+    """单个商品某一天的数据(微信罗盘商品级)。
+
+    一次只支持一个商品 + 单日,调用方(中台)需自行按商品 × 天循环。
+    ⚠️ 官方标注「仅历史数据,暂无当日数据」——当天查不到是正常的,要 T+1。
+    金额单位:分;字段里没有"详情页访客数",商品点击人数(product_click_uv)是最接近的真值。
+    """
+    store = store_for(shop_of(request))
+    return ok_or_400(lambda: store.get_product_overview(
+        str(date).replace("-", ""), product_id))
+
+
 # ==================================================================
 # 启动入口:python fastapi_server.py 直接跑
 # ==================================================================

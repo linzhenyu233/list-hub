@@ -193,6 +193,8 @@ html, body { font-family: var(--gem-font); color: var(--gem-text); background: v
   border-radius: 11px; background: linear-gradient(135deg, #6366F1, #4F46E5);
   color: #fff; font-size: 20px; box-shadow: 0 4px 12px rgba(79, 70, 229, .40);
 }
+/* SHINING HOUSE 图形标记：源图 45x28，按比例缩到 26px 宽居中（不写死高度，避免换图后变形） */
+.brand-mark img { width: 26px; height: auto; display: block; }
 .brand strong { display: block; font-size: 15px; letter-spacing: .3px; color: #fff; }
 .brand span { display: block; margin-top: 2px; color: #8A93A3; font-size: 11px; letter-spacing: 2px; }
 
@@ -393,3 +395,5 @@ html, body { font-family: var(--gem-font); color: var(--gem-text); background: v
 .el-table .job-item--failed:hover > td.el-table__cell { background: #FCE3E2 !important; }
 .el-table .publish-item--failed > td.el-table__cell { background: var(--gem-danger-soft); }
 .el-table .publish-item--failed:hover > td.el-table__cell { background: #FCE3E2 !important; }
+
+

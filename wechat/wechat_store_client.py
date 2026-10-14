@@ -1153,8 +1153,12 @@ class WxStore:
             products.append({
                 "product_id": item.get("product_id"),
                 "sku_id": item.get("sku_id"),
-                "product_cnt": item.get("product_cnt"),
-                "real_price": item.get("real_price"),                 # 分
+                # 商品名与商家编码：数据面板要按"单个商品"拆解，没有名字只能显示一串 id
+                "title": item.get("title") or item.get("product_title"),
+                "sku_code": item.get("sku_code") or item.get("outer_product_id"),
+                "product_cnt": item.get("product_cnt") or item.get("sku_cnt"),
+                "real_price": item.get("real_price") or item.get("sale_price"),   # 分(用户实付)
+                "sale_price": item.get("sale_price"),                              # 分(原价)
                 "on_aftersale_sku_cnt": item.get("on_aftersale_sku_cnt"),
                 "finish_aftersale_sku_cnt": item.get("finish_aftersale_sku_cnt"),
             })
@@ -1303,6 +1307,69 @@ class WxStore:
             "pay_gmv", "pay_uv", "pay_order_cnt", "pay_refund_gmv",
             "product_click_uv", "live_pay_gmv", "feed_pay_gmv",
         )}
+
+    # =================================================================
+    # 接口 13b:商品级数据(微信罗盘) —— 商品明细面板的"官方口径"
+    #   POST /channels/ec/compass/shop/product/data/get
+    #   入参只有 ds(YYYYMMDD,单日) + product_id(**一次只能查一个商品**),
+    #   没有日期区间/批量 —— 要覆盖 N 个商品 × D 天就是 N×D 次请求。
+    #   ⚠️ 官方标注「仅历史数据,暂无当日数据」:当天数据要 T+1 才有。
+    #   字段都是字符串,部分退款率字段是浮点数(可能为 null),要分别解析。
+    # =================================================================
+    PRODUCT_OVERVIEW_FIELDS = (
+        # 流量/行为
+        "product_click_uv", "product_click_cnt",
+        # 下单
+        "create_gmv", "create_uv", "create_cnt", "create_product_cnt",
+        # 成交
+        "pay_gmv", "pay_uv", "pay_cnt", "pay_product_cnt",
+        "pure_pay_gmv", "pay_gmv_per_uv",
+        # 退款
+        "pay_refund_gmv", "pay_refund_uv", "pay_refund_cnt", "pay_refund_product_cnt",
+        "refund_gmv", "refund_uv", "refund_cnt", "refund_product_cnt",
+    )
+
+    def get_product_overview(self, ds, product_id):
+        """取某个商品某一天的数据。ds 形如 '20261010'(YYYYMMDD)。金额单位:分。"""
+        data = self._post("/channels/ec/compass/shop/product/data/get",
+                          {"ds": str(ds), "product_id": int(product_id)})
+        return self.summarize_product_overview(data)
+
+    @staticmethod
+    def summarize_product_overview(payload):
+        """罗盘商品数据 → 扁平 dict(响应里的 product_info.data 直接摊平)。
+
+        数值字段接口一律以**字符串**返回(如 "pay_gmv":"0"),这里统一转 int;
+        退款率三个字段是浮点数且可能为 null,原样保留(None 表示平台未给)。
+        """
+        info = (payload or {}).get("product_info") or {}
+        data = info.get("data") or {}
+
+        def num(key):
+            try:
+                return int(float(data.get(key)))
+            except (TypeError, ValueError):
+                return 0
+
+        result = {key: num(key) for key in WxStore.PRODUCT_OVERVIEW_FIELDS}
+        # 下钻用得到的商品标识/图/价(price 在 product_info 上,不在 data 里;单位同为分)
+        try:
+            price = int(float(info.get("price")))
+        except (TypeError, ValueError):
+            price = 0
+        result.update({
+            "product_id": str(info.get("product_id") or ""),
+            "title": info.get("title") or "",
+            "head_img_url": info.get("head_img_url") or "",
+            "price": price,
+        })
+        for rate_key in ("pay_refund_ratio", "pay_refund_after_send_ratio",
+                         "pay_refund_before_send_ratio"):
+            try:
+                result[rate_key] = float(data[rate_key])
+            except (TypeError, ValueError):
+                result[rate_key] = None
+        return result
 
 
 # =====================================================================

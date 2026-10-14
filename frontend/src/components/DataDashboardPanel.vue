@@ -3,14 +3,18 @@
 //
 // 数据从哪来（页面必须能自证，不能让人猜）：
 //   ① 平台自带数据概览（微信罗盘：成交金额/成交人数/成交订单数/退款金额/商品点击人数）—— 官方口径，优先用；
-//   ② 订单接口聚合（两家平台都有，但拿不到"买家数/点击人数"）—— 兜底口径。
-//   每个数字右上角的 ⓘ 里都写清了它用的哪套口径；小红书没有罗盘，买家数/点击人数就显示"—"，不编数。
+//   ② 订单接口聚合（两家平台都有）—— 兜底口径。
+//   人数（支付买家数/下单人数）在官方口径缺失时用**订单里的买家标识当天去重**自算：
+//   小红书没有罗盘，但订单接口带 xhsOpenId，所以这两个数能算出来（标识不落库，只落个数）。
+//   流量（访客/点击）两家都拿不到——小红书开放平台完全没有这类接口，所以「支付转化率」
+//   对小红书只能是"—"，不编数；能算的是「下单后转化率」（下单之后的转化）。
+//   每个数字右上角的 ⓘ 里都写清了它用的哪套口径。
 //
 // 图上没有的"实时/周/月"：平台接口只提供**按日**数据，所以这里的 周/月 是我们把日数据归并出来的，
 // "实时"给不了（接口层不存在），干脆不摆一个点不动的按钮。
-import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
-import { ArrowLeft, ArrowRight, Download, InfoFilled, Refresh, Setting } from '@element-plus/icons-vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowLeft, ArrowRight, Download, InfoFilled, Refresh, Search, Setting } from '@element-plus/icons-vue'
 import { bulkApi } from '../bulkApi'
 import { shops } from '../shopContext'
 import { useIsMobile } from '../useResponsive'
@@ -18,6 +22,10 @@ import { useIsMobile } from '../useResponsive'
 const isMobile = useIsMobile()
 const loading = ref(false)
 const syncing = ref(false)
+// 手动同步的后台任务（POST /orders/sync 只登记任务，进度靠轮询 /orders/sync/status）
+const syncJobId = ref('')
+const syncJob = reactive({ status: '', done: 0, total: 0, synced: 0, failed: 0, current: '', message: '', range: '' })
+let syncPollTimer = null
 const errorMsg = ref('')
 const granularity = ref('day')
 const customVisible = ref(false)
@@ -55,8 +63,10 @@ const METRICS = [
   { key: 'net_paid_amount', label: '净支付金额', kind: 'money', tip: '支付金额 − 退款金额。平台接口没有这个字段，是按公式推算的' },
   { key: 'refund_amount', label: '退款金额（完结时间）', kind: 'money', tip: '微信取自罗盘「成交退款金额」；小红书取售后单完成当天的退款金额' },
   { key: 'paid_orders', label: '支付子订单数', kind: 'int', tip: '微信取自罗盘「成交订单数」；小红书取当日支付成功的订单数' },
-  { key: 'buyers', label: '支付买家数', kind: 'int-optional', tip: '微信罗盘「成交人数」。小红书订单接口不提供买家维度（也不落库买家信息），显示 —' },
-  { key: 'conversion_rate', label: '支付转化率', kind: 'rate-optional', tip: '近似口径 = 支付买家数 ÷ 商品点击人数（平台没有官方转化率字段）' },
+  { key: 'buyers', label: '支付买家数', kind: 'int-optional', tip: '微信取罗盘「成交人数」；小红书平台没开放人数接口，用订单里的买家标识**当天去重**自算（标识不落库）' },
+  { key: 'conversion_rate', label: '支付转化率', kind: 'rate-optional', tip: '下单**之前**的转化，近似口径 = 支付买家数 ÷ 商品点击人数。小红书没有任何流量接口，分母拿不到 → 显示 —' },
+  { key: 'created_buyers', label: '下单人数', kind: 'int-optional', tip: '按订单创建时间去重买家自算（含未支付/已取消）。两个平台都没有店铺级的官方「下单人数」接口——微信罗盘的下单人数只在商品级接口里' },
+  { key: 'created_conversion_rate', label: '下单后转化率', kind: 'rate-optional', tip: '下单**之后**的转化 = 支付买家数 ÷ 下单人数。和上面「支付转化率」不是一回事，别混用' },
   { key: 'avg_order_value', label: '客单价', kind: 'money', tip: '支付金额 ÷ 支付子订单数（按公式推算）' },
   { key: 'clicks', label: '商品点击人数', kind: 'int-optional', tip: '微信罗盘「商品点击人数」；小红书无对应接口，显示 —' },
   { key: 'dealt_orders', label: '成交笔数（确认收货）', kind: 'int', tip: '我们自己的口径：当日确认收货/交易完成的订单数（不是平台成交金额的笔数）' },
@@ -92,6 +102,8 @@ const allChecked = computed(() => checkedKeys.value.length === METRICS.length)
 function toggleAllMetrics() {
   checkedKeys.value = allChecked.value ? defaultCheckedKeys() : METRICS.map((metric) => metric.key)
 }
+
+const pad2 = (n) => String(n).padStart(2, '0')
 
 function ymd(date) {
   const d = new Date(date)
@@ -146,7 +158,26 @@ function deltaOf(metric) {
 }
 const updatedText = computed(() => {
   if (!state.lastSyncedAt) return '还没同步过，点右侧「同步数据」'
-  return `统计时间 ${String(state.lastSyncedAt).slice(0, 16).replace('T', ' ')}（平台多为 T+1，当天数据次日才完整）`
+  // 库里存的是 UTC 时间（带 +00:00），页面必须按本地时区显示，否则会差 8 个小时
+  const at = new Date(state.lastSyncedAt)
+  const time = Number.isNaN(at.getTime())
+    ? String(state.lastSyncedAt).slice(0, 16).replace('T', ' ')
+    : `${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())} ${pad2(at.getHours())}:${pad2(at.getMinutes())}`
+  return `统计时间 ${time}（平台多为 T+1，当天数据次日才完整）`
+})
+// 同步按钮文案：跑起来后显示「同步中 12/120」，别让按钮看着像卡死
+const syncButtonText = computed(() => {
+  if (!syncing.value) return '同步数据'
+  if (syncJob.status !== 'running' || !syncJob.total) return '同步中…'
+  return `同步中 ${syncJob.done}/${syncJob.total}`
+})
+// 把「正在同步哪段区间」写出来：面板当前选的是别的区间时，用户看不到数字在动，
+// 不知道该切到哪去看——这一行就是告诉他去哪儿看。
+const syncHintText = computed(() => {
+  if (!syncing.value) return ''
+  const range = syncJob.range
+  const scope = range && range.start && range.end ? ` ${range.start} ~ ${range.end}` : ''
+  return `正在同步${scope}，已同步的会陆续显示，不用等全部跑完`
 })
 // 区间文字要能自证"这是什么窗口"：选"周"就是 4 个整周，不是随便 28 天
 const rangeText = computed(() => {
@@ -239,6 +270,149 @@ function pointsOf(series) {
   return (series || []).map((day) => `${day.x.toFixed(1)},${day.y.toFixed(1)}`).join(' ')
 }
 
+// ============ 商品明细（下方那块，按单个商品摊开）============
+const productLoading = ref(false)
+const productKeyword = ref('')
+const productSort = ref('amount')
+const productLimit = ref(20)
+const productState = reactive({ rows: [], totals: {}, prevTotals: {}, productTotal: 0, statsNote: '' })
+
+async function loadProducts(silent = false) {
+  // 静默刷新（同步过程中每隔几秒刷一次）不要让商品表自己转圈，否则每隔几秒闪一下
+  if (!silent) productLoading.value = true
+  try {
+    const start = toDay(range.value?.[0])
+    const end = toDay(range.value?.[1])
+    const data = await bulkApi.orderProductMetrics(start, end, '', panelShop.value,
+                                                  productKeyword.value.trim(),
+                                                  productSort.value, productLimit.value, 0)
+    const result = data?.result || {}
+    productState.rows = result.rows || []
+    productState.totals = result.totals || {}
+    productState.prevTotals = result.prev_totals || {}
+    productState.productTotal = result.product_total || 0
+    productState.statsNote = result.stats_note || ''
+    await loadProductImages(productState.rows)
+  } catch (error) {
+    ElMessage.error(`商品维度读取失败：${error.message}`)
+    productState.rows = []
+    productState.statsNote = ''
+  } finally {
+    if (!silent) productLoading.value = false
+  }
+}
+// ============ 交易明细（最下面那块，订单级）============
+// 为什么不跟着上面的区间走：交易明细是**按单日**实时拉平台接口的（后端不落订单明细表），
+// 跟着 28 天的区间会变成几十次平台请求、几百秒。所以它有自己的单日游标，
+// 只共用面板的「店铺范围」，这样口径一致、耗时也可控。
+const detail = reactive({
+  day: ymd(new Date()), platform: '', keyword: '',
+  page: 1, pageSize: 20, rows: [], total: 0, sumPaidAmount: 0,
+  notes: [], loading: false, error: '', loaded: false,
+})
+// 明细里的时间戳后端已经转成**本地时区**秒级，直接格式化即可（不要再按 UTC 处理）
+function orderTime(ts) {
+  if (!ts) return '—'
+  const at = new Date(Number(ts) * 1000)
+  if (Number.isNaN(at.getTime())) return '—'
+  return `${at.getFullYear()}-${pad2(at.getMonth() + 1)}-${pad2(at.getDate())} ${pad2(at.getHours())}:${pad2(at.getMinutes())}:${pad2(at.getSeconds())}`
+}
+const orderShopText = (row) => row.shop_name || row.shop_id || '—'
+function shiftDetailDay(step) {
+  const next = new Date(detail.day)
+  if (Number.isNaN(next.getTime())) return
+  next.setDate(next.getDate() + step)
+  if (next > new Date()) return          // 明细是"某一天已发生的订单"，不让选未来
+  detail.day = ymd(next)
+  detail.page = 1
+  loadDetails()
+}
+// 相对今天偏移 n 天（0=今天，-1=昨天，-7=上周同日）
+function jumpDetailDay(offset) {
+  const target = daysAgo(-offset)
+  if (target > new Date()) return
+  if (detail.day === ymd(target)) return   // 已经在这一天就别白拉一次接口
+  detail.day = ymd(target)
+  detail.page = 1
+  loadDetails()
+}
+// 日历里禁掉未来日期：平台当天数据本来就要 T+1 才完整，选未来没意义
+function disableFutureDay(date) {
+  return date.getTime() > Date.now()
+}
+function onDetailDayPick(value) {
+  if (!value) return
+  detail.day = value
+  detail.page = 1
+  loadDetails()
+}
+async function loadDetails() {
+  detail.loading = true
+  detail.error = ''
+  try {
+    const data = await bulkApi.orderDetails(detail.day, detail.platform, panelShop.value,
+                                             detail.keyword.trim(), detail.pageSize,
+                                             (detail.page - 1) * detail.pageSize)
+    const result = data?.result || {}
+    detail.rows = result.rows || []
+    detail.total = result.total || 0
+    detail.sumPaidAmount = result.sum_paid_amount || 0
+    detail.notes = result.notes || []
+    detail.loaded = true
+  } catch (error) {
+    detail.error = error.message
+    detail.rows = []
+    detail.total = 0
+  } finally {
+    detail.loading = false
+  }
+}
+// 商品成本/运费成本：平台订单接口没有这两个字段，本地也没有成本表，
+// 所以先按示例做成「配置」入口，点开说明数据从哪来——别拿 0 冒充成本。
+function costTip(kind) {
+  ElMessageBox.alert(
+    kind === '商品成本'
+      ? '商品成本 = 各 SKU 的采购成本 × 数量。目前平台订单接口和本地货盘表都没有成本字段，'
+        + '需要先在货盘表加「成本价」列，或接 ERP 的成本数据。'
+      : '运费成本 = 每单实际承担的运费。平台订单接口只有「向买家收取的运费」（微信 freight），'
+        + '不是我们的成本；真实成本要按物流结算单算，目前没有数据源。',
+    kind, { confirmButtonText: '知道了' })
+}
+const productPlatformText = (platform) => platformText(platform)
+// 商品级流量/转化：只有平台统计接口真的返回了(stats_source 非空)才显示数字。
+// 判断必须用 visits_available，不能看数值是否为 0 —— 0 分不清"真的没人看"和"平台没这数据"。
+const productVisits = (row) => (row.visits_available ? row.visits : null)
+// 下单人数（罗盘 create_uv）与访客数共用同一个「平台有没有给数据」开关。
+// 原「加购数」占位列已删除：加购发生在成单之前，罗盘商品级接口返回的 31 个字段里没有加购、
+// 订单接口也只有成单后的数据，三条路都拿不到；换成平台确实提供的「下单人数」，
+// 正好补上 点击 → 下单 → 支付 漏斗中间那一环。
+const productCreateUv = (row) => (row.visits_available ? row.create_uv : null)
+const productConversion = (row) => {
+  if (!row.visits_available || row.conversion_rate === null || row.conversion_rate === undefined) return null
+  return (row.conversion_rate * 100).toFixed(1) + '%'
+}
+const productImageCache = reactive({})
+function productImageKey(row) { return String(row.platform) + '|' + String(row.product_id) }
+function productImageUrl(row) { return productImageCache[productImageKey(row)] || '' }
+async function loadProductImages(rows) {
+  await Promise.all(rows.filter((row) => row.product_id).map(async (row) => {
+    const key = productImageKey(row)
+    if (productImageCache[key] !== undefined) return
+    // 优先用订单里带回来的图（平台在订单里直接给了 SKU 主图）：
+    // 无需再请求平台，也不会因为商品已下架/不在商品列表里而变成「无图」。
+    if (row.image_url) { productImageCache[key] = row.image_url; return }
+    try {
+      const data = await bulkApi.orderProductImage(
+        row.platform, row.product_id, panelShop.value, row.shop_id || '')
+      productImageCache[key] = (data && data.result && data.result.url) || ''
+    } catch (error) { productImageCache[key] = '' }
+  }))
+}
+const productDelta = (row) => {
+  if (row.delta === null || row.delta === undefined) return { text: '—', up: false, muted: true }
+  return { text: `${Math.abs(row.delta * 100).toFixed(1)}%`, up: row.delta > 0, muted: false }
+}
+
 // 鼠标移到图上：显示那天的日期与金额（比只看一条线有用）
 const hoverIndex = ref(-1)
 function onChartMove(event) {
@@ -266,24 +440,31 @@ const hoverInfo = computed(() => {
   }
 })
 
+// 取数主体：load() 管整页 loading 遮罩与报错提示；同步过程中的「边跑边出数」直接调
+// fetchPanel(true) 静默刷新——否则每隔几秒整页闪一次加载中，比不同步还难受。
+async function fetchPanel(silent = false) {
+  const start = toDay(range.value?.[0])
+  const end = toDay(range.value?.[1])
+  // 「自定义」是界面概念（自选区间），后端粒度只有 日/周/月 —— 自定义时按「天」取数
+  const apiGranularity = granularity.value === 'custom' ? 'day' : granularity.value
+  const data = await bulkApi.orderMetrics(start, end, '', apiGranularity, panelShop.value)
+  const result = data?.result || {}
+  Object.assign(state, {
+    rows: result.rows || [], totals: result.totals || {}, prevTotals: result.prev_totals || {},
+    daily: result.daily || [], prevDaily: result.prev_daily || [], platforms: result.platforms || [],
+    statsPlatforms: result.stats_platforms || [], configured: result.configured || {},
+    lastSyncedAt: result.last_synced_at || null, syncedDays: result.synced_days || 0,
+    range: result.range || { start: start || '', end: end || '' },
+    prevRange: result.prev_range || { start: '', end: '' },
+  })
+  await loadProducts(silent)          // 下面的商品维度用同一区间/店铺范围，跟着一起刷新
+}
+
 async function load() {
   loading.value = true
   errorMsg.value = ''
   try {
-    const start = toDay(range.value?.[0])
-    const end = toDay(range.value?.[1])
-    // 「自定义」是界面概念（自选区间），后端粒度只有 日/周/月 —— 自定义时按「天」取数
-    const apiGranularity = granularity.value === 'custom' ? 'day' : granularity.value
-    const data = await bulkApi.orderMetrics(start, end, '', apiGranularity, panelShop.value)
-    const result = data?.result || {}
-    Object.assign(state, {
-      rows: result.rows || [], totals: result.totals || {}, prevTotals: result.prev_totals || {},
-      daily: result.daily || [], prevDaily: result.prev_daily || [], platforms: result.platforms || [],
-      statsPlatforms: result.stats_platforms || [], configured: result.configured || {},
-      lastSyncedAt: result.last_synced_at || null, syncedDays: result.synced_days || 0,
-      range: result.range || { start: start || '', end: end || '' },
-      prevRange: result.prev_range || { start: '', end: '' },
-    })
+    await fetchPanel(false)
   } catch (error) {
     errorMsg.value = error.message
     state.rows = []
@@ -312,7 +493,7 @@ async function exportExcel() {
     link.click()
     link.remove()
     URL.revokeObjectURL(url)
-    ElMessage.success('已导出，文件里含「按周期 / 按天 / 口径说明」三张表')
+    ElMessage.success('已导出：汇总 + 各平台日销售 + 各平台交易清单 + 口径说明')
   } catch (error) {
     ElMessage.error(`导出失败：${error.message}`)
   } finally {
@@ -321,25 +502,115 @@ async function exportExcel() {
 }
 
 async function syncNow() {
+  const start = toDay(range.value?.[0])
+  const end = toDay(range.value?.[1])
+  // 同步也只同步本页选的范围（all = 逐店同步，会慢一些）。
+  // POST 现在只登记任务、立即返回，真正的进度靠轮询 /orders/sync/status
   syncing.value = true
+  Object.assign(syncJob, { status: 'running', done: 0, total: 0, synced: 0, failed: 0, current: '', message: '' })
+  syncLoadedDone = 0                 // 新任务从头开始边跑边出数
+  syncLastRefreshAt = 0
   try {
-    const start = toDay(range.value?.[0])
-    const end = toDay(range.value?.[1])
-    // 同步也只同步本页选的范围（all = 逐店同步，会慢一些）
     const data = await bulkApi.orderSync({ start, end, shop: panelShop.value })
     const result = data?.result || {}
-    if (result.failed) {
-      const first = (result.items || []).find((item) => item.sync_error)
-      ElMessage.warning(`同步完成：成功 ${result.synced} 天、失败 ${result.failed} 天（${first?.sync_error?.slice(0, 60) || ''}）`)
-    } else {
-      ElMessage.success(`同步完成：${result.synced} 条（${result.range?.start} ~ ${result.range?.end}）`)
-    }
-    await load()
+    syncJobId.value = result.job_id || ''
+    applySyncJob(result)
+    if (result.status === 'running') startSyncPolling()
+    else await finishSync(result)
   } catch (error) {
     ElMessage.error(`同步失败：${error.message}`)
-  } finally {
+    stopSyncPolling()
     syncing.value = false
   }
+}
+
+function applySyncJob(job) {
+  if (!job || !job.job_id) return
+  Object.assign(syncJob, {
+    status: job.status || '', done: job.done || 0, total: job.total || 0,
+    synced: job.synced || 0, failed: job.failed || 0, current: job.current || '',
+    message: job.message || '', range: job.range || '',
+  })
+}
+
+function startSyncPolling() {
+  stopSyncPolling()
+  syncPollTimer = setInterval(pollSyncJob, 1500)
+}
+
+function stopSyncPolling() {
+  if (syncPollTimer) {
+    clearInterval(syncPollTimer)
+    syncPollTimer = null
+  }
+}
+
+// 「边同步边出数」：每 SYNC_REFRESH_MS 毫秒静默刷一次面板，所以 100+ 天的同步
+// 不用等全部跑完才看到数——已经落库的那部分先显示出来，数字会随进度往上走。
+// 三个限制别去掉：
+//   ① done 没变不刷（没新数据就别白拉一次接口）；
+//   ② 3 秒节流（100 多步时按 1.5s 轮询直接刷会把接口打满）；
+//   ③ 同一时刻只跑一次刷新（load 还没回来就不再发起）。
+const SYNC_REFRESH_MS = 3000
+let syncLoadedDone = 0
+let syncLastRefreshAt = 0
+let syncRefreshing = false
+
+async function refreshPanelSilently(force = false) {
+  if (syncRefreshing) return
+  if (!force) {
+    if (syncJob.done <= syncLoadedDone) return
+    if (Date.now() - syncLastRefreshAt < SYNC_REFRESH_MS) return
+  }
+  syncRefreshing = true
+  syncLastRefreshAt = Date.now()
+  syncLoadedDone = Math.max(syncLoadedDone, syncJob.done)
+  try {
+    await fetchPanel(true)
+  } catch { /* 静默刷新失败不打扰用户：结束时还会再整页刷一次 */ } finally {
+    syncRefreshing = false
+  }
+}
+
+async function pollSyncJob() {
+  try {
+    const data = await bulkApi.orderSyncStatus(syncJobId.value)
+    const result = data?.result || {}
+    // 服务重启过：任务没了，前端不能再傻等，直接按结束处理并刷新面板
+    if (result.status === 'idle') {
+      stopSyncPolling()
+      await finishSync({ status: 'done', synced: 0, failed: 0 })
+      return
+    }
+    applySyncJob(result)
+    if (result.status !== 'running') {
+      stopSyncPolling()
+      await finishSync(result)
+      return
+    }
+    await refreshPanelSilently()
+  } catch (error) {
+    stopSyncPolling()
+    syncing.value = false
+    ElMessage.error(`读取同步进度失败：${error.message}`)
+  }
+}
+
+async function finishSync(result) {
+  const synced = result.synced || 0
+  const failed = result.failed || 0
+  if (result.status === 'failed') {
+    ElMessage.error(`同步失败：${result.message || '未知错误'}`)
+  } else if (failed) {
+    const first = (result.errors || [])[0]
+    ElMessage.warning(`同步完成：成功 ${synced} 天、失败 ${failed} 天（${first?.error?.slice(0, 60) || ''}）`)
+  } else if (result.range) {
+    ElMessage.success(`同步完成：${synced} 条（${result.range.start} ~ ${result.range.end}）`)
+  } else {
+    ElMessage.success('同步已结束，数据已刷新')
+  }
+  await load()
+  syncing.value = false
 }
 
 // 前后翻页：按当前粒度的"整段"平移（周=整周、月=整月、日/自定义=等长天数），
@@ -365,6 +636,16 @@ function shiftRange(step) {
   const span = Math.round((new Date(end) - new Date(start)) / 86400000) + 1
   range.value = [ymd(shiftDays(start, step * span)), ymd(shiftDays(end, step * span))]
 }
+// 打开「自定义统计区间」弹窗。
+// 每次都把日期框预填成**当前正在看的那段**：在自定义模式里再点一次「自定义」，
+// 是想微调这段区间，而不是又跳回默认的近 7 天（原来预填逻辑只挂在粒度切换上，
+// 结果第二次点按钮连弹窗都打不开）。
+function openCustomRange() {
+  customStart.value = range.value?.[0] || ymd(daysAgo(6))
+  customEnd.value = range.value?.[1] || ymd(new Date())
+  customVisible.value = true
+}
+
 // 切粒度时给一个"默认窗口"，每个窗口都对齐自然边界：
 //   日 → 近 7 天（含今天）
 //   周 → 近 4 个**完整**自然周（周一~周日；不含本周，因为本周还没过完，环比会假跌）
@@ -372,9 +653,7 @@ function shiftRange(step) {
 function applyGranularity(value) {
   granularity.value = value
   if (value === 'custom') {
-    customStart.value = range.value?.[0] || ymd(daysAgo(6))
-    customEnd.value = range.value?.[1] || ymd(new Date())
-    customVisible.value = true
+    openCustomRange()
     return
   }
   if (value === 'day') {
@@ -432,6 +711,21 @@ watch(panelShop, (value) => {
   load()
 })
 watch(() => range.value, load)
+// 商品维度：排序/显示条数/搜索词变化时重拉（搜索做 350ms 防抖，别每敲一个字打一次接口）
+watch([productSort, productLimit], loadProducts)
+let productKeywordTimer = null
+watch(productKeyword, () => {
+  clearTimeout(productKeywordTimer)
+  productKeywordTimer = setTimeout(loadProducts, 350)
+})
+// 交易明细：跟着店铺范围走（口径与上面一致）；订单号搜索同样 350ms 防抖，别每敲一个字打一次平台
+watch(() => panelShop.value, () => { detail.page = 1; loadDetails() })
+watch(() => detail.platform, () => { detail.page = 1; loadDetails() })
+let detailKeywordTimer = null
+watch(() => detail.keyword, () => {
+  clearTimeout(detailKeywordTimer)
+  detailKeywordTimer = setTimeout(() => { detail.page = 1; loadDetails() }, 350)
+})
 
 onMounted(async () => {
   if (!shops.value.length) {
@@ -442,7 +736,22 @@ onMounted(async () => {
     } catch { /* 拉不到就只显示"全部店铺汇总" */ }
   }
   await load()
+  await loadProducts()
+  await loadDetails()      // 交易明细：按单日实时拉，第一次进页面就把当天明细取回来
+  // 同步过程中刷新页面：接着轮询后台任务，按钮继续显示进度
+  try {
+    const data = await bulkApi.orderSyncStatus()
+    const result = data?.result || {}
+    if (result.status === 'running') {
+      syncJobId.value = result.job_id || ''
+      applySyncJob(result)
+      syncing.value = true
+      startSyncPolling()
+    }
+  } catch { /* 读不到就算了，不影响面板 */ }
 })
+
+onUnmounted(stopSyncPolling)
 </script>
 
 <template>
@@ -463,7 +772,9 @@ onMounted(async () => {
           <el-radio-button value="day">日</el-radio-button>
           <el-radio-button value="week">周</el-radio-button>
           <el-radio-button value="month">月</el-radio-button>
-          <el-radio-button value="custom">自定义</el-radio-button>
+          <!-- 已经处于自定义模式时再点这个按钮，radio 不会发 update:model-value（选中态没变），
+               弹窗就打不开了。所以额外挂一个 click：不管当前是什么模式，点它都开弹窗。 -->
+          <el-radio-button value="custom" @click="openCustomRange">自定义</el-radio-button>
         </el-radio-group>
         <el-button-group>
           <el-button size="small" :icon="ArrowLeft" @click="shiftRange(-1)" title="上一周期" />
@@ -476,7 +787,8 @@ onMounted(async () => {
         <el-button size="small" @click="toggleAllMetrics">{{ allChecked ? '只看核心指标' : '全部指标' }}</el-button>
         <el-button link size="small" :icon="InfoFilled" @click="readmeVisible = true">口径说明</el-button>
         <el-button size="small" :icon="Download" :loading="exporting" @click="exportExcel">导出</el-button>
-        <el-button type="primary" size="small" :icon="Refresh" :loading="syncing" @click="syncNow">同步数据</el-button>
+        <el-button type="primary" size="small" :icon="Refresh" :loading="syncing" @click="syncNow">{{ syncButtonText }}</el-button>
+        <span v-if="syncing" class="dash-sync-hint">{{ syncHintText }}</span>
       </div>
     </div>
 
@@ -559,6 +871,233 @@ onMounted(async () => {
       </aside>
     </div>
 
+    <!-- 商品明细：把上面按"天/平台"的汇总，按单个商品摊开 -->
+    <section class="dash-products">
+      <div class="dash-head">
+        <h1>商品明细</h1>
+        <div class="dash-head-right">
+          <el-input v-model="productKeyword" clearable size="small" :prefix-icon="Search"
+                    placeholder="搜索商品名 / 商家编码 / 商品ID" style="width: 250px" />
+          <el-select v-model="productSort" size="small" style="width: 132px">
+            <el-option label="按支付金额" value="amount" />
+            <el-option label="按支付件数" value="qty" />
+            <el-option label="按订单数" value="orders" />
+            <el-option label="按商品名" value="name" />
+          </el-select>
+          <span class="dash-time">共 {{ productState.productTotal }} 个商品</span>
+        </div>
+      </div>
+      <p class="product-note">
+        金额按「订单实付」等比分摊到商品（优惠、运费都摊过），所以各商品之和 = 上面的支付金额；
+        退款仍按订单口径，未用平台商品级退款金额（口径不同，只作参考）。
+      </p>
+      <p v-if="productState.statsNote" class="product-note product-note-stats">
+        {{ productState.statsNote }}
+      </p>
+      <el-table v-loading="productLoading" :data="productState.rows" size="small"
+                empty-text="该区间还没有商品级数据，请先点右上角「同步数据」">
+        <el-table-column label="图" width="64">
+          <template #default="{ row }">
+            <el-image v-if="productImageUrl(row)" :src="productImageUrl(row)" fit="cover"
+                      class="p-thumb" :preview-src-list="[productImageUrl(row)]"
+                      preview-teleported hide-on-click-modal />
+            <span v-else class="p-thumb p-thumb-empty">无图</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="商品" min-width="280">
+          <template #default="{ row }">
+            <div class="p-cell">
+              <el-tag size="small" effect="light" round
+                      :type="row.platform === 'wechat' ? 'success' : 'danger'">{{ productPlatformText(row.platform) }}</el-tag>
+              <span class="p-name" :title="row.product_name || row.product_id">
+                {{ row.product_name || '（平台未返回商品名）' }}
+              </span>
+              <span v-if="row.sku_code" class="p-code">{{ row.sku_code }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="支付金额" width="130" align="right">
+          <template #default="{ row }">{{ money(row.paid_amount) }}</template>
+        </el-table-column>
+        <el-table-column label="占比" width="160">
+          <template #default="{ row }">
+            <div class="p-share">
+              <span class="p-bar"><i :style="{ width: Math.min(100, row.share * 300) + '%' }" /></span>
+              <span class="p-share-text">{{ (row.share * 100).toFixed(1) }}%</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="支付件数" width="100" align="right">
+          <template #default="{ row }">{{ row.paid_qty }}</template>
+        </el-table-column>
+        <el-table-column label="商品访客数" width="118" align="right">
+          <template #header>
+            <span class="col-head">
+              商品访客数
+              <el-tooltip placement="top" effect="light" content="微信=罗盘「商品点击人数」（平台没有「详情页访客数」这个口径）；小红书未开放统计接口，显示「—」；当天数据平台要 T+1 才有">
+                <el-icon class="col-info"><InfoFilled /></el-icon>
+              </el-tooltip>
+            </span>
+          </template>
+          <template #default="{ row }">
+            <span v-if="productVisits(row) !== null">{{ productVisits(row) }}</span>
+            <span v-else class="col-na">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="下单人数" width="112" align="right">
+          <template #header>
+            <span class="col-head">
+              下单人数
+              <el-tooltip placement="top" effect="light" content="微信罗盘「下单人数」：点过商品又下了单的人数（下单未支付也算）；小红书未开放统计接口，显示「—」；当天数据平台要 T+1 才有">
+                <el-icon class="col-info"><InfoFilled /></el-icon>
+              </el-tooltip>
+            </span>
+          </template>
+          <template #default="{ row }">
+            <span v-if="productCreateUv(row) !== null">{{ productCreateUv(row) }}</span>
+            <span v-else class="col-na">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="支付转化率" width="112" align="right">
+          <template #header>
+            <span class="col-head">
+              支付转化率
+              <el-tooltip placement="top" effect="light" content="成交人数 ÷ 商品点击人数（按平台口径自算，平台没给现成字段）；小红书未开放统计接口，显示「—」">
+                <el-icon class="col-info"><InfoFilled /></el-icon>
+              </el-tooltip>
+            </span>
+          </template>
+          <template #default="{ row }">
+            <span v-if="productConversion(row) !== null">{{ productConversion(row) }}</span>
+            <span v-else class="col-na">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="订单数" width="90" align="right">
+          <template #default="{ row }">{{ row.order_count }}</template>
+        </el-table-column>
+        <el-table-column label="较上一周期" width="120" align="right">
+          <template #default="{ row }">
+            <span :class="['p-delta', productDelta(row).up ? 'up' : 'down', { muted: productDelta(row).muted }]">
+              <span class="caret">{{ productDelta(row).up ? '▲' : '▼' }}</span>{{ productDelta(row).text }}
+            </span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div v-if="productState.productTotal > productState.rows.length" class="p-more">
+        <el-button size="small" text type="primary" @click="productLimit += 20">
+          显示更多（已显示 {{ productState.rows.length }} / {{ productState.productTotal }}）
+        </el-button>
+      </div>
+      <p v-if="productState.rows.length" class="product-sum">
+        合计：{{ productState.totals.products }} 个商品 · 支付 {{ money(productState.totals.paid_amount) }} 元 ·
+        {{ productState.totals.paid_qty }} 件<template v-if="productState.totals.visits"> ·
+        访客 {{ productState.totals.visits }} 人 · 下单 {{ productState.totals.create_uv }} 人 ·
+        成交 {{ productState.totals.buyers }} 人</template> ·
+        上一周期 {{ money(productState.prevTotals.paid_amount) }} 元
+      </p>
+    </section>
+
+    <!-- 交易明细：订单级明细。与上面同一个 .dash-page 内、紧邻其下，共用店铺范围；
+         数据是按单日**实时**拉平台接口（后端不落订单明细表），有 5 分钟缓存。 -->
+    <section class="dash-orders">
+      <div class="dash-head">
+        <h1>交易明细</h1>
+        <div class="dash-head-right">
+          <el-input v-model="detail.keyword" size="small" class="order-search"
+                    placeholder="输入订单号" clearable :prefix-icon="Search" />
+          <el-select v-model="detail.platform" size="small" class="platform-select">
+            <el-option value="" label="全部平台" />
+            <el-option value="wechat" label="微信小店" />
+            <el-option value="xhs" label="小红书" />
+          </el-select>
+          <span class="dash-time">统计时间</span>
+          <el-date-picker v-model="detail.day" type="date" value-format="YYYY-MM-DD"
+                          format="YYYY-MM-DD" size="small" class="day-picker"
+                          :clearable="false" :disabled-date="disableFutureDay"
+                          placeholder="选择日期" @change="onDetailDayPick" />
+          <el-button-group>
+            <el-button size="small" :icon="ArrowLeft" @click="shiftDetailDay(-1)" title="前一天" />
+            <el-button size="small" :icon="ArrowRight" @click="shiftDetailDay(1)" title="后一天" />
+          </el-button-group>
+          <!-- 只有前后按钮时翻一天要一直点，所以再给三个"一步到位"的跳转 -->
+          <el-button-group class="day-quick">
+            <el-button size="small" @click="jumpDetailDay(0)">今天</el-button>
+            <el-button size="small" @click="jumpDetailDay(-1)">昨天</el-button>
+            <el-button size="small" @click="jumpDetailDay(-7)">上周同日</el-button>
+          </el-button-group>
+        </div>
+      </div>
+      <el-alert v-if="detail.error" type="error" show-icon :closable="false" class="dash-alert"
+                title="交易明细读取失败" :description="detail.error" />
+      <p v-else-if="detail.notes.length" class="product-note">
+        <span v-for="(note, index) in detail.notes" :key="index">{{ note }}<template v-if="index < detail.notes.length - 1">；</template></span>
+      </p>
+      <el-table v-loading="detail.loading" :data="detail.rows" size="small"
+                empty-text="该日期没有订单明细">
+        <!-- 列宽用 min-width：容器多出来的宽度会由 el-table 按比例分给各列，表格能撑满
+             （写死 width 的话右侧会空一大块）。表头一律走 .col-head（已带 nowrap），
+             中文不会在窄列里被压成"确认收/货金/额"竖排。 -->
+        <el-table-column min-width="230" show-overflow-tooltip>
+          <template #header><span class="col-head">订单编号</span></template>
+          <template #default="{ row }">
+            <div class="p-cell">
+              <el-tag size="small" effect="plain">{{ platformText(row.platform) }}</el-tag>
+              <span class="p-code">{{ row.order_no }}</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column min-width="170" show-overflow-tooltip>
+          <template #header><span class="col-head">店铺</span></template>
+          <template #default="{ row }"><span class="order-shop">{{ orderShopText(row) }}</span></template>
+        </el-table-column>
+        <el-table-column min-width="160">
+          <template #header><span class="col-head">订单创建时间</span></template>
+          <template #default="{ row }"><span class="order-time">{{ orderTime(row.create_ts) }}</span></template>
+        </el-table-column>
+        <el-table-column min-width="160">
+          <template #header><span class="col-head">支付时间</span></template>
+          <template #default="{ row }"><span class="order-time">{{ orderTime(row.pay_ts) }}</span></template>
+        </el-table-column>
+        <el-table-column min-width="110" align="right">
+          <template #header><span class="col-head">实付金额</span></template>
+          <template #default="{ row }">{{ money(row.paid_amount) }}</template>
+        </el-table-column>
+        <el-table-column min-width="120" align="right">
+          <template #header><span class="col-head">确认收货金额</span></template>
+          <template #default="{ row }">
+            <span v-if="row.confirm_amount !== null && row.confirm_amount !== undefined">{{ money(row.confirm_amount) }}</span>
+            <span v-else class="col-na">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column min-width="100" align="right">
+          <template #header><span class="col-head">商品成本</span></template>
+          <template #default><el-button link type="primary" size="small" @click="costTip('商品成本')">配置</el-button></template>
+        </el-table-column>
+        <el-table-column min-width="100" align="right">
+          <template #header><span class="col-head">运费成本</span></template>
+          <template #default><el-button link type="primary" size="small" @click="costTip('运费成本')">配置</el-button></template>
+        </el-table-column>
+      </el-table>
+      <p class="product-note">
+        确认收货金额：平台订单接口没有这个字段，用「已完成订单的实付金额」近似，未完成的显示 —；
+        商品成本 / 运费成本：暂无数据源（订单接口与货盘表都没有成本字段，平台只回「向买家收取的运费」），
+        点「配置」看说明。
+      </p>
+      <div class="order-foot">
+        <el-pagination
+          :current-page="detail.page"
+          :page-size="detail.pageSize"
+          :page-sizes="[20, 50, 100]"
+          :total="detail.total"
+          :disabled="detail.loading"
+          layout="sizes, prev, pager, next"
+          @current-change="(value) => { detail.page = value; loadDetails() }"
+          @size-change="(value) => { detail.pageSize = value; detail.page = 1; loadDetails() }"
+        />
+        <span class="muted-copy">当日实付合计 {{ money(detail.sumPaidAmount) }} 元</span>
+      </div>
+    </section>
+
     <el-dialog v-model="pickerVisible" title="自定义指标" width="440px" append-to-body>
       <p class="dialog-tip">勾选后立即显示在面板上（默认展示前 8 个平台后台同款指标），选择会被记住。</p>
       <el-checkbox-group v-model="checkedKeys">
@@ -615,6 +1154,7 @@ onMounted(async () => {
 .dash-head h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--gem-text); }
 .dash-head-right { display: flex; align-items: center; flex-wrap: wrap; gap: var(--gem-space-2); }
 .dash-time { color: var(--gem-text-3); font-size: 12px; }
+.dash-sync-hint { color: var(--gem-text-4); font-size: 12px; }
 .dash-scope-label { color: var(--gem-text-3); font-size: 12px; cursor: help; }
 .scope-select { width: 210px; }
 .dash-range { color: var(--gem-text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -694,6 +1234,59 @@ onMounted(async () => {
 .summary-cell strong { color: var(--gem-text); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
 .chart-tick { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
 .dialog-tip { margin: 8px 0 0; color: var(--gem-text-3); font-size: 12px; }
+/* ===================== 商品明细（下方面板） ===================== */
+.dash-products {
+  display: flex; flex-direction: column; gap: var(--gem-space-2);
+  padding: var(--gem-space-4);
+  background: var(--gem-surface); border: 1px solid var(--gem-border);
+  border-radius: var(--gem-radius-md); box-shadow: var(--gem-shadow-sm);
+}
+.dash-products .dash-head h1 { font-size: 16px; }
+/* 交易明细：与商品维度同一张卡片的观感，只多加搜索框/页脚两块 */
+.dash-orders {
+  display: flex; flex-direction: column; gap: var(--gem-space-2);
+  padding: var(--gem-space-4);
+  background: var(--gem-surface); border: 1px solid var(--gem-border);
+  border-radius: var(--gem-radius-md); box-shadow: var(--gem-shadow-sm);
+}
+.dash-orders .dash-head h1 { font-size: 16px; }
+/* 表头一律不换行。中文在任意位置都能断行，列一被挤窄就会变成"确认收/货金/额"这种
+   竖排，行高被撑到近 200px（实测踩到）。右侧三列用固定 width 保证放得下，
+   屏幕不够宽时让表格横向滚动，也不要把表头压成竖排。 */
+.dash-orders :deep(.el-table th .cell) { white-space: nowrap; }
+.dash-orders :deep(.el-table th) { white-space: nowrap; }
+.dash-orders .col-head { white-space: nowrap; }
+.dash-orders .col-info { flex: 0 0 auto; }
+.order-search { width: 190px; }
+.day-picker { width: 140px; }
+.platform-select { width: 120px; }
+.order-shop, .order-time { color: var(--gem-text-2); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 订单号 22 位、店铺名又长：都按单行省略，别把行高撑成两行三行 */
+.dash-orders .order-shop { overflow: hidden; text-overflow: ellipsis; }
+.dash-orders .p-code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.order-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--gem-space-2); flex-wrap: wrap; }
+.order-foot .muted-copy { color: var(--gem-text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.product-note { margin: 0; color: var(--gem-text-3); font-size: 12px; }
+.product-note-stats { color: var(--gem-text-2); }
+.product-sum { margin: var(--gem-space-2) 0 0; color: var(--gem-text-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.p-thumb { width: 40px; height: 40px; border-radius: var(--gem-radius-sm); border: 1px solid var(--gem-border); background: var(--gem-surface-2); }
+.p-thumb-empty { display: inline-flex; align-items: center; justify-content: center; color: var(--gem-text-4); font-size: 11px; }
+.col-head { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.col-info { color: var(--gem-text-4); font-size: 13px; cursor: help; }
+.col-na { color: var(--gem-text-4); }
+.p-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.p-name { color: var(--gem-text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.p-code { color: var(--gem-text-4); font-size: 11px; font-family: var(--gem-font-mono); flex-shrink: 0; }
+.p-share { display: flex; align-items: center; gap: 8px; }
+.p-bar { flex: 1; min-width: 40px; height: 6px; border-radius: var(--gem-radius-pill); background: var(--gem-surface-2); overflow: hidden; }
+.p-bar > i { display: block; height: 100%; border-radius: var(--gem-radius-pill); background: var(--gem-brand); }
+.p-share-text { color: var(--gem-text-3); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
+.p-delta { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.p-delta.up { color: var(--gem-danger); }
+.p-delta.down { color: var(--gem-success); }
+.p-delta.muted { color: var(--gem-text-3); }
+.p-delta .caret { font-size: 10px; }
+.p-more { display: flex; justify-content: center; padding-top: var(--gem-space-1); }
 .readme-title { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--gem-text); }
 .readme-title:not(:first-child) { margin-top: var(--gem-space-4); }
 .quick-ranges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: var(--gem-space-3); }
