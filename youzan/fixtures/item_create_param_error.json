@@ -1,0 +1,7 @@
+{
+  "_comment": "负面剧本：发品参数不合法（4301）。启用方式见同目录 _index.json 的 scenarios。",
+  "gw_err_resp": {
+    "err_code": 4301,
+    "err_msg": "参数类型不匹配: price 必须是数字（单位:元）"
+  }
+}

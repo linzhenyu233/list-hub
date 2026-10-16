@@ -1,0 +1,32 @@
+{
+  "_readme": [
+    "有赞接口的 mock 剧本（fixture）目录。",
+    "",
+    "【谁会读它】mock_platform._load_fixture —— 平台服务在 mock 模式下按 method 名找剧本。",
+    "  这里默认什么都不放：成功响应由 mock_platform._synthesize 按有赞响应壳确定性合成",
+    "  （同一 item_no 永远算出同一个假 item_id，便于回归比对）。",
+    "  只有「平台才会给出的异常响应」（限流、参数错、商品重名）才值得写成文件。",
+    "",
+    "【查找顺序】MOCK_FIXTURE_MAP 显式指定 > _recorded/<method>.json（录制的真实响应）",
+    "  > 本文件的 fixtures.<method>.file > <method 转文件名>.json。",
+    "",
+    "【文件内容】有赞**原样**的响应壳（不是中台自己的简化结构）：",
+    "  网关错误用 {\"gw_err_resp\": {\"err_code\": ..., \"err_msg\": \"...\"}}；",
+    "  业务返回用 {\"code\": 0, \"data\": {...}, \"msg\": \"\"}。",
+    "  以 _ 开头的键只是给人看的注释，加载时会被忽略。",
+    "",
+    "【录制】live 模式设 MOCK_RECORD=1，真实响应写进 _recorded/（自动脱敏密钥/买家信息）。"
+  ],
+  "platform": "youzan",
+  "fixtures": {},
+  "scenarios": {
+    "item_create_param_error.json": {
+      "desc": "发品参数错（4301）—— 复现失败清单与「改参数后重试」",
+      "enable": "MOCK_FIXTURE_MAP=youzan.item.create=item_create_param_error.json"
+    },
+    "gw_err_resp_4101.json": {
+      "desc": "平台限流（4101）—— 验证退避重试，重试用尽后进失败清单",
+      "enable": "MOCK_FIXTURE_MAP=youzan.item.create=gw_err_resp_4101.json"
+    }
+  }
+}

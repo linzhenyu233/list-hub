@@ -1,0 +1,4 @@
+# 有赞店铺 API 服务 (youzan_api.py / youzan_store.py)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+requests>=2.31.0
