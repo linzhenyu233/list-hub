@@ -64,8 +64,10 @@ _ENV_PARAMS_MAP = {
 }
 
 # 凭证字段（redacted_list 会剔除这些键）
+# ⚠️ 新平台若用新的密钥字段名（如有赞的 client_secret），必须补进来 ——
+#    漏了会让 GET /shops 把密钥原文发给前端。
 _SECRET_FIELDS = {
-    "secret", "app_secret", "access_token", "refresh_token",
+    "secret", "app_secret", "client_secret", "access_token", "refresh_token",
     "session_key", "token",
 }
 
@@ -156,13 +158,33 @@ def resolve(shop_id: str | None) -> dict:
 
 
 def has_platform(shop_id: str, platform: str) -> bool:
-    """某店铺是否配置了指定平台（有凭证字段即视为配置）。"""
+    """某店铺是否配置了指定平台（有凭证字段即视为配置）。
+
+    mock 模式同样算「配了」：mock 存在的意义就是"凭证还没到位也能把链路跑通"。
+    前端（店铺管理页 / 批量发布面板）与各平台服务（如 youzan_conf_of）都按这个口径，
+    这里不跟上的话会出现"前端能勾有赞、中台却不建订单页/不同步有赞订单"的错位。
+    """
     if platform not in _VALID_PLATFORMS:
         raise ValueError(f"非法平台: {platform}")
     shop = resolve(shop_id) if isinstance(shop_id, str) and shop_id else default_shop()
     pconf = shop.get(platform) or {}
     # 有该平台的凭证主键即视为配置了该平台（secret 可能为空占位）
-    return bool(pconf.get(platform_registry.creds_key(platform)))
+    if pconf.get(platform_registry.creds_key(platform)):
+        return True
+    return _in_mock_mode(platform, shop["shop_id"])
+
+
+def _in_mock_mode(platform: str, shop_id: str) -> bool:
+    """该店该平台当前是否 mock 联调模式。
+
+    延迟 import + 兜底 False：mock_platform 只在需要时引入，import 失败（如被裁剪的
+    部署包）不应把"是否配了平台"这个问题变成异常。
+    """
+    try:
+        import mock_platform
+        return bool(mock_platform.is_mock(platform, shop_id))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def platform_creds(shop_id: str | None, platform: str) -> dict:
@@ -172,13 +194,15 @@ def platform_creds(shop_id: str | None, platform: str) -> dict:
         {"appid": "...", "secret": "...", "brand_id": "...",
          "freight_template_id": "...", "after_sale_address_id": "..."}
 
-    该平台未配置时抛 ValueError。
+    该平台未配置时抛 ValueError。mock 模式下允许凭证为空——与 has_platform 同一口径，
+    否则会出现"判定为已配置、取凭证却抛错"的自相矛盾。
     """
     if platform not in _VALID_PLATFORMS:
         raise ValueError(f"非法平台: {platform}")
     shop = resolve(shop_id)
     pconf = shop.get(platform) or {}
-    if not pconf.get(platform_registry.creds_key(platform)):
+    if not pconf.get(platform_registry.creds_key(platform)) \
+            and not _in_mock_mode(platform, shop["shop_id"]):
         raise ValueError(f"店铺 {shop['shop_id']} 未配置 {platform} 平台")
     return _deep_copy(pconf)
 
@@ -292,18 +316,19 @@ def _interpolate(obj, path: str, missing: list):
 
 
 def _synthesize_default_from_env() -> dict:
-    """无 shops.json 时，从 .env 合成默认店。与改造前行为完全等价。"""
-    wechat_conf = {}
-    for field, env_key in _ENV_CREDENTIALS_MAP["wechat"].items():
-        wechat_conf[field] = os.environ.get(env_key, "") or ""
-    for field, (env_key, default) in _ENV_PARAMS_MAP["wechat"].items():
-        wechat_conf[field] = os.environ.get(env_key) or default
+    """无 shops.json 时，从 .env 合成默认店。与改造前行为完全等价。
 
-    xhs_conf = {}
-    for field, env_key in _ENV_CREDENTIALS_MAP["xhs"].items():
-        xhs_conf[field] = os.environ.get(env_key, "") or ""
-    for field, (env_key, default) in _ENV_PARAMS_MAP["xhs"].items():
-        xhs_conf[field] = os.environ.get(env_key) or default
+    ⚠️ 这里**按 platform_registry 的平台列表循环**（原先写死了 wechat/xhs 两段），
+    接新平台时只改 platform_registry 即可，不会出现"注册了平台但默认店合成不出来"。
+    """
+    platform_confs = {}
+    for platform in _VALID_PLATFORMS:
+        conf = {}
+        for field, env_key in _ENV_CREDENTIALS_MAP[platform].items():
+            conf[field] = os.environ.get(env_key, "") or ""
+        for field, (env_key, default) in _ENV_PARAMS_MAP[platform].items():
+            conf[field] = os.environ.get(env_key) or default
+        platform_confs[platform] = conf
 
     image_root = (
         os.environ.get("DEFAULT_IMAGE_ROOT")
@@ -315,10 +340,9 @@ def _synthesize_default_from_env() -> dict:
         "name": DEFAULT_SHOP_NAME,
         "enabled": True,
         "is_default": True,
-        "wechat": wechat_conf,
-        "xhs": xhs_conf,
+        **platform_confs,
         "image_root": image_root,
-        "remark": "自动合成：从 .env WX_* / XHS_* 单店配置回退",
+        "remark": "自动合成：从 .env WX_* / XHS_* / YOUZAN_* 单店配置回退",
     }
 
 

@@ -74,7 +74,7 @@ import urllib.parse
 #    - 货盘表 ID 列的**追加顺序**（bulk_api._huopai_id_columns 按 HUOPAI_ID_HEADERS 的键顺序建列）
 #    - worker 线程池的启动顺序
 #    因此「新增平台」应追加到末尾，不要插队。
-_PLATFORMS: tuple[str, ...] = ("wechat", "xhs")
+_PLATFORMS: tuple[str, ...] = ("wechat", "xhs", "youzan")
 
 _ADAPTERS: dict[str, dict] = {
     "wechat": {
@@ -152,6 +152,76 @@ _ADAPTERS: dict[str, dict] = {
         "auth_expired_markers": ("401", "accessToken expired", "授权已过期"),
         "sku_image_fallback": True,
         "supports": frozenset({"publish", "listing", "delete", "image", "orders"}),
+    },
+    "youzan": {
+        # 有赞云开放平台（自用型无容器应用）：见 docs/有赞平台适配实施方案.md
+        "key": "youzan",
+        "label": "有赞",
+        "api_base_env": "YOUZAN_API_BASE",
+        "default_base": "http://127.0.0.1:8030",
+        "service_dir": "youzan",
+        # 有赞把"应用身份 + 店铺"分开：client_id/client_secret 是应用凭证，kdt_id 是店铺 ID；
+        # 自用型应用可绑多个店铺，access_token 按 kdt_id 隔离，所以三件套缺一不可。
+        "creds_key": "client_id",
+        "required_credentials": ("client_id", "client_secret", "kdt_id"),
+        "param_keys": ("delivery_template_id",),
+        "env_credentials": {
+            "client_id": "YOUZAN_CLIENT_ID",
+            "client_secret": "YOUZAN_CLIENT_SECRET",
+            "kdt_id": "YOUZAN_KDT_ID",
+            "access_token": "YOUZAN_ACCESS_TOKEN",
+        },
+        "env_params": {
+            "delivery_template_id": ("YOUZAN_DELIVERY_TEMPLATE_ID", ""),
+        },
+        "title_column": "youzan_title",
+        "title_fit": "youzan",
+        # ★待核对：有赞商品标题上限。
+        #   线索：有赞**后台发布页**商品名称允许 100 字（2026-10-15 用户截图），但后台页
+        #   一般比开放接口宽松（后台会替我们兜住），不能据此认定 API 也给 100。
+        #   现按 60 与微信对齐（保守）：多截 40 字只会让标题变短，不会让平台拒。
+        #   真机联调时用一条 61~100 字的标题单独发一次，验出上限后再调这里 + fit_youzan_title。
+        "title_fit_max": 60,
+        # ★★ 2026-10-15 真机纠正：有赞商品接口的 price 单位是**分**，不是元！
+        #    原先按"官方文档注明单位:元"写成 yuan，导致真机发布出来的商品价格是预期的 1/100
+        #    （货盘上架价 699000 元 → 平台存成 699000 分 = 6990 元，会超低价卖出）。
+        #    双重证据：
+        #      ① 真机：用户在后台手工建的商品填 28000 元 → GET 回来 price=2800000（= 分）；
+        #      ② 官方《有赞云开放接口商品场景对接说明》明确写 price「单位：分」。
+        #    ⚠️ 与微信/小红书同为 cent，不要再改回 yuan。
+        "price_unit": "cent",
+        "publish_path": "/products",
+        "image_file_path": "/materials/upload-file",
+        # ⚠️ price_unit=cent 只适用于**创建**（item.create 的 price 与 sku_stocks[].price 收分）。
+        # 2026-10-15 真机实测两条反直觉口径：
+        #   ① **改价接口 youzan.item.sku.update 的 price 收「元」**（与创建方向相反）——
+        #      按分传 20128600 会被读成 2012 万元，报 code=123001065 SKU价格超过最大限制；
+        #      传 201287.5（元）成功，平台里存的是 20128750 分。
+        #   ② youzan.item.quantity.update 的 type **只认 1=增量**（2/3 报 123000104
+        #      不支持的库存更新类型）—— 平台没有"全量覆盖"，要设绝对库存必须先回读现值算差值。
+        "image_url_path": "/materials/upload",
+        # ★待核对：图片上传入参名（官方文档/SDK 示例有 img / image 两种写法）
+        "image_url_payload_key": "img",
+        "item_path": "/products/{id}",
+        "required_params": (("youzan_delivery_template_id", "有赞运费模板"),),
+        "id_headers": ("有赞商品id", "有赞商品ID", "有赞产品id"),
+        "sku_id_headers": ("有赞规格id", "有赞sku id", "有赞规格id(sku)"),
+        # ✅ 2026-10-15 真机核对：商品已删除时 youzan.item.get 报
+        #    `code=122001001 商品不存在!`（HTTP 400）→ 错误码与文案都记下来，双保险
+        "gone_markers": ("122001001", "商品不存在", "商品已删除", "item not exist", "item_not_exist"),
+        # 4101 = 请求太频繁（公开文档确认）
+        "rate_limit_markers": ("4101", "请求太频繁", "too many request"),
+        # ★待核对：access_token 失效类错误码
+        "auth_expired_markers": ("access_token 无效", "无效的access_token", "4201"),
+        # 有赞商品主图与规格图是分开的素材，规格缺图时用主图兜底更稳
+        "sku_image_fallback": True,
+        # listing = 上下架；delete = 删除商品。
+        # ✅ 2026-10-15 真机核对：youzan.item.update.listing / .delisting 与 youzan.item.delete
+        #    都可用（均返回 {"item_id":…, "is_success": true}）。
+        #    但 **delete 仍未在代码里开放**（youzan_api 没有 /products/{id} 的 DELETE 路由、
+        #    前端也没有删除按钮）—— 声明了却没人实现，前端会冒出点不动的删除按钮，
+        #    所以这里先不加；真要开放删除时：youzan_api 补 DELETE 路由 + 这里加 "delete"。
+        "supports": frozenset({"publish", "image", "orders", "listing"}),
     },
     # --- 待接入（软著后按接口清单 §5.1 逐一补字段，标签均为 `*` 需核对）-------------
     # "douyin": { ... },   抖音：creds_key="access_token"、price_unit="cent"、

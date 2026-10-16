@@ -202,6 +202,12 @@ def _error_envelope(platform: str, kind: str, method_key: str) -> dict:
     if platform == "wechat":
         code = {"rate_limit": 45009, "auth_expired": 40001, "param_error": 40002}[kind]
         return {"errcode": code, "errmsg": f"[mock] {kind} ({method_key})"}
+    if platform == "youzan":
+        # ⚠️ 有赞的错误壳与成功壳都带 `*` 待核对（见 docs/有赞平台适配实施方案.md §11-★1）：
+        #    网关层失败用 gw_err_resp，部分接口用 code/msg；这里用**网关壳**，
+        #    4101=请求太频繁 / 4301=参数错 已由官方文档/公开案例确认。
+        code = {"rate_limit": 4101, "auth_expired": 4201, "param_error": 4301}[kind]
+        return {"gw_err_resp": {"err_code": code, "err_msg": f"[mock] {kind} ({method_key})"}}
     return {"error": f"[mock] {kind} ({method_key})"}
 
 
@@ -494,6 +500,7 @@ def mock_id(platform: str, seed: str) -> str:
 def _seed_of(body: dict) -> str:
     """从请求体里挑一个稳定的种子：优先商品编码/货号，其次标题，最后整个请求体。"""
     for key in ("out_product_id", "outer_product_id", "productCode", "product_code", "erpCode",
+                "item_no", "sku_no", "outer_id",
                 "product_id", "itemId", "item_id", "skuId", "sku_id"):
         value = body.get(key)
         if value:
@@ -551,7 +558,9 @@ def _synthesize(platform: str, method_key: str, body: dict):
         return {"error_code": 0, "success": True, "data": data}
     if platform == "wechat":
         return _wechat_envelope(key, seed, body)
-    # 新平台（阶段⑤）：先给一个统一的最小壳，接入时按接口清单替换本函数
+    if platform == "youzan":
+        return _youzan_envelope(key, seed, body)
+    # 其余未注册平台：先给一个统一的最小壳，接入时按接口清单替换本函数
     return {"errcode": 0, "errmsg": "ok", "data": {}}
 
 
@@ -627,6 +636,186 @@ def _xhs_data(key: str, seed: str, body: dict):
         return {"skuId": mock_id("xhs", "sku:" + seed)}
     if "createitem" in key or "additem" in key:
         return {"itemId": mock_id("xhs", seed)}
+    return {}
+
+
+def _youzan_stamp(day: str, hour: int, minute: int = 0) -> str:
+    """'YYYYMMDD' + 时:分 → 'YYYY-MM-DD HH:MM:SS'。
+
+    有赞订单接口的时间字段是**字符串**（如 "2026-10-15 12:00:00"），不是时间戳，
+    所以不能复用 _mock_day_seconds（那是给微信/小红书的时间戳口径用的）。
+    """
+    try:
+        stamp = time.mktime(time.strptime(f"{day} {hour:02d}:{minute:02d}:00", "%Y%m%d %H:%M:%S"))
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+    except (ValueError, OverflowError):
+        return f"{day[:4]}-{day[4:6]}-{day[6:8]} {hour:02d}:{minute:02d}:00"
+
+
+def _youzan_day_of_request(body: dict, *keys) -> str:
+    """从有赞订单请求里取时间窗起点 → 'YYYYMMDD'（mock 订单按天稳定生成）。
+
+    ★待核对：有赞 4.0.4 的时间参数名/格式（公开文档为 start_created/end_created 一类
+    "YYYY-MM-DD HH:MM:SS" 字符串）。这里对字符串与秒/毫秒时间戳都做兼容。
+    """
+    for key in keys:
+        value = body.get(key)
+        if isinstance(value, dict):
+            value = value.get("start_time") or value.get("startTime")
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+            try:
+                return time.strftime("%Y%m%d", time.strptime(text, fmt))
+            except ValueError:
+                continue
+        try:
+            seconds = int(float(text))
+        except (TypeError, ValueError):
+            continue
+        if seconds >= 10 ** 12:
+            seconds //= 1000
+        return time.strftime("%Y%m%d", time.localtime(seconds))
+    return "19700101"
+
+
+def _youzan_envelope(key: str, seed: str, body: dict):
+    """有赞云响应壳。
+
+    ⚠️ 成功壳形态是 `*` 待核对项（官方文档 3.0 商品接口既有 `{"code":0,"data":{...}}`，
+    也有直接返回业务对象的写法）——服务层的解析做了兼容，两种都能吃下，
+    真机录制一次（MOCK_RECORD=1）后以录制结果为准。
+    取 token 不走 youzan.* 接口（POST /auth/token），壳完全不同，单独处理。
+    """
+    if "auth/token" in key or key in ("auth.token", "token", "oauth.token"):
+        # ⚠️ 取 token 的 body 里全是凭证（client_secret 等），**不能**用 _seed_of 的结果
+        #    （那是请求体原文片段，会把密钥切一半塞进假 token 里）。这里用摘要，确定性且不泄漏。
+        token_seed = "|".join(str(body.get(name) or "")
+                              for name in ("kdt_id", "client_id")) or "youzan"
+        digest = hashlib.md5(f"youzan:auth:{token_seed}".encode("utf-8")).hexdigest()
+        return {"access_token": f"mock-access-{digest[:24]}", "expires_in": 7 * 24 * 3600,
+                "scope": "multi_store", "token_type": "Bearer"}
+    return {"code": 0, "data": _youzan_data(key, seed, body), "msg": ""}
+
+
+def _youzan_data(key: str, seed: str, body: dict):
+    """有赞业务 data（字段名带 ★ 的需真机录制校正）。
+
+    ⚠️ 金额/价格一律按**元**合成：有赞 item.create 的 price 官方注明"单位:元"，
+    与微信/小红书的"分"不同（分/元搞错不会报错，只会超低价卖出）。
+    """
+    # --- 商品：创建 / 变更 / 上下架 ---
+    if "item.create" in key or "item.add" in key:
+        # 真机形态（2026-10-15）：返回**完整商品对象**且外面包一层 item；
+        # 规格入参是 JSON 字符串 sku_stocks（元素含 item_no / skus[{k,kid,v,vid}]）。
+        stocks = body.get("sku_stocks")
+        if isinstance(stocks, str):
+            try:
+                stocks = json.loads(stocks)
+            except ValueError:
+                stocks = []
+        stocks = stocks if isinstance(stocks, list) else []
+        skus = [{"sku_id": mock_id("youzan", f"{seed}:sku:{index}"),
+                 "item_no": (one or {}).get("item_no") or f"{seed}-{index + 1}",
+                 "price": (one or {}).get("price"), "quantity": (one or {}).get("quantity")}
+                for index, one in enumerate(stocks)]
+        item = {"item_id": mock_id("youzan", seed),
+                "alias": f"mock{seed[:10]}",
+                "item_no": body.get("item_no") or seed,
+                "price": body.get("price"), "quantity": body.get("quantity"),
+                "skus": skus}
+        return {"item": item}
+    if "quantity" in key or "sku.update" in key:
+        return {"item_id": str(body.get("item_id") or mock_id("youzan", seed)),
+                "sku_id": str(body.get("sku_id") or mock_id("youzan", "sku:" + seed))}
+    if "listing" in key or "delisting" in key:
+        # item.update.listing / item.update.delisting（★接口名待核对）
+        return {"item_id": str(body.get("item_id") or mock_id("youzan", seed))}
+    if "item.delete" in key or "item.remove" in key:
+        return {"item_id": str(body.get("item_id") or mock_id("youzan", seed))}
+    if "item.update" in key:
+        return {"item_id": str(body.get("item_id") or mock_id("youzan", seed))}
+    if "item.get" in key or "item.detail" in key:
+        # 真机形态：详情也包在 item 里，规格键是 skus、编码键是 item_no
+        item_id = str(body.get("item_id") or mock_id("youzan", seed))
+        return {"item": {"item_id": item_id, "item_no": seed,
+                         "title": body.get("title") or f"mock 商品 {seed[:12]}",
+                         "is_listing": 1, "status": "on_sale",
+                         "skus": [{"sku_id": mock_id("youzan", "sku:" + seed), "item_no": seed,
+                                   "price": 19900, "quantity": 100}]}}
+    if "items.custom" in key:
+        return {"items": [{"item_id": mock_id("youzan", seed), "item_no": seed,
+                           "title": f"mock 商品 {seed[:12]}", "is_listing": 1}]}
+    if "skus.custom" in key:
+        return {"skus": [{"sku_id": mock_id("youzan", "sku:" + seed), "sku_no": seed,
+                          "item_id": mock_id("youzan", seed),
+                          "price": "199.00", "stock": 100}]}
+    if "items.onsale" in key or "items.inventory" in key:
+        # 商品列表（有赞商品列表页用）。按 state 合成 3 条稳定假数据。
+        # ⚠️ 真机报文（2026-10-15）里**没有 is_listing 字段**，状态由"调的是哪个接口"决定；
+        #    早期 mock 自作主张塞了 is_listing，反而让前端"依赖该字段"的 bug 在 mock 下测不出来，
+        #    真机一上就把出售中商品全显示成仓库中。mock 必须与真机一致，这里不再返回该字段。
+        onsale = "onsale" in key
+        items = []
+        for index in range(1, 4):
+            price = f"{99 + index * 50}.00"           # 元 ★单位待核对
+            items.append({
+                "item_id": mock_id("youzan", f"{key}:item:{index}"),
+                "item_no": f"MOCKYZ{index:04d}",
+                "title": f"mock 有赞商品 {index}（{'出售中' if onsale else '仓库中'}）",
+                "cid": "1002",
+                "price": price,
+                "quantity": 30 * index,
+                "skus": [{"sku_id": mock_id("youzan", f"{key}:sku:{index}"),
+                          "sku_no": f"MOCKYZ{index:04d}-S1",
+                          "price": price, "quantity": 30 * index}],
+            })
+        return {"items": items, "count": len(items)}     # 真实总数键是 count（不是 total_count）
+    # --- 类目 / 运费模板 / 图片素材 / 店铺 ---
+    if "itemcategories" in key or "category" in key:
+        return {"categories": [{"cid": "1001", "name": "mock 一级类目", "is_leaf": 0,
+                                "children": [{"cid": "1002", "name": "mock 叶子类目",
+                                              "is_leaf": 1, "children": []}]}]}
+    if "template" in key or "delivery" in key:
+        return {"templates": [{"delivery_template_id": "mock_tpl_1", "name": "mock 运费模板"}]}
+    if "upload" in key or "storage" in key:
+        return {"image_id": f"img{seed[:8]}",
+                "image_url": f"https://mock.local/youzan/{seed[:8]}.jpg"}
+    if "shop.get" in key:
+        return {"shop": {"kdt_id": "mock_kdt", "name": "mock 有赞店铺"}}
+    # --- 交易（只读；数据面板用）---
+    # ⚠️ 字段名与金额单位均为 `*` 待核对项：有赞订单时间字段是**字符串**、
+    #    金额字段（payment/total_fee）单位需真机对账一次。
+    if "trades.sold" in key:
+        day = _youzan_day_of_request(body, "start_created", "start_update", "start_time")
+        orders = []
+        for index, status in ((1, "WAIT_SELLER_SEND_GOODS"), (2, "TRADE_SUCCESS")):
+            orders.append({
+                "tid": f"E{day}000000000{index}",
+                "status": status,
+                "created": _youzan_stamp(day, 12, index),
+                "pay_time": _youzan_stamp(day, 12, index + 1),
+                "update_time": _youzan_stamp(day, 13, index),
+                "success_time": _youzan_stamp(day, 14) if status == "TRADE_SUCCESS" else "",
+                "payment": f"{199 + index * 100}.00",     # 元 ★单位待核对
+                "buyer_id": f"mock-buyer-{index}",        # 隐私字段，服务层不会透出
+            })
+        return {"orders": orders, "total_results": len(orders),
+                "page_no": int(body.get("page_no") or 1),
+                "page_size": int(body.get("page_size") or 20)}
+    if "trade.get" in key:
+        tid = str(body.get("tid") or "mock-tid")
+        day = "19700101"
+        order = {"tid": tid, "status": "TRADE_SUCCESS",
+                 "created": _youzan_stamp(day, 12), "pay_time": _youzan_stamp(day, 12, 5),
+                 "update_time": _youzan_stamp(day, 13), "success_time": _youzan_stamp(day, 14),
+                 "payment": "199.00", "buyer_id": "mock-buyer"}
+        return {"trade": order, "full_order_info": {"order_info": order},
+                "order_items": [{"item_id": mock_id("youzan", seed),
+                                 "sku_id": mock_id("youzan", "sku:" + seed),
+                                 "sku_no": seed, "title": f"mock 商品 {seed[:12]}",
+                                 "num": 1, "price": "199.00"}]}
     return {}
 
 
@@ -738,5 +927,9 @@ if __name__ == "__main__":
     print("  微信 /channels/ec/product/add ->",
           json.dumps(_synthesize("wechat", "/channels/ec/product/add",
                                  {"title": "示例商品名"}), ensure_ascii=False))
+    print("  有赞 youzan.item.create ->",
+          json.dumps(_synthesize("youzan", "youzan.item.create",
+                                 {"item_no": "KGN1000330-永恒",
+                                  "sku_list": [{}, {}]}), ensure_ascii=False))
     print("\n脱敏示例：", json.dumps(mask({"app_secret": "s3cr3t", "accessToken": "t0ken",
                                           "item": {"name": "标题"}}), ensure_ascii=False))
