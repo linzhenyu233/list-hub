@@ -95,6 +95,8 @@ const categoryMatching = ref(false)
 const xhsCascade = ref({})
 // 有赞类目人工确认用的逐级选择状态（结构与 xhsCascade 一致）
 const youzanCascade = ref({})
+// 内部类目 → 手填的有赞类目 ID（类目树选不出来时的兜底，见 confirmYouzanCidById）
+const youzanManualCid = ref({})
 const aliasPanelVisible = ref(false)
 const itemKeyword = ref('')
 const itemErrorFilter = ref('all')
@@ -463,7 +465,10 @@ async function confirmXhsCategory(group, level, value) {
 async function loadYouzanLevel(group, level, parentId = null) {
   const data = await youzanApi.categories(parentId ? { parent_id: parentId } : {})
   const result = data?.result || data || []
-  const options = Array.isArray(result) ? result : (result.categories || result.list || [])
+  let options = Array.isArray(result) ? result : (result.categories || result.list || [])
+  // 第一级只列根节点：服务端不带 parent_id 返回的是**全量平铺**（含二/三级），
+  // 不过滤的话一级下拉会把所有层级混在一起（真机：测试店铺一级下拉里 8 个一级 + 18 个二级并列）
+  if (!parentId) options = options.filter((row) => !String(row.parent_cid ?? row.parent_id ?? '').trim())
   const state = youzanCascade.value[group.internal_category] || { levels: [[], [], []], selected: [] }
   state.levels[level] = options
   state.levels.splice(level + 1)
@@ -476,12 +481,45 @@ async function confirmYouzanCategory(group, level, value) {
   const item = state.levels[level].find((row) => String(row.cid || row.id) === String(value))
   if (!item) return
   // 非叶子类目继续加载下一级，不写死层数
-  if (!(item.is_leaf || item.isLeaf || item.leaf)) { await loadYouzanLevel(group, level + 1, value); return }
+  if (!(item.is_leaf || item.isLeaf || item.leaf)) {
+    await loadYouzanLevel(group, level + 1, value)
+    const next = youzanCascade.value[group.internal_category]?.levels?.[level + 1] || []
+    if (!next.length) {
+      // 选了没有子类目的节点：以前点完什么都不发生（看着像界面卡了）。
+      // 有赞云测试店铺就是这种结构（8 个一级类目里 7 个是空的），必须说清楚下一步怎么办。
+      ElMessage.warning(`「${item.name}」下面没有子类目，换一个一级类目试试（有赞云测试店铺只有「其他」下面开放了类目）；也可以直接填类目 ID`)
+    }
+    return
+  }
   const chain = state.selected.slice(0, level + 1).map((id, index) => { const row = state.levels[index].find((option) => String(option.cid || option.id) === String(id)); return { id, name: row?.name || '' } })
-  for (const code of group.products) mapping.value.products[code] = { ...(mapping.value.products[code] || {}), youzan_category: chain.map((row) => row.name).join(' > '), youzan_category_chain: chain, youzan_cid: value, youzan_status: '有赞类目已人工确认' }
   youzanCascade.value = { ...youzanCascade.value, [group.internal_category]: state }
-  // 同时写 category_id 与 cid：后端读 youzan_cid，映射表展示读 category_id
-  void saveGroupAlias(group.internal_category, { youzan: { category: chain.map((row) => row.name).join(' > '), chain, category_id: value, cid: value } })
+  applyYouzanCategory(group, chain, value)
+}
+
+// 落库：把选定的有赞类目写到这一组商品的映射里，并顺手存进类目映射表（下批自动命中）。
+// 同时写 category_id 与 cid：后端读 youzan_cid，映射表展示读 category_id。
+function applyYouzanCategory(group, chain, cid) {
+  const text = chain.map((row) => row.name).join(' > ')
+  for (const code of group.products) {
+    mapping.value.products[code] = {
+      ...(mapping.value.products[code] || {}),
+      youzan_category: text, youzan_category_chain: chain, youzan_cid: cid, youzan_status: '有赞类目已人工确认',
+    }
+  }
+  void saveGroupAlias(group.internal_category, { youzan: { category: text, chain, category_id: cid, cid } })
+}
+
+// 兜底：直接填类目 ID。
+// 为什么需要：类目树可能"选不出来"——有赞云测试店铺 8 个一级类目里只有「其他」下面开放了子类目，
+// 珠宝商品在测试店没有对口类目；正式店也可能出现"平台类目名跟我们的内部类目对不上"。
+// 这种情况下让运营/联调直接填 cid（可先用「读取类目」看清 cid），不必跟级联选择较劲。
+function confirmYouzanCidById(group) {
+  const cid = String(youzanManualCid.value[group.internal_category] || '').trim()
+  if (!cid) return ElMessage.warning('请先填写有赞类目 ID（可在「读取类目」的下拉里看到）')
+  if (!/^\d+$/.test(cid)) return ElMessage.warning('有赞类目 ID 是纯数字，请检查后重填')
+  applyYouzanCategory(group, [{ id: cid, name: `手填类目ID ${cid}` }], cid)
+  youzanManualCid.value = { ...youzanManualCid.value, [group.internal_category]: '' }
+  ElMessage.success(`已按类目 ID ${cid} 写入（同内部类目已存入映射表，下批自动命中）`)
 }
 
 // 类目别名映射表:人工确认一次存表,后续批次自动命中不再重复选;后端合并微信/小红书/有赞各侧,这里只传本次确认的一侧即可
@@ -511,6 +549,15 @@ function listFrom(data, keys) {
 function optionName(item) { return item.name || item.templateName || item.template_name || item.planName || item.planInfoName || item.title || item.id || '--' }
 function settingId(item) { return String(item.id || item.templateId || item.template_id || item.planInfoId || item.logisticsPlanId || '') }
 
+// 名字带「测试」的模板一般是联调用的，默认藏起来——但**藏完不能变成空**：
+// 有赞云测试店铺唯一的运费模板就叫「测试」，无脑过滤会造成"接口明明有数据、下拉却是无数据"，
+// 而它是必选项 → 直接卡死发布（2026-10-15 用户报的正是这条）。
+// 规则：过滤后还有别的模板才隐藏「测试」；一个都不剩就原样列出（宁可看到"测试"，也不要空下拉）。
+function preferNonTest(rows) {
+  const kept = rows.filter((item) => !optionName(item).includes('测试'))
+  return kept.length ? kept : rows
+}
+
 // 按指定店铺拉「店铺私有参数」下拉（运费模板/物流方案）。shopId 为空 = 当前选中店铺。
 // 拆店后一家店只属于一个平台：只拉该店「已配置」的平台，且各平台互不牵连。
 // ⚠️ 绝不能把微信/小红书接口塞进同一个裸 Promise.all —— 小红书店没有微信配置，
@@ -535,10 +582,12 @@ async function fetchShopPlatformSettings(shopId = '') {
   return {
     errors,
     settings: {
-      wechatFreight: (wechatResult.templates || wechatResult.freight_templates || wechatResult.list || (Array.isArray(wechatResult) ? wechatResult : [])).filter((item) => item.is_valid !== false && !String(item.name || item.template_name || '').includes('测试')),
-      xhsShipping: listFrom(shipping, ['templates', 'carriageTemplateList', 'list']).filter((item) => !optionName(item).includes('测试')),
+      wechatFreight: preferNonTest((wechatResult.templates || wechatResult.freight_templates || wechatResult.list || (Array.isArray(wechatResult) ? wechatResult : [])).filter((item) => item.is_valid !== false)),
+      xhsShipping: preferNonTest(listFrom(shipping, ['templates', 'carriageTemplateList', 'list'])),
       xhsLogistics: listFrom(logistics, ['logisticsPlans', 'logisticsList', 'plans', 'list']).filter((item) => item.isValid !== false),
-      youzanDelivery: listFrom(youzanTemplates, ['templates', 'delivery_templates', 'list']).filter((item) => !optionName(item).includes('测试')),
+      // 有赞运费模板：`youzan.logistics.template.search` 真机返回 {"paginator":…,"items":[…]}
+      // （我们的服务已把列表平铺进 result，两种形状都兼容）
+      youzanDelivery: preferNonTest(listFrom(youzanTemplates, ['items', 'templates', 'delivery_templates', 'list'])),
     },
   }
 }
@@ -950,7 +999,10 @@ async function autoMatchYouzanCategory(product, mappingItem) {
   for (const part of parts) {
     const data = await youzanApi.categories(parentId ? { parent_id: parentId } : {})
     const result = data?.result || data || []
-    const options = Array.isArray(result) ? result : (result.categories || result.list || [])
+    let options = Array.isArray(result) ? result : (result.categories || result.list || [])
+    // 第一级只拿根节点：不带 parent_id 时服务端返回全量平铺（含子级），
+    // 混着匹配会出现"同一个名字既是一级又是二级"→ 命中 2 个被判为匹配失败
+    if (!parentId) options = options.filter((item) => !String(item.parent_cid ?? item.parent_id ?? '').trim())
     let matches = options.filter((item) => String(item.name || '').trim() === part)
     if (!matches.length) {
       matches = options.filter((item) => {
@@ -1872,18 +1924,22 @@ async function publish(partial = false) {
       <template v-if="availablePlatforms.includes('wechat')">
         <span>微信运费模板</span>
         <el-select v-model="batchPlatformSettings.wechatFreightId" placeholder="选择微信运费模板" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.wechatFreightId }"><el-option v-for="item in (platformSettings.wechatFreight || [])" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
-        <span v-if="!batchPlatformSettings.wechatFreightId" class="setting-required-hint">必选，没选不能发布</span>
+        <span v-if="!settingsLoading && !(platformSettings.wechatFreight || []).length" class="setting-empty-hint">该店铺还没有运费模板，请先在微信小店后台建一个，再点刷新</span>
+        <span v-else-if="!batchPlatformSettings.wechatFreightId" class="setting-required-hint">必选，没选不能发布</span>
       </template>
       <template v-if="availablePlatforms.includes('xhs')">
         <span>小红书运费模板 / 物流方案</span>
         <el-select v-model="batchPlatformSettings.xhsShippingId" placeholder="选择运费模板" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.xhsShippingId }"><el-option v-for="item in platformSettings.xhsShipping" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
         <el-select v-model="batchPlatformSettings.xhsLogisticsId" placeholder="选择物流方案" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.xhsLogisticsId }"><el-option v-for="item in platformSettings.xhsLogistics" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
-        <span v-if="!batchPlatformSettings.xhsShippingId || !batchPlatformSettings.xhsLogisticsId" class="setting-required-hint">必选，没选不能发布</span>
+        <span v-if="!settingsLoading && !platformSettings.xhsShipping.length && !platformSettings.xhsLogistics.length" class="setting-empty-hint">该店铺还没有运费模板/物流方案，请先在小红书店铺后台建好，再点刷新</span>
+        <span v-else-if="!batchPlatformSettings.xhsShippingId || !batchPlatformSettings.xhsLogisticsId" class="setting-required-hint">必选，没选不能发布</span>
       </template>
       <template v-if="availablePlatforms.includes('youzan')">
         <span>有赞运费模板</span>
         <el-select v-model="batchPlatformSettings.youzanDeliveryId" placeholder="选择有赞运费模板" style="width:220px" :class="{ 'setting-required-select': !batchPlatformSettings.youzanDeliveryId }"><el-option v-for="item in (platformSettings.youzanDelivery || [])" :key="settingId(item)" :label="optionName(item)" :value="settingId(item)" /></el-select>
-        <span v-if="!batchPlatformSettings.youzanDeliveryId" class="setting-required-hint">必选，没选不能发布</span>
+        <!-- 店铺侧一个模板都没有 ≠ 没选：给出该去哪儿建，否则"下拉无数据"会被当成接口坏了 -->
+        <span v-if="!settingsLoading && !(platformSettings.youzanDelivery || []).length" class="setting-empty-hint">该店铺还没有运费模板，请先在有赞后台（物流 → 运费模板）建一个，再点刷新</span>
+        <span v-else-if="!batchPlatformSettings.youzanDeliveryId" class="setting-required-hint">必选，没选不能发布</span>
       </template>
     </div>
     <div v-if="step === 2 && availablePlatforms.includes('wechat') && mappingGroups.some((group) => group.mapping.wechat_candidates?.length > 1)" class="mapping-confirm-list">
@@ -1909,6 +1965,9 @@ async function publish(partial = false) {
         <span>有赞：{{ group.internal_category }}（{{ group.products.length }} 个商品）</span>
         <el-button size="small" @click="loadYouzanLevel(group, 0)">读取类目</el-button>
         <template v-for="(options, level) in (youzanCascade[group.internal_category]?.levels || [])" :key="level"><el-select :model-value="youzanCascade[group.internal_category]?.selected?.[level]" :placeholder="`第${level + 1}级类目`" @change="(value) => confirmYouzanCategory(group, level, value)"><el-option v-for="item in options" :key="item.cid || item.id" :label="item.name" :value="item.cid || item.id" /></el-select></template>
+        <!-- 兜底：类目树选不出叶子时（有赞云测试店铺只有「其他」下有子类目）直接填 cid -->
+        <el-input v-model="youzanManualCid[group.internal_category]" size="small" placeholder="或直接填类目ID" style="width:150px" @keyup.enter="confirmYouzanCidById(group)" />
+        <el-button size="small" @click="confirmYouzanCidById(group)">用这个ID</el-button>
       </div>
     </div>
     <!-- 品牌没兜底可用时的红条：brandId 为空平台必拒（且不会静默替运营选一个品牌） -->

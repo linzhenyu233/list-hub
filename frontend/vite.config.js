@@ -38,6 +38,12 @@ export default defineConfig(({ mode }) => {
         headers: authHeaders,
         rewrite: (path) => path.replace(/^\/xhs-api/, ''),
       },
+      '/youzan-api': {
+        target: env.VITE_YOUZAN_PROXY_TARGET || 'http://127.0.0.1:8030',
+        changeOrigin: true,
+        headers: authHeaders,
+        rewrite: (path) => path.replace(/^\/youzan-api/, ''),
+      },
       '/bulk-api': {
         target: env.VITE_BULK_PROXY_TARGET || 'http://127.0.0.1:8020',
         changeOrigin: true,

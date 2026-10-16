@@ -45,8 +45,11 @@ const state = reactive({
   range: { start: '', end: '' }, prevRange: { start: '', end: '' },
 })
 
-const PLATFORM_TEXT = { wechat: '微信小店', xhs: '小红书' }
+const PLATFORM_TEXT = { wechat: '微信小店', xhs: '小红书', youzan: '有赞' }
 const platformText = (platform) => PLATFORM_TEXT[platform] || platform
+// 平台标签配色：加新平台只改这张表（原来商品明细里写死"非微信即红"，有赞会被标成小红书那色）
+const PLATFORM_TAG = { wechat: 'success', xhs: 'danger', youzan: 'warning' }
+const platformTag = (platform) => PLATFORM_TAG[platform] || 'info'
 
 // 店铺下拉：第一项固定是"全部店铺汇总"，其余是各启用店铺（跟顶栏那份清单同源，但选择互不影响）
 const shopOptions = computed(() => [
@@ -59,17 +62,19 @@ const scopeAll = computed(() => panelShop.value === PANEL_SHOP_ALL)
 
 // 卡片清单：kind 决定怎么格式化；tip 是口径说明（点 ⓘ 看）。
 // 卡片显不显示还跟「当前范围有没有这个数」有关，见下面的 visibleMetrics。
+// ⚠️ 每条的 tip 都要写全**三个平台**的口径：有赞没有"数据概览/罗盘"类接口（§11-★10 未确认前
+// 不加 stats 能力），能有的都是订单聚合值；缺接口的项显示「—」，不要写成"小红书这样、有赞没说"。
 const METRICS = [
-  { key: 'paid_amount', label: '支付金额', kind: 'money', tip: '平台数据概览（微信罗盘「成交金额」）优先；小红书用订单接口聚合的当日支付金额' },
+  { key: 'paid_amount', label: '支付金额', kind: 'money', tip: '微信取罗盘「成交金额」；小红书/有赞用订单接口聚合的当日支付金额' },
   { key: 'net_paid_amount', label: '净支付金额', kind: 'money', tip: '支付金额 − 退款金额。平台接口没有这个字段，是按公式推算的' },
-  { key: 'refund_amount', label: '退款金额（完结时间）', kind: 'money', tip: '微信取自罗盘「成交退款金额」；小红书取售后单完成当天的退款金额' },
-  { key: 'paid_orders', label: '支付子订单数', kind: 'int', tip: '微信取自罗盘「成交订单数」；小红书取当日支付成功的订单数' },
-  { key: 'buyers', label: '支付买家数', kind: 'int-optional', tip: '微信取罗盘「成交人数」；小红书平台没开放人数接口，用订单里的买家标识**当天去重**自算（标识不落库）' },
-  { key: 'conversion_rate', label: '支付转化率', kind: 'rate-optional', tip: '下单**之前**的转化，近似口径 = 支付买家数 ÷ 商品点击人数。小红书没有任何流量接口，分母拿不到 → 显示 —' },
-  { key: 'created_buyers', label: '下单人数', kind: 'int-optional', tip: '按订单创建时间去重买家自算（含未支付/已取消）。两个平台都没有店铺级的官方「下单人数」接口——微信罗盘的下单人数只在商品级接口里' },
+  { key: 'refund_amount', label: '退款金额（完结时间）', kind: 'money', tip: '微信取自罗盘「成交退款金额」；小红书取售后单完成当天的退款金额；有赞售后接口未核对接入（§11-★9），暂记 0' },
+  { key: 'paid_orders', label: '支付子订单数', kind: 'int', tip: '微信取自罗盘「成交订单数」；小红书/有赞取当日支付成功的订单数' },
+  { key: 'buyers', label: '支付买家数', kind: 'int-optional', tip: '微信取罗盘「成交人数」；小红书/有赞平台没开放人数接口，用订单里的买家标识**当天去重**自算（标识不落库）' },
+  { key: 'conversion_rate', label: '支付转化率', kind: 'rate-optional', tip: '下单**之前**的转化，近似口径 = 支付买家数 ÷ 商品点击人数。小红书/有赞没有任何流量接口，分母拿不到 → 显示 —' },
+  { key: 'created_buyers', label: '下单人数', kind: 'int-optional', tip: '按订单创建时间去重买家自算（含未支付/已取消）。三个平台都没有店铺级的官方「下单人数」接口——微信罗盘的下单人数只在商品级接口里' },
   { key: 'created_conversion_rate', label: '下单后转化率', kind: 'rate-optional', tip: '下单**之后**的转化 = 支付买家数 ÷ 下单人数。和上面「支付转化率」不是一回事，别混用' },
   { key: 'avg_order_value', label: '客单价', kind: 'money', tip: '支付金额 ÷ 支付子订单数（按公式推算）' },
-  { key: 'clicks', label: '商品点击人数', kind: 'int-optional', tip: '微信罗盘「商品点击人数」；小红书无对应接口，显示 —' },
+  { key: 'clicks', label: '商品点击人数', kind: 'int-optional', tip: '微信罗盘「商品点击人数」；小红书/有赞无对应接口，显示 —' },
   { key: 'dealt_orders', label: '成交笔数（确认收货）', kind: 'int', tip: '我们自己的口径：当日确认收货/交易完成的订单数（不是平台成交金额的笔数）' },
   { key: 'actual_income', label: '实际收入（已发货+待发货）', kind: 'money', tip: '当前仍在途（已发货+待发货）的订单金额，是存量口径，不受所选区间限制' },
   { key: 'actual_orders', label: '实际笔数（在途）', kind: 'int', tip: '上述在途状态的订单数' },
@@ -447,23 +452,37 @@ function onDetailRangePick(value) {
   detail.range = [a, b]    // 下面的 watch 负责重拉
 }
 let detailsSeq = 0
+// 明细分两段加载：**先只要本地已同步的**（毫秒级，表格立刻有数），
+// 再把没同步过的天实时补拉（要打平台接口，小红书还逐单补详情，可能几十秒）。
+// 之前是一个请求等全部拉完才显示，于是概览和商品明细都出来了、明细还在转圈。
+// 后端 live=false 那轮会返回 pending_live（还差多少没同步），据此决定要不要补第二次。
+function applyDetailResult(result) {
+  detail.rows = result.rows || []
+  detail.total = result.total || 0
+  detail.sumPaidAmount = result.sum_paid_amount || 0
+  detail.notes = result.notes || []
+  detail.loaded = true
+}
 async function loadDetails() {
   const seq = ++detailsSeq
+  const args = [detail.range[0], detail.range[1], detail.platform, panelShop.value,
+                detail.keyword.trim(), detail.pageSize, (detail.page - 1) * detail.pageSize]
   detail.loading = true
   detail.error = ''
+  let pending = 0
   try {
-    const data = await bulkApi.orderDetails(detail.range[0], detail.range[1],
-                                             detail.platform, panelShop.value,
-                                             detail.keyword.trim(), detail.pageSize,
-                                             (detail.page - 1) * detail.pageSize)
-    // 连着改日期/切筛选时，旧请求可能后到：只认最后一次，别让表里闪回旧数据
+    const local = await bulkApi.orderDetails(...args, false)
+    if (seq !== detailsSeq) return          // 期间又改条件了，交给新的一次请求
+    const result = local?.result || {}
+    applyDetailResult(result)
+    pending = Number(result.pending_live || 0)
+    if (!pending) return                     // 全都在本地，一次就齐了
+    detail.loading = false                  // 别再遮住已经显示出来的数据
+    detail.notes = [`正在补拉 ${pending} 个没同步过的「店×平台×天」，可能要几十秒；`
+                    + '想立刻看到全部，先点「同步数据」']
+    const full = await bulkApi.orderDetails(...args, true)
     if (seq !== detailsSeq) return
-    const result = data?.result || {}
-    detail.rows = result.rows || []
-    detail.total = result.total || 0
-    detail.sumPaidAmount = result.sum_paid_amount || 0
-    detail.notes = result.notes || []
-    detail.loaded = true
+    applyDetailResult(full?.result || {})
   } catch (error) {
     if (seq !== detailsSeq) return
     detail.error = error.message
@@ -1032,7 +1051,7 @@ onUnmounted(stopSyncPolling)
           <template #default="{ row }">
             <div class="p-cell">
               <el-tag size="small" effect="light" round
-                      :type="row.platform === 'wechat' ? 'success' : 'danger'">{{ productPlatformText(row.platform) }}</el-tag>
+                      :type="platformTag(row.platform)">{{ productPlatformText(row.platform) }}</el-tag>
               <span class="p-name" :title="row.product_name || row.product_id">
                 {{ row.product_name || '（平台未返回商品名）' }}
               </span>
@@ -1131,8 +1150,8 @@ onUnmounted(stopSyncPolling)
                     placeholder="输入订单号" clearable :prefix-icon="Search" />
           <el-select v-model="detail.platform" size="small" class="platform-select">
             <el-option value="" label="全部平台" />
-            <el-option value="wechat" label="微信小店" />
-            <el-option value="xhs" label="小红书" />
+            <!-- 选项按「本次范围实际有数据的平台」生成：写死微信/小红书会让有赞订单筛不出来 -->
+            <el-option v-for="p in state.platforms" :key="p" :value="p" :label="platformText(p)" />
           </el-select>
           <span class="dash-time">统计区间</span>
           <el-date-picker v-model="detail.range" type="daterange" value-format="YYYY-MM-DD"
@@ -1151,6 +1170,10 @@ onUnmounted(stopSyncPolling)
                 title="交易明细读取失败" :description="detail.error" />
       <p v-else-if="detail.notes.length" class="product-note">
         <span v-for="(note, index) in detail.notes" :key="index">{{ note }}<template v-if="index < detail.notes.length - 1">；</template></span>
+      </p>
+      <p v-if="!detail.follow" class="product-note">
+        明细现在是独立区间 {{ detail.range?.[0] }} ~ {{ detail.range?.[1] }}，与统计区间（{{ rangeText }}）不同；
+        导出与「同步数据」始终按统计区间走。
       </p>
       <el-table v-loading="detail.loading" :data="detail.rows" size="small"
                 empty-text="该区间没有订单明细">

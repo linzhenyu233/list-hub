@@ -22,6 +22,7 @@ import {
   Notebook,
   Upload,
   TrendCharts,
+  ShoppingBag,
 } from '@element-plus/icons-vue'
 import { storeApi } from './api'
 import { xhsApi } from './xhsApi'
@@ -33,6 +34,7 @@ import brandMark from './assets/shining-house-mark.png'
 const ProductForm = defineAsyncComponent(() => import('./components/ProductForm.vue'))
 const XhsProductPanel = defineAsyncComponent(() => import('./components/XhsProductPanel.vue'))
 const XhsProductForm = defineAsyncComponent(() => import('./components/XhsProductForm.vue'))
+const YouzanProductPanel = defineAsyncComponent(() => import('./components/YouzanProductPanel.vue'))
 const BulkPublishPanel = defineAsyncComponent(() => import('./components/BulkPublishPanel.vue'))
 const CategoryAliasPanel = defineAsyncComponent(() => import('./components/CategoryAliasPanel.vue'))
 const ShopPanel = defineAsyncComponent(() => import('./components/ShopPanel.vue'))
@@ -395,6 +397,7 @@ const moreNavVisible = ref(false)
 const moreNavItems = [
   { view: 'create', label: '发布微信商品', icon: CirclePlus, platform: 'wechat' },
   { view: 'xhs-create', label: '发布小红书商品', icon: CirclePlus, platform: 'xhs' },
+  { view: 'youzan-products', label: '有赞商品', icon: ShoppingBag, platform: 'youzan' },
   { view: 'category-aliases', label: '类目映射', icon: Collection, platform: 'bulk' },
   { view: 'data-dashboard', label: '数据面板', icon: TrendCharts, platform: 'bulk' },
   { view: 'shops', label: '店铺管理', icon: Shop },
@@ -405,27 +408,47 @@ function goTo(view) {
   if (view === 'products') return selectPlatform('wechat')
   if (view === 'xhs-products') return selectPlatform('xhs')
   if (view === 'bulk-publish' || view === 'category-aliases') platform.value = 'bulk'
+  if (view === 'youzan-products') platform.value = 'youzan'
   const item = moreNavItems.find((nav) => nav.view === view)
   if (item?.platform) platform.value = item.platform
   activeView.value = view
 }
 
-// 拆店后一家店只属于一个平台：当前视图与店铺平台不匹配时自动跳转，免得切到小红书店后还停在微信商品页要再手动换。
-// 只管平台专属页（微信商品 / 小红书商品 / 发布小红书商品）；批量发布、类目映射、店铺管理、设置不限平台，不干预。
-// 返回 'wechat' / 'xhs'（发生了跳转）或 ''（视图本来就匹配）。
+// 拆店后一家店只属于一个平台：切店后如果当前停在"这家店不支持"的平台页上，自动换到它支持的平台页。
+// ⚠️ 必须**双向**：原来只有"踢出去"（在有赞页切到微信店 → 回微信页），没有"带进来"
+//    （在微信页切到有赞店 → 仍停在微信页，看着像"选店铺没反应"，2026-10-15 用户报的正是这条）。
+// 只管平台专属页（微信商品 / 小红书商品 / 发布小红书商品 / 有赞商品）；批量发布、类目映射、店铺管理、设置不限平台，不干预。
+// 返回跳到的平台名（'wechat' / 'xhs' / 'youzan'）或 ''（视图本来就匹配）。
+const PLATFORM_HOME_VIEW = { wechat: 'products', xhs: 'xhs-products', youzan: 'youzan-products' }
+// `create`（发布微信商品）也算微信专属：切到有赞店/小红书店时若还停在这一页，
+// 会把微信商品发到当前选中的其它平台店上——必须一起对齐。
+const VIEW_PLATFORM = { products: 'wechat', create: 'wechat', 'xhs-products': 'xhs', 'xhs-create': 'xhs', 'youzan-products': 'youzan' }
+const PLATFORM_SHOP_TEXT = { wechat: '微信店', xhs: '小红书店', youzan: '有赞店' }
+const PLATFORM_PAGE_TEXT = { wechat: '微信商品', xhs: '小红书商品', youzan: '有赞商品' }
+// 店铺下拉里的平台标签（微信沿用默认蓝、小红书红、有赞橙）
+const PLATFORM_TAG_TEXT = { wechat: '微信', xhs: '小红书', youzan: '有赞' }
+const PLATFORM_TAG_TYPE = { xhs: 'danger', youzan: 'warning' }
+
+// 这家店开通了哪些平台。口径与后端 shop_registry.has_platform 一致（mock 也算开通），
+// 三处判断必须同一套标准，否则会出现"前端能进有赞页、后端说没配"的错位。
+function platformsOf(shop) {
+  const list = []
+  if (shop.wechat?.appid) list.push('wechat')
+  if (shop.xhs?.app_id) list.push('xhs')
+  if (shop.youzan?.client_id || shop.youzan?.kdt_id || shop.youzan?.mode === 'mock') list.push('youzan')
+  return list
+}
+
 function alignViewWithShop(shop) {
   if (!shop) return ''
-  const isWechatOnly = Boolean(shop.wechat?.appid) && !shop.xhs?.app_id
-  const isXhsOnly = Boolean(shop.xhs?.app_id) && !shop.wechat?.appid
-  if (isWechatOnly && (activeView.value === 'xhs-products' || activeView.value === 'xhs-create')) {
-    selectPlatform('wechat')
-    return 'wechat'
-  }
-  if (isXhsOnly && activeView.value === 'products') {
-    selectPlatform('xhs')
-    return 'xhs'
-  }
-  return ''
+  const viewPlatform = VIEW_PLATFORM[activeView.value]
+  if (!viewPlatform) return ''                        // 不在平台专属页：不干预
+  const platforms = platformsOf(shop)
+  if (platforms.includes(viewPlatform)) return ''      // 这家店本来就支持当前页
+  // 换到这家店支持的平台页（多平台店按微信→小红书→有赞取第一个，与旧行为一致；一个都没有则回微信页兜底）
+  const next = ['wechat', 'xhs', 'youzan'].find((one) => platforms.includes(one)) || 'wechat'
+  goTo(PLATFORM_HOME_VIEW[next])
+  return next
 }
 
 function afterXhsCreated() {
@@ -541,8 +564,8 @@ watch(currentShopId, (value) => {
   if (serviceOnline.value) void globalRefresh()
   if (target) {
     ElMessage.success(
-      realigned === 'xhs' ? `已切换到「${target.name}」，该店是小红书店，已自动进入小红书商品页`
-        : realigned === 'wechat' ? `已切换到「${target.name}」，该店是微信店，已自动回到微信商品页`
+      realigned
+        ? `已切换到「${target.name}」，该店是${PLATFORM_SHOP_TEXT[realigned]}，已自动进入${PLATFORM_PAGE_TEXT[realigned]}页`
         : `已切换到「${target.name}」`,
     )
   }
@@ -574,6 +597,9 @@ onMounted(async () => {
           <el-menu-item index="xhs-products" :title="sidebarCollapsed ? '小红书商品' : null" @click="selectPlatform('xhs')"><el-icon><Notebook /></el-icon><span>小红书商品</span></el-menu-item>
           <el-menu-item index="xhs-create" :title="sidebarCollapsed ? '发布小红书商品' : null" @click="platform = 'xhs'"><el-icon><CirclePlus /></el-icon><span>发布小红书商品</span></el-menu-item>
         </el-menu-item-group>
+        <el-menu-item-group title="有赞">
+          <el-menu-item index="youzan-products" :title="sidebarCollapsed ? '有赞商品' : null" @click="platform = 'youzan'"><el-icon><ShoppingBag /></el-icon><span>有赞商品</span></el-menu-item>
+        </el-menu-item-group>
         <el-menu-item-group title="批量与配置">
           <el-menu-item index="bulk-publish" :title="sidebarCollapsed ? '批量发布商品' : null" @click="platform = 'bulk'"><el-icon><Upload /></el-icon><span>批量发布商品</span></el-menu-item>
           <el-menu-item index="category-aliases" :title="sidebarCollapsed ? '类目映射' : null" @click="platform = 'bulk'"><el-icon><Collection /></el-icon><span>类目映射</span></el-menu-item>
@@ -595,7 +621,7 @@ onMounted(async () => {
             <el-button class="sidebar-toggle" text circle :icon="sidebarCollapsed ? Expand : Fold" @click="toggleSidebar" />
           </el-tooltip>
           <span class="breadcrumb">运营中心 /</span>
-          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : activeView === 'data-dashboard' ? '数据面板' : activeView === 'shops' ? '店铺管理' : '连接设置' }}</strong>
+          <strong>{{ activeView === 'products' ? '微信商品' : activeView === 'xhs-products' ? '小红书商品' : activeView === 'youzan-products' ? '有赞商品' : activeView === 'xhs-create' ? '发布小红书商品' : activeView === 'create' ? '发布微信商品' : activeView === 'bulk-publish' ? '批量发布商品' : activeView === 'category-aliases' ? '类目映射' : activeView === 'data-dashboard' ? '数据面板' : activeView === 'shops' ? '店铺管理' : '连接设置' }}</strong>
         </div>
         <div class="topbar-actions">
           <el-select v-model="shopIdProxy" :loading="shopSwitching" placeholder="选择店铺"
@@ -605,8 +631,8 @@ onMounted(async () => {
               <div class="shop-option">
                 <span class="shop-option-name">{{ item.name }}</span>
                 <span class="shop-option-tags">
-                  <el-tag v-if="item.wechat?.appid" size="small" effect="light" round>微信</el-tag>
-                  <el-tag v-if="item.xhs?.app_id" size="small" type="danger" effect="light" round>小红书</el-tag>
+                  <!-- 标签直接由 platformsOf 生成：与"切店自动跳页"共用同一套判定，避免两处口径打架 -->
+                  <el-tag v-for="one in platformsOf(item)" :key="one" size="small" :type="PLATFORM_TAG_TYPE[one] || 'primary'" effect="light" round>{{ PLATFORM_TAG_TEXT[one] }}</el-tag>
                 </span>
               </div>
             </el-option>
@@ -623,6 +649,10 @@ onMounted(async () => {
         <!-- key 里带 currentShopId：切店时强制重建组件，避免保留上一家店的列表/分页状态；max=1 保证旧店铺实例被淘汰，不累积缓存 -->
         <KeepAlive :max="1">
           <XhsProductPanel v-if="activeView === 'xhs-products'" :key="`xhs-products-${currentShopId}`" :refresh-tick="globalRefreshTick" @create="activeView = 'xhs-create'" />
+        </KeepAlive>
+
+        <KeepAlive :max="1">
+          <YouzanProductPanel v-if="activeView === 'youzan-products'" :key="`youzan-products-${currentShopId}`" :refresh-tick="globalRefreshTick" />
         </KeepAlive>
 
         <template v-if="activeView === 'xhs-create'">

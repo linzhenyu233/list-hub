@@ -47,6 +47,10 @@ export const bulkApi = {
   }),
   imageCacheStats: () => http.get('/image-cache/stats'),
   clearImageCache: () => http.delete('/image-cache'),
+  // 有赞商品编辑（列表页「编辑」抽屉）：改标题 / SKU 价格(元) / SKU 库存(绝对值) / 上下架。
+  // 走中台而不是直连有赞服务：单位换算、标题上限校验、以及"接口说成功但回读没变"的校验都在中台。
+  // 返回 { ok, changed, warnings, item } —— warnings 要展示给运营，不能吞掉。
+  youzanEditItem: (body, shopId = '') => http.post('/youzan/item-edit', body, { timeout: 180000, headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   // shopId 可选：跨店发布的任务属于目标店，查进度/重试失败项必须带目标店，否则 404
   job: (id, shopId = '') => http.get(`/jobs/${id}`, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
   retry: (id, itemIds = [], shopId = '') => http.post(`/jobs/${id}/retry`, { item_ids: itemIds }, { headers: shopId ? { 'X-Shop-Id': shopId } : undefined }),
@@ -128,13 +132,15 @@ export const bulkApi = {
   // 商品明细：**订单级**明细，支持区间（start~end）或单日（start===end 时走 date 参数）。
   // 后端本地优先：同步过的天直接读库秒回；没同步过的天才实时调平台接口（带 5 分钟缓存、
   // 并发 + 总超时），小红书还要逐单补详情，所以给足超时；否则默认 60s 会先超时。
-  orderDetails: (start = '', end = '', platform = '', shop = '', keyword = '', limit = 20, offset = 0) => {
+  orderDetails: (start = '', end = '', platform = '', shop = '', keyword = '', limit = 20,
+                 offset = 0, live = true) => {
     const params = {}
     if (start && end && start !== end) { params.start = start; params.end = end }
     else if (start) params.date = start
     if (platform) params.platform = platform
     if (shop) params.shop = shop
     if (keyword) params.keyword = keyword
+    if (!live) params.live = 'false'
     params.limit = limit
     params.offset = offset
     return http.get('/orders/details', { params, timeout: 180000 })

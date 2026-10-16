@@ -187,6 +187,33 @@ html, body { font-family: var(--gem-font); color: var(--gem-text); background: v
 }
 .app-shell > .el-container { margin-left: var(--gem-sidebar-w); min-width: 0; }
 
+/* ===================== 侧边栏展开 / 折叠（顶栏按钮切换） ===================== */
+/* 顶栏左侧：折叠按钮 + 面包屑，横向排布 */
+.topbar-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.sidebar-toggle { width: 32px; height: 32px; font-size: 17px; color: var(--gem-text-2); }
+
+/* 折叠态：72px 窄栏只留图标（与 ≤900px 窄屏的窄栏同宽），文字全部隐藏；
+   菜单项在折叠时挂了原生 title，悬停即可看到页面名 */
+.sidebar { transition: width var(--gem-dur) var(--gem-ease); }
+.app-shell > .el-container { transition: margin-left var(--gem-dur) var(--gem-ease); }
+.app-shell.sidebar-collapsed .sidebar { width: 72px !important; }
+.app-shell.sidebar-collapsed > .el-container { margin-left: 72px; }
+.app-shell.sidebar-collapsed .brand { justify-content: center; padding: 0; }
+.app-shell.sidebar-collapsed .brand > div:last-child,
+.app-shell.sidebar-collapsed .nav-menu .el-menu-item span,
+.app-shell.sidebar-collapsed .nav-menu .el-menu-item-group__title,
+.app-shell.sidebar-collapsed .sidebar-footer > div:last-child { display: none; }
+.app-shell.sidebar-collapsed .nav-menu { padding: 14px 10px; }
+.app-shell.sidebar-collapsed .nav-menu .el-menu-item { justify-content: center; padding: 0 !important; }
+.app-shell.sidebar-collapsed .nav-menu .el-menu-item .el-icon { margin: 0; }
+.app-shell.sidebar-collapsed .sidebar-footer { justify-content: center; padding: 14px 0; margin: 10px 16px; }
+
+/* 手机（≤620px）侧栏整个隐藏：折叠按钮没意义，折叠态也不能留出幽灵边距 */
+@media (max-width: 620px) {
+  .sidebar-toggle { display: none; }
+  .app-shell.sidebar-collapsed > .el-container { margin-left: 0; }
+}
+
 .brand { height: 76px; display: flex; align-items: center; gap: 12px; padding: 0 22px; border-bottom: 1px solid rgba(255, 255, 255, .07); }
 .brand-mark {
   width: 38px; height: 38px; display: grid; place-items: center;
