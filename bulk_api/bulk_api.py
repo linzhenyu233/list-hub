@@ -239,6 +239,7 @@ def _ensure_db_schema():
             _migrate_add_order_buyer_columns(conn)
             _migrate_add_product_image_column(conn)
             _migrate_add_product_stats_columns(conn)
+            _migrate_add_category_platform_columns(conn)
             _rebuild_multishop_tables(conn)
             _reassign_legacy_shop(conn)
             _create_indexes(conn)
@@ -275,7 +276,7 @@ def _create_tables(conn):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         shop_id TEXT NOT NULL,
         internal_category TEXT NOT NULL,
-        wechat_json TEXT, xhs_json TEXT, updated_at TEXT,
+        wechat_json TEXT, xhs_json TEXT, youzan_json TEXT, updated_at TEXT,
         UNIQUE(shop_id, internal_category)
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS publish_jobs (
@@ -513,6 +514,17 @@ def _table_sql(conn, table):
     return row["sql"] if row and row["sql"] else None
 
 
+def _migrate_add_category_platform_columns(conn):
+    """category_aliases 补「新平台」的映射列（接平台时逐个加，老库需要）。
+
+    ⚠️ 必须在 `_rebuild_multishop_tables` **之前**执行：
+       重建时要从 legacy 表 SELECT 这些列，列不存在会直接报 no such column。
+
+    加列是纯追加（TEXT，可为空），对既有微信/小红书映射零影响。
+    """
+    _safe_add_column(conn, "category_aliases", "youzan_json TEXT")
+
+
 def _rebuild_multishop_tables(conn):
     """重建仍带「单店时代唯一约束」的表。
 
@@ -544,11 +556,11 @@ def _rebuild_multishop_tables(conn):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 shop_id TEXT NOT NULL,
                 internal_category TEXT NOT NULL,
-                wechat_json TEXT, xhs_json TEXT, updated_at TEXT,
+                wechat_json TEXT, xhs_json TEXT, youzan_json TEXT, updated_at TEXT,
                 UNIQUE(shop_id, internal_category)
             )""")
-            conn.execute("""INSERT INTO category_aliases(id,shop_id,internal_category,wechat_json,xhs_json,updated_at)
-                SELECT id,shop_id,internal_category,wechat_json,xhs_json,updated_at
+            conn.execute("""INSERT INTO category_aliases(id,shop_id,internal_category,wechat_json,xhs_json,youzan_json,updated_at)
+                SELECT id,shop_id,internal_category,wechat_json,xhs_json,youzan_json,updated_at
                 FROM category_aliases_legacy""")
             conn.execute("DROP TABLE category_aliases_legacy")
 
@@ -732,10 +744,21 @@ def fit_xhs_title(title):
     return text
 
 
+def fit_youzan_title(title):
+    """有赞标题压到合法长度。
+
+    ★待核对：有赞未给出"标题多少字"的确定上限（docs §11-★5），这里先按 60 个字符
+    与微信对齐。有赞对过短标题没有硬要求，所以不做"短文补词"（小红书的补词逻辑是平台规则）。
+    真机报"标题过长/过短"时，只改这个函数与适配器的 title_fit_max。
+    """
+    return str(title or "")[:60]
+
+
 # 平台 → 发布前的标题长度兜底函数。新平台先补 fit_* 再在这里登记，否则 platform_title 会 fail fast。
 _TITLE_FITTERS = {
     "wechat": fit_wechat_title,
     "xhs": fit_xhs_title,
+    "youzan": fit_youzan_title,
 }
 
 
@@ -903,7 +926,11 @@ def _platform_image(platform, source_url, shop_id=None):
     if response.get("ok") is False: raise RuntimeError(str(response.get("detail") or response)[:500])
     result = response.get("result")
     if isinstance(result, str): platform_url = result
-    else: platform_url = (result or {}).get("url") or (result or {}).get("materialUrl") or (result or {}).get("fileUrl") or (result or {}).get("img_url")
+    else: platform_url = ((result or {}).get("url") or (result or {}).get("materialUrl")
+                          or (result or {}).get("fileUrl") or (result or {}).get("img_url")
+                          # 有赞：商品接口只收素材 ID（image_ids），所以这里缓存的是 image_id，
+                          # 不是可访问 URL（平台侧素材 ID 本来就不可外链，能拼进 payload 即可）。
+                          or (result or {}).get("image_id"))
     if not platform_url: raise RuntimeError(f"{platform} 图片上传未返回地址")
     conn = db()
     conn.execute("INSERT OR REPLACE INTO image_upload_cache(shop_id,platform,source_hash,source_url,platform_url,updated_at) VALUES(?,?,?,?,?,?)",
@@ -966,7 +993,8 @@ def _upload_image_uncached(platform, source_url, shop_id=None):
     if isinstance(result, str):
         return result
     return ((result or {}).get("url") or (result or {}).get("materialUrl")
-            or (result or {}).get("fileUrl") or (result or {}).get("img_url") or "")
+            or (result or {}).get("fileUrl") or (result or {}).get("img_url")
+            or (result or {}).get("image_id") or "")
 
 
 def _upload_sku_images(platform, skus, shop_id=None):
@@ -1125,6 +1153,89 @@ def _xhs_payload(product, mapping, group_config=None, shop_id=None):
     return {"item": item, "sku_list": sku_list}
 
 
+def _youzan_price(amount_yuan):
+    """中台价格（元）→ 有赞价格。
+
+    ⚠️ 有赞 item.create 的 price 官方注明"单位:元"（与微信/小红书的"分"不同）。
+    换算走适配器的 price_unit，不在业务代码里写死 —— 否则平台改口径时两处会打架。
+    """
+    value = platform_registry.price_to_platform("youzan", amount_yuan)
+    return round(float(value or 0), 2)
+
+
+def _youzan_payload(product, mapping, group_config=None, shop_id=None):
+    """组装有赞 item.create 的请求体。
+
+    ⚠️ 字段名与结构属 `*` 待核对项（docs/有赞平台适配实施方案.md §11-★2）：
+    **本函数是有赞发布口径的唯一改动点**，联调时对着官方文档逐字校正即可。
+
+    与微信/小红书的三点不同：
+      1. 主图只收素材 ID（``image_ids``，逗号分隔 ≤15 张）——
+         URL 已在 _platform_image 阶段换成了 image_id；
+      2. ``price`` / ``quantity`` 是**商品级**必填（多规格商品另有 sku_list）；
+      3. ``desc`` 必填且要求 >5 个字符，货盘通常没有描述 → 用标题合成，不写回货盘。
+    """
+    cid = mapping.get("youzan_cid") or mapping.get("youzan_category_id")
+    if not cid:
+        raise RuntimeError("未配置有赞类目")
+    template_id = mapping.get("youzan_delivery_template_id") or mapping.get("delivery_template_id")
+    if not template_id:
+        raise RuntimeError("未选择有赞运费模板")
+    images = [str(u).strip() for u in (product.get("main_images") or []) if str(u or "").strip()]
+    if not images:
+        raise RuntimeError("有赞商品至少需要一张主图")
+
+    title = platform_title(product, mapping, "youzan")
+    description = str(product.get("description") or "").strip()
+    if len(description) < 6:
+        description = f"{title}｜商品详情以实物与平台规格为准"
+
+    item = {
+        "title": title,
+        "desc": description,
+        "image_ids": ",".join(images[:15]),
+        "cid": str(cid),
+        "delivery_template_id": str(template_id),
+        # 商家编码：ID 回填与"重发去重"都靠它（对应有赞 items.custom.get 的查询键）
+        "item_no": product.get("product_code"),
+    }
+
+    skus = []
+    for sku in product.get("skus", []):
+        item_sku = {
+            "price": _youzan_price(sku.get("price")),
+            "quantity": int(float(sku.get("stock") or 0)),
+            "sku_no": sku.get("sku_code"),
+        }
+        if sku.get("uploaded_sku_image"):
+            item_sku["image_id"] = sku["uploaded_sku_image"]      # ★字段名待核对
+        skus.append(item_sku)
+    if skus:
+        item["sku_list"] = skus
+        # 商品级 price/quantity 同样是必填：取首个 SKU 价 + 库存合计兜底
+        # （多规格时平台以 sku_list 为准，这两个值只影响后台列表展示）
+        item["price"] = skus[0]["price"]
+        item["quantity"] = sum(one["quantity"] for one in skus)
+    else:
+        item["price"] = _youzan_price(product.get("price"))
+        item["quantity"] = int(float(product.get("stock") or 0))
+
+    # 规格维度（"颜色/重量"这类）：货盘 specs → 有赞 sku_properties（★结构待核对）
+    properties = {}
+    for sku in product.get("skus", []):
+        for spec in sku.get("specs") or []:
+            name = str(spec.get("name") or "").strip()
+            value = str(spec.get("value") or "").strip()
+            if name and value:
+                properties.setdefault(name, [])
+                if value not in properties[name]:
+                    properties[name].append(value)
+    if properties:
+        item["sku_properties"] = [{"name": name, "values": [{"name": v} for v in values]}
+                                  for name, values in properties.items()]
+    return item
+
+
 # 跨店发布：任务(job)里存了目标店的店铺私有参数，执行时必须覆盖批次里的来源店参数，
 # 否则会把来源店的运费模板/物流方案/品牌发给目标店（平台会拒：模板不属于该店）。
 # 只覆盖这 4 个「按店不同」的键；类目/属性/SKU规格是平台级的，跨店通用，绝不能动。
@@ -1133,6 +1244,7 @@ _SHOP_SCOPED_MAPPING_KEYS = (
     "xhs_shipping_template_id",     # 小红书运费模板
     "xhs_logistics_plan_id",        # 小红书物流方案
     "xhs_brand_id",                 # 小红书品牌
+    "youzan_delivery_template_id",  # 有赞运费模板（每店不同）
 )
 
 
@@ -1225,11 +1337,32 @@ def _publish_xhs(product, mapping, group_config, shop_id):
     return value
 
 
+def _publish_youzan(product, mapping, group_config, shop_id):
+    """有赞发布：一个接口创建商品（含 SKU）。
+
+    返回体归一：有赞返回 item_id / sku_ids（★字段名待核对），这里补一个中台通用的
+    ``product_id`` 键，让 publish_items.platform_product_id 的写入与别家平台一致。
+    """
+    product = _prepare_platform_images(product, "youzan", shop_id=shop_id)
+    path = platform_registry.adapter("youzan")["publish_path"]
+    result = _json_post(f"{YOUZAN_API_BASE}{path}",
+                        _youzan_payload(product, mapping, group_config, shop_id), shop_id=shop_id)
+    if result.get("ok") is False:
+        raise RuntimeError(str(result.get("detail") or result)[:500])
+    value = result.get("result")
+    if isinstance(value, dict):
+        if value.get("item_id") and not value.get("product_id"):
+            value["product_id"] = value["item_id"]
+        return value
+    return {"product_id": value}
+
+
 # 平台 → 发布处理器。接新平台 = 在 platform_registry 加一条适配器 + 在这里加一个 _publish_<平台>，
 # 不需要在编排层再加 if 分支（分支一旦漏掉就会走到"当成别家平台发布"）。
 _PUBLISH_HANDLERS = {
     "wechat": _publish_wechat,
     "xhs": _publish_xhs,
+    "youzan": _publish_youzan,
 }
 
 
@@ -1416,6 +1549,7 @@ class AliasBody(BaseModel):
     internal_category: str
     wechat: dict | None = None
     xhs: dict | None = None
+    youzan: dict | None = None
 
 
 class AliasImportBody(BaseModel):
@@ -3261,6 +3395,14 @@ ORDER_STATUS_GROUPS = {
         "finished": (100,),                   # 已完成
     },
     "xhs": {"unpaid": (), "pending_ship": (), "shipped": (), "finished": ()},
+    # 有赞：status 是**字符串枚举**（不是数字码），★枚举值待真机核对（docs §11-★8）。
+    # 未列出的状态会被当成"既未付款也未完成"，不会算进任何一个口径 —— 宁可少算不猜。
+    "youzan": {
+        "unpaid": ("WAIT_BUYER_PAY", "TRADE_CLOSED"),        # 待付款 / 交易关闭
+        "pending_ship": ("WAIT_SELLER_SEND_GOODS",),         # 待发货
+        "shipped": ("WAIT_BUYER_CONFIRM_GOODS",),            # 待收货（已发货）
+        "finished": ("TRADE_SUCCESS",),                      # 交易成功
+    },
 }
 # 退款「已完成」的状态值（微信：官方枚举；小红书：字段名带 SUCCESS 语义，待真机核对）
 REFUND_DONE_STATUS = {
@@ -3268,9 +3410,16 @@ REFUND_DONE_STATUS = {
 }
 # 金额单位：微信=分（官方文档），小红书=元（字段名 refundAmountYuan 暗示「元」，待真机核对）
 # 订单「支付金额」单位：实测小红书订单详情 totalPayAmount 也是**分**（109900 = 1099.00 元）
-ORDER_AMOUNT_UNIT = {"wechat": "cent", "xhs": "cent"}
+# 有赞：★待真机对账一次（item.create 的 price 确定是「元」，订单金额字段须实测确认；
+#       写错不会报错，只会让面板金额放大/缩小 100 倍）。
+ORDER_AMOUNT_UNIT = {"wechat": "cent", "xhs": "cent", "youzan": "yuan"}
 # 售后退款金额单位与订单不同：小红书字段名 refundAmountYuan/expectedRefundAmountYuan 带 Yuan → 元
-REFUND_AMOUNT_UNIT = {"wechat": "cent", "xhs": "yuan"}
+REFUND_AMOUNT_UNIT = {"wechat": "cent", "xhs": "yuan", "youzan": "yuan"}
+# 售后（退款）只读接口已接入的平台。
+# ⚠️ 有赞的售后接口名仍是待核对项（docs §11-★9）：在确认之前**不去打**它的服务 ——
+#    否则要么 404 让整个订单同步失败，要么静默把退款金额记成 0 而页面看不出原因。
+#    核对完成后把它加进来即可（同时要在 youzan_api.py 补 /aftersales 路由）。
+_AFTERSALE_PLATFORMS = ("wechat", "xhs")
 ORDER_SYNC_MAX_PAGES = 20          # 单日单平台最多翻 20 页，防止异常时无限翻页
 # 单日单店最多补几条订单详情（小红书列表缺金额/下单时间，只能逐单补；防止把平台限流打满）。
 # 定 200 的原因：实测一天可能有几十单，30 会把大半天数漏成"金额不全"（面板数字偏小且不显眼），
@@ -3304,12 +3453,22 @@ def _to_yuan(platform, value, unit_map=None):
 
 
 def _to_epoch_seconds(value):
-    """平台时间戳 → 秒（拿不到返回 0）。
+    """平台时间 → 秒（拿不到返回 0）。三种形态都要吃下：
 
-    实测坑：**小红书的时间戳是毫秒**（如 1791152601107），微信是秒。
-    不归一化就会拿"秒级区间"去比"毫秒值"，结果永远不在区间内 ——
-    线上表现是"小红书订单/售后拉到了、指标全是 0"。
+    - **秒级时间戳**（微信）
+    - **毫秒时间戳**（小红书：如 1791152601107）
+    - **"YYYY-MM-DD HH:MM:SS" 字符串**（有赞订单接口的时间字段是字符串，不是时间戳）
+
+    不归一化就会拿"秒级区间"去比另一种刻度，结果永远不在区间内 ——
+    线上表现是"订单拉到了、指标全是 0"（小红书踩过一次，有赞会以字符串形式再踩一次）。
     """
+    if isinstance(value, str) and value.strip() and not value.strip().isdigit():
+        text = value.strip().replace("T", " ")[:19]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return int(time.mktime(time.strptime(text, fmt)))
+            except (ValueError, OverflowError):
+                continue
     try:
         ts = int(float(value or 0))
     except (TypeError, ValueError):
@@ -3326,8 +3485,13 @@ def _day_bounds(stat_date):
     return start, start + 86400
 
 
+# 平台 → 订单只读服务地址。
+# ⚠️ 这里原来是 `WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE` 的二元判断：
+#    接第三个平台时会把有赞的订单请求**静默打到小红书服务**（404 或拿错数据都不报错），
+#    所以改成查表 + 适配器兜底。
 def _order_api_base(platform):
-    return WECHAT_API_BASE if platform == "wechat" else XHS_API_BASE
+    return {"wechat": WECHAT_API_BASE, "xhs": XHS_API_BASE,
+            "youzan": YOUZAN_API_BASE}.get(platform) or platform_registry.api_base(platform)
 
 
 # —— 「商品明细」面板的订单级数据 ————————————————————————————————
@@ -3489,7 +3653,8 @@ def _order_detail_rows(platform, shop_id, stat_date):
         if detail_note:
             notes.append(detail_note)
     except Exception as exc:  # noqa: BLE001
-        return [], [f"{_shop_display_name(shop_id)}/{platform}：订单拉取失败（{str(exc)[:80]}）"]
+        return [], [f"{_shop_display_name(shop_id)}/{platform}：订单拉取失败"
+                    f"（{_http_error_message(exc)[:120]}）"]
     if len(orders) > ORDER_DETAIL_MAX_ORDERS:
         total = len(orders)
         orders = orders[:ORDER_DETAIL_MAX_ORDERS]
@@ -3533,7 +3698,14 @@ def _fetch_orders(platform, shop_id, start, end):
 
 
 def _fetch_aftersales(platform, shop_id, start, end):
-    """拉某平台某天的售后（退款）摘要。"""
+    """拉某平台某天的售后（退款）摘要。
+
+    ⚠️ 只对 `_AFTERSALE_PLATFORMS` 里的平台发请求：未接入售后的平台（当前是有赞）
+    直接返回空，由 sync_order_metrics 在 notes 里写明"退款按 0 计"，
+    **不静默当成"这天没有退款"**，也不去赌一个还没核对的接口名。
+    """
+    if platform not in _AFTERSALE_PLATFORMS:
+        return []
     base = _order_api_base(platform)
     aftersales = []
     if platform == "wechat":
@@ -3665,7 +3837,8 @@ def _aggregate_order_day(platform, orders, aftersales, start, end):
             if buyer_key:
                 paid_buyer_keys.add(buyer_key)
         if status in finished:
-            done_ts = _to_epoch_seconds(order.get("confirm_receipt_time"))
+            # 微信用 confirm_receipt_time（确认收货时间），有赞用 success_time（已归一成 finish_time）
+            done_ts = _to_epoch_seconds(order.get("confirm_receipt_time") or order.get("finish_time"))
             if start <= done_ts < end:
                 dealt_orders += 1
         if status in pending_ship or status in shipped:
@@ -3908,6 +4081,9 @@ def sync_order_metrics(shop_id, platform, stat_date):
         status_map_ready = True
         note_parts = ["小红书按 paidTime/finishTime 判断状态（平台未公开状态码表），"
                       "支付金额取订单详情 totalPayAmount(分)"]
+    if platform not in _AFTERSALE_PLATFORMS:
+        # 有赞：售后接口名待核对（docs §11-★9）。明说"退款按 0 计"，别让页面看着像"没有退款"。
+        note_parts.append("该平台售后接口未接入：退款金额按 0 计（接口名待核对后补齐）")
     try:
         orders = _fetch_orders(platform, shop_id, start, end)
         aftersales = _fetch_aftersales(platform, shop_id, start, end)
@@ -3925,7 +4101,7 @@ def sync_order_metrics(shop_id, platform, stat_date):
             "actual_income": 0.0, "actual_orders": 0, "refund_rate": 0.0,
             "paid_buyers": 0, "created_buyers": 0,
         }
-        error = str(exc)[:300]
+        error = _http_error_message(exc)[:300]
     stats, stats_source = {}, None
     try:
         stats = _fetch_shop_overview(platform, shop_id, stat_date)
@@ -3990,6 +4166,21 @@ def order_platforms(shop_id):
         except Exception:  # noqa: BLE001
             continue
     return result
+
+
+def _detail_targets(shop_id, platform=""):
+    """明细查询该打哪些平台。
+
+    ``platform`` 为空 = 该店已配的全部平台（走 order_platforms，天然安全）；
+    显式指定时**必须该店确实配了这个平台**才打 —— 否则会给"只配了小红书"的店
+    打微信订单接口，微信服务直接回 400（detail:「店铺 xx 未配置微信小店凭证」），
+    明细表底下就多出一串「订单拉取失败（HTTP Error 400）」的噪音。
+    ⚠️ 导出路径（_export_order_rows）早就修过同一个坑，区间/单日明细这里当时漏了。
+    """
+    configured = order_platforms(shop_id)
+    if not platform:
+        return configured
+    return [platform] if platform in configured else []
 
 
 def sync_orders_range(shop_id, start_date, end_date, platforms=None, on_progress=None):
@@ -4094,11 +4285,14 @@ def _sync_job_public(job):
         "percent": round(job["done"] * 100 / job["total"], 1) if job["total"] else 0.0,
         "synced": job["synced"], "failed": job["failed"],
         "errors": job["errors"], "message": job["message"],
+        # 因为"该店没配这个平台"被排除掉的组合（如选了微信、但某店只有小红书），
+        # 让面板能说清楚它们为什么没进这次同步，而不是让人以为漏同步了。
+        "skipped": job.get("skipped") or [],
         "started_at": job["started_at"], "finished_at": job["finished_at"],
     }
 
 
-def _sync_job_create(start, end, shop_ids, targets_by_shop):
+def _sync_job_create(start, end, shop_ids, targets_by_shop, skipped=None):
     """登记一个手动同步任务（status=running）。"""
     job_id = uuid.uuid4().hex[:12]
     platforms = sorted({p for targets in targets_by_shop.values() for p in targets})
@@ -4106,6 +4300,7 @@ def _sync_job_create(start, end, shop_ids, targets_by_shop):
         "job_id": job_id, "status": "running",
         "range": {"start": start, "end": end},
         "shops": list(shop_ids), "platforms": platforms,
+        "skipped": list(skipped or []),
         # 总步数 = Σ(每家平台数 × 天数)，前端拿它算百分比
         "total": sum(len(targets) * _sync_job_days(start, end) for targets in targets_by_shop.values()),
         "done": 0, "current": "", "synced": 0, "failed": 0, "errors": [],
@@ -4175,20 +4370,28 @@ def orders_sync(body: OrderSyncBody, request: Request):
             raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{value}")
     if start > end:
         raise HTTPException(400, "开始日期不能晚于结束日期")
-    # 逐店解析目标平台：某家店没配订单平台就跳过，不因为其中一家没配就整批失败
+    # 逐店解析目标平台：某家店没配订单平台就跳过，不因为其中一家没配就整批失败。
+    # ⚠️ 显式 platforms 也要按"该店实际配了没"过滤（_detail_targets）：否则选了微信 +
+    # 全部店铺，会给只配了小红书的两家店打微信订单接口 → 平台 400，同步结果里凭空多出
+    # 一堆"订单拉取失败（HTTP Error 400）"（实测踩过）。
     targets_by_shop = {}
+    skipped = []
     for shop_id in shop_ids:
         targets = [p for p in (body.platforms or order_platforms(shop_id))
-                   if platform_registry.is_platform(p)]
+                   if platform_registry.is_platform(p) and _detail_targets(shop_id, p)]
         if targets:
             targets_by_shop[shop_id] = targets
+        for platform in (body.platforms or ()):
+            if platform_registry.is_platform(platform) and not _detail_targets(shop_id, platform):
+                skipped.append({"shop_id": shop_id, "shop": _shop_display_name(shop_id),
+                                "platform": platform})
     if not targets_by_shop:
         raise HTTPException(400, "所选店铺都没有可同步订单的平台（未配置凭证，或平台未声明 orders 能力）")
     with _ORDER_SYNC_JOBS_LOCK:
         running = [job for job in _ORDER_SYNC_JOBS.values() if job["status"] == "running"]
     if running:
         return {"ok": True, "result": {**_sync_job_public(running[0]), "reused": True}}
-    job = _sync_job_create(start, end, shop_ids, targets_by_shop)
+    job = _sync_job_create(start, end, shop_ids, targets_by_shop, skipped=skipped)
     threading.Thread(target=_run_sync_job, args=(job["job_id"], targets_by_shop, start, end),
                      name=f"order-sync-{job['job_id']}", daemon=True).start()
     print(f"[orders] 手动同步任务 {job['job_id']} 启动：{start}~{end}，"
@@ -4518,7 +4721,8 @@ EXPORT_METRIC_NOTES = [
     ("下单买家数", "按订单创建时间去重买家自算（两个平台都没有店铺级的官方人数接口）"),
     ("支付买家数", "微信取罗盘「成交人数」；小红书用订单里的买家标识当天去重自算（不落库）"),
     ("支付转化率", "支付买家数 ÷ 商品点击人数（**下单之前**的转化，近似口径；小红书分母缺失 → 「—」）"),
-    ("汇总支付金额 / 汇总成交笔数", "同一周期内**各平台合计**（表内已纵向合并）"),
+    ("汇总支付金额 / 汇总成交笔数", "同一周期内**各平台合计**（表内已纵向合并）；"
+                    "汇总成交笔数与支付笔数同口径，取各平台支付笔数相加"),
     ("实际收入 / 实际笔数", "存量口径：该日创建、**截至最近一次同步**仍未完成的订单金额与笔数。"
                     "所以只在当天/次日同步时抓得到；事后补同步会显示 0（订单早已完成或退款）"),
     ("退款率", "退款金额 ÷ 支付金额"),
@@ -4608,7 +4812,9 @@ def _export_summary_rows(views, granularity):
         # 跨平台合计：只在每组第一行写值，其余留空，由调用方合并单元格
         bucket_totals = _sum_views(period_views)
         rows[bucket_start - 1]["sum_paid"] = bucket_totals["paid_amount"]
-        rows[bucket_start - 1]["sum_dealt"] = bucket_totals["dealt_orders"]
+        # 汇总成交笔数 = 该周期各平台**支付笔数**合计：运营确认"成交笔数"与"支付笔数"
+        # 是同一回事；原先取罗盘「确认收货成交」，小红书没有这个口径恒为 0，整列全 0
+        rows[bucket_start - 1]["sum_dealt"] = bucket_totals["paid_orders"]
         if len(bucket_platforms) > 1:
             for key in ("seq", "period", "week_seg", "sum_paid", "sum_dealt", "analysis"):
                 merge_ranges.append((key, bucket_start, len(rows)))
@@ -4622,6 +4828,9 @@ EXPORT_ORDER_DETAIL_MAX = 20
 # 超时就跳过这些天并在表里写明（宁可清单少几天，也不要让人等十分钟）。
 EXPORT_DETAIL_FETCH_WORKERS = 6
 EXPORT_DETAIL_FETCH_TIMEOUT = 45
+# 明细面板「交易明细」的区间查询一次最多看多少天：防误选一年把请求拖爆。
+# 同步过的天都是本地读（不慢）；慢的是没同步过的天，那部分走上面的并发+总超时保护。
+DETAIL_RANGE_MAX_DAYS = 62
 
 
 def _export_order_rows(shop_ids, platform, start, end):
@@ -4793,7 +5002,7 @@ def orders_metrics_export(request: Request, start: str = Query(""), end: str = Q
         "created_buyers": (sum(row["created_buyers"] for row in summary_rows
                                if isinstance(row["created_buyers"], (int, float))) or None),
         "paid_orders": totals["paid_orders"], "sum_paid": totals["paid_amount"],
-        "sum_dealt": totals["dealt_orders"], "refund_amount": totals["refund_amount"],
+        "sum_dealt": totals["paid_orders"], "refund_amount": totals["refund_amount"],
         "actual_income": totals["actual_income"], "actual_orders": totals["actual_orders"],
         "refund_rate": totals["refund_rate"], "analysis": None}
     write_row(sheet, summary_columns, total_row, bold=True)
@@ -4836,6 +5045,7 @@ def orders_metrics_export(request: Request, start: str = Query(""), end: str = Q
         orders, order_notes = _export_order_rows(shop_ids, target, start, end)
         export_notes.extend(order_notes)
         write_header(order_sheet, EXPORT_ORDER_COLUMNS)
+        order_first_data_row = order_sheet.max_row + 1   # 数据从表头下一行开始（标题行占第 1 行）
         amount_sum = 0.0
         qty_sum = 0
         for index, row in enumerate(orders, start=1):
@@ -4860,6 +5070,36 @@ def orders_metrics_export(request: Request, start: str = Query(""), end: str = Q
             "order_no": f"合计（{len(orders)} 笔）", "paid_amount": round(amount_sum, 2),
             "item_qty": qty_sum, "item_title": None, "status_text": None,
             "refund_reason": None, "remark": None}, bold=True)
+        # 月段/周段：相邻同值的单元格纵向合并成一格（对齐参考表的读法）。清单按时间
+        # 倒序写，同月同周的订单必然相邻，只看相邻即可。周段要带上月份一起分组：
+        # 周段跨月会重新从第一周起算，不同月的两个"第一周"不是同一段，不能并成一格。
+        # 合计行、没有创建时间的行（值为 None）不参与合并。
+        seg_keys = []
+        for row in orders:
+            created = datetime.fromtimestamp(row["create_ts"]) if row.get("create_ts") else None
+            seg_keys.append((f"{created.month}月" if created else None,
+                             _month_week_seg(created)))
+        order_column_index = {col[0]: i for i, col in enumerate(EXPORT_ORDER_COLUMNS, start=1)}
+
+        def merge_equal_runs(letter, position):
+            """把 seg_keys 第 position 位连续相同的行合并成一个单元格。"""
+            run_start = 0
+            for i in range(1, len(seg_keys) + 1):
+                head = seg_keys[run_start][position]
+                same = (i < len(seg_keys) and seg_keys[i][position] == head
+                        and (position == 0 or seg_keys[i][0] == seg_keys[run_start][0]))
+                if same:
+                    continue
+                if head is not None and i - run_start > 1:
+                    top = order_first_data_row + run_start
+                    order_sheet.merge_cells(
+                        f"{letter}{top}:{letter}{order_first_data_row + i - 1}")
+                    order_sheet[f"{letter}{top}"].alignment = Alignment(
+                        horizontal="center", vertical="center")
+                run_start = i
+
+        merge_equal_runs(get_column_letter(order_column_index["month_seg"]), 0)
+        merge_equal_runs(get_column_letter(order_column_index["week_seg"]), 1)
         apply_widths(order_sheet, EXPORT_ORDER_COLUMNS)
 
     # ——————————————— ④ 口径说明 ————————————————————————
@@ -5017,16 +5257,19 @@ def _product_stats_note(rows):
 
 
 @app.get("/orders/details")
-def orders_details(request: Request, date: str = Query("", description="YYYY-MM-DD；不传=今天"),
+def orders_details(request: Request, date: str = Query("", description="YYYY-MM-DD；单日模式"),
+                   start: str = Query("", description="YYYY-MM-DD；区间模式开始（与 end 至少给一个，优先于 date）"),
+                   end: str = Query("", description="YYYY-MM-DD；区间模式结束"),
                    platform: str = Query("", description="wechat / xhs；不传=该店已配的全部平台"),
                    shop: str = Query("", description="店铺范围：all=全部店铺汇总；不传=跟随当前店铺"),
                    keyword: str = Query("", description="按订单编号/订单号模糊搜"),
                    limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0)):
-    """【商品明细】某一天的**订单级**明细（面板下方那张表的数据源）。
+    """【商品明细】订单级明细（面板下方那张表的数据源）：支持单日（date）或区间（start/end）。
 
     和 /orders/metrics 的区别：那个是按天聚合的日报，这个是逐笔订单。
-    ⚠️ 中台不落订单明细表，所以这里是**实时**调平台订单接口（带 5 分钟内存缓存，
-       翻页/搜单号不会重复打平台）。小红书还要逐单补详情，会明显慢一点。
+    **本地优先**：同步过的天直接读 SQLite（毫秒级）；没同步过的天才实时打平台接口
+    （带 5 分钟内存缓存，区间模式下并发拉 + 总超时，超时的天跳过并在 notes 写明）。
+    区间最长 62 天，超出自动截断并在 notes 里说明。
     店铺范围沿用面板自己的 shop 参数（'all'=全部店铺汇总），与顶栏当前店铺解耦。
     """
     stat_date = date or datetime.now().strftime("%Y-%m-%d")
@@ -5038,12 +5281,77 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
         raise HTTPException(400, f"未知平台：{platform}")
     shop_ids = _metric_shop_scope(request, shop)
     rows, notes = [], []
-    for shop_id in shop_ids:
-        targets = [platform] if platform else order_platforms(shop_id)
-        for target in targets:
-            day_rows, day_notes = _order_detail_rows(target, shop_id, stat_date)
-            rows.extend(day_rows)
-            notes.extend(day_notes)
+    # 显式筛了平台、但某家店压根没配这个平台 → 跳过该店（下面写进 notes 说明原因）
+    skipped_shops = []
+    # 区间模式（start/end 任传一个即生效；只传一个就当单日查）
+    range_mode = bool(start or end)
+    range_first = range_last = stat_date
+    if range_mode:
+        first = start or end
+        last = end or start
+        try:
+            first_day = datetime.strptime(first, "%Y-%m-%d").date()
+            last_day = datetime.strptime(last, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, f"日期格式应为 YYYY-MM-DD：{first} ~ {last}")
+        if first_day > last_day:
+            first_day, last_day = last_day, first_day
+        if (last_day - first_day).days + 1 > DETAIL_RANGE_MAX_DAYS:
+            last_day = first_day + timedelta(days=DETAIL_RANGE_MAX_DAYS - 1)
+            notes.append(f"区间最长 {DETAIL_RANGE_MAX_DAYS} 天，已截断到 {last_day.strftime('%Y-%m-%d')}")
+        range_first = first_day.strftime("%Y-%m-%d")
+        range_last = last_day.strftime("%Y-%m-%d")
+        days = [(first_day + timedelta(days=off)).strftime("%Y-%m-%d")
+                for off in range((last_day - first_day).days + 1)]
+        live = []
+        for shop_id in shop_ids:
+            targets = _detail_targets(shop_id, platform)
+            if platform and not targets:
+                skipped_shops.append(_shop_display_name(shop_id))
+                continue
+            for target in targets:
+                for day in days:
+                    local = _local_order_rows(shop_id, target, day)
+                    if local:
+                        rows.extend(local)
+                    else:
+                        live.append((target, shop_id, day))
+        if live:
+            notes.append(f"区间里有 {len(live)} 个「店×平台×天」没同步过明细，正在实时向平台拉取；"
+                         f"先点「同步数据」再查可秒出")
+            deadline = time.time() + EXPORT_DETAIL_FETCH_TIMEOUT
+            with ThreadPoolExecutor(max_workers=EXPORT_DETAIL_FETCH_WORKERS) as pool:
+                futures = {pool.submit(_order_detail_rows, target, shop_id, day): (target, shop_id, day)
+                           for target, shop_id, day in live}
+                for future in as_completed(futures, timeout=max(1, deadline - time.time())):
+                    try:
+                        day_rows, day_notes = future.result()
+                    except Exception as exc:  # noqa: BLE001  单天失败不影响整张表
+                        target, shop_id, day = futures[future]
+                        day_rows, day_notes = [], [f"{_shop_display_name(shop_id)}/{target}/{day}"
+                                                   f" 拉取失败（{_http_error_message(exc)[:80]}）"]
+                    rows.extend(day_rows)
+                    notes.extend(day_notes)
+            # 超时未返回的天直接跳过（线程池退出时会等它们，但查询不再空等）
+            pending = sum(1 for f in futures if not f.done())
+            if pending:
+                notes.append(f"有 {pending} 个「店×平台×天」实时拉取超时已跳过，"
+                             f"点「同步数据」后重查可补全")
+        # 各天各自倒序，拼起来不保证全局有序：统一按支付/创建时间倒序
+        rows.sort(key=lambda row: row.get("pay_ts") or row.get("create_ts") or 0, reverse=True)
+    else:
+        for shop_id in shop_ids:
+            targets = _detail_targets(shop_id, platform)
+            if platform and not targets:
+                skipped_shops.append(_shop_display_name(shop_id))
+                continue
+            for target in targets:
+                day_rows, day_notes = _order_detail_rows(target, shop_id, stat_date)
+                rows.extend(day_rows)
+                notes.extend(day_notes)
+    if skipped_shops:
+        notes.append(f"{'、'.join(skipped_shops)} 未配置{platform_registry.platform_label(platform)}凭证，"
+                     f"已跳过（在「店铺管理」补好凭证后直接可查，不必先同步）")
     keyword = str(keyword or "").strip()
     if keyword:
         low = keyword.lower()
@@ -5053,7 +5361,8 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
     total = len(rows)
     page = rows[offset:offset + limit]
     return {"ok": True, "result": {
-        "date": stat_date, "rows": page, "total": total,
+        "date": stat_date, "start": range_first, "end": range_last,
+        "rows": page, "total": total,
         "limit": limit, "offset": offset,
         "platforms": sorted({row["platform"] for row in rows}),
         "shops": sorted({row["shop_id"] for row in rows}),
@@ -5328,6 +5637,18 @@ def _http_error_detail(exc):
         return str(exc)[:500]
 
 
+def _http_error_message(exc):
+    """异常 → 能给运营看的文案。
+
+    ⚠️ urllib 的 HTTPError 直接 ``str()`` 只有 "HTTP Error 400: Bad Request"，
+    真实原因（"店铺 xx 未配置微信小店凭证"之类）在响应体的 detail 里。
+    直接把 str(exc) 写进面板，看的人只知道是个 400，完全不知道错在哪（实测踩过）。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"平台服务返回 {exc.code}：{_http_error_detail(exc)}"
+    return str(exc)
+
+
 def platform_item_state(platform, product_id, shop_id=None):
     """核对该商品在平台上还在不在, 返回 (state, 说明)。
 
@@ -5566,7 +5887,7 @@ def list_aliases(request: Request):
         if entry is None:
             entry = merged[key] = {
                 "id": r["id"], "internal_category": key, "shop_id": r["shop_id"],
-                "wechat": None, "xhs": None, "updated_at": r["updated_at"],
+                "wechat": None, "xhs": None, "youzan": None, "updated_at": r["updated_at"],
                 "shop_ids": [],
             }
         entry["shop_ids"].append(r["shop_id"])
@@ -5574,6 +5895,8 @@ def list_aliases(request: Request):
             entry["wechat"] = json.loads(r["wechat_json"])
         if entry["xhs"] is None and r["xhs_json"]:
             entry["xhs"] = json.loads(r["xhs_json"])
+        if entry["youzan"] is None and r["youzan_json"]:
+            entry["youzan"] = json.loads(r["youzan_json"])
     return {"ok": True, "result": list(merged.values())}
 
 
@@ -5584,22 +5907,26 @@ def save_alias(body: AliasBody, request: Request):
     if not key:
         raise HTTPException(400, "internal_category 不能为空")
     conn = db()
-    existing = conn.execute("SELECT wechat_json, xhs_json FROM category_aliases WHERE shop_id=? AND internal_category=?", (shop_id, key)).fetchone()
+    existing = conn.execute("SELECT wechat_json, xhs_json, youzan_json FROM category_aliases WHERE shop_id=? AND internal_category=?", (shop_id, key)).fetchone()
     # 合并语义:本次未传的一侧保留旧值(微信和小红书经常分两次确认)
     wechat = body.wechat if body.wechat is not None else (json.loads(existing["wechat_json"]) if existing and existing["wechat_json"] else None)
     xhs = body.xhs if body.xhs is not None else (json.loads(existing["xhs_json"]) if existing and existing["xhs_json"] else None)
-    if not wechat and not xhs:
+    youzan = body.youzan if body.youzan is not None else (json.loads(existing["youzan_json"]) if existing and existing["youzan_json"] else None)
+    if not wechat and not xhs and not youzan:
         conn.close()
-        raise HTTPException(400, "wechat 和 xhs 至少提供一个")
+        raise HTTPException(400, "wechat / xhs / youzan 至少提供一个")
     conn.execute(
-        """INSERT INTO category_aliases(shop_id, internal_category, wechat_json, xhs_json, updated_at)
-           VALUES(?,?,?,?,?)
+        """INSERT INTO category_aliases(shop_id, internal_category, wechat_json, xhs_json, youzan_json, updated_at)
+           VALUES(?,?,?,?,?,?)
            ON CONFLICT(shop_id, internal_category) DO UPDATE SET
-             wechat_json=excluded.wechat_json, xhs_json=excluded.xhs_json, updated_at=excluded.updated_at""",
+             wechat_json=excluded.wechat_json, xhs_json=excluded.xhs_json,
+             youzan_json=excluded.youzan_json, updated_at=excluded.updated_at""",
         (shop_id, key, json.dumps(wechat, ensure_ascii=False) if wechat else None,
-         json.dumps(xhs, ensure_ascii=False) if xhs else None, now()))
+         json.dumps(xhs, ensure_ascii=False) if xhs else None,
+         json.dumps(youzan, ensure_ascii=False) if youzan else None, now()))
     conn.commit(); conn.close()
-    return {"ok": True, "result": {"internal_category": key, "wechat": wechat, "xhs": xhs}}
+    return {"ok": True, "result": {"internal_category": key, "wechat": wechat, "xhs": xhs,
+                                   "youzan": youzan}}
 
 
 @app.delete("/category-aliases/{alias_id}")
@@ -5629,6 +5956,7 @@ def delete_alias(alias_id: int, request: Request):
 #    127.0.0.1 是纯 IPv4，行为确定。
 WECHAT_API_BASE = platform_registry.api_base("wechat")
 XHS_API_BASE = platform_registry.api_base("xhs")
+YOUZAN_API_BASE = platform_registry.api_base("youzan")
 
 
 def _http_get_json(url, timeout=60, shop_id=None, extra_headers=None):
@@ -5795,16 +6123,22 @@ def import_aliases(body: AliasImportBody, request: Request):
         conn = db()
         for internal, wechat, xhs in resolved:
             # 合并语义与单条保存一致:本次未解析出的一侧保留旧值
-            existing = conn.execute("SELECT wechat_json, xhs_json FROM category_aliases WHERE shop_id=? AND internal_category=?", (shop_id, internal)).fetchone()
+            existing = conn.execute("SELECT wechat_json, xhs_json, youzan_json FROM category_aliases WHERE shop_id=? AND internal_category=?", (shop_id, internal)).fetchone()
             merged_wechat = wechat or (json.loads(existing["wechat_json"]) if existing and existing["wechat_json"] else None)
             merged_xhs = xhs or (json.loads(existing["xhs_json"]) if existing and existing["xhs_json"] else None)
+            # 批量导入的 Excel 当前只有「微信路径 / 小红书路径」两列，有赞列留待前端改造（Y3）后补；
+            # 这里保留旧值，避免"导一次 Excel 把已配好的有赞映射清空"。
+            merged_youzan = (json.loads(existing["youzan_json"])
+                             if existing and existing["youzan_json"] else None)
             conn.execute(
-                """INSERT INTO category_aliases(shop_id, internal_category, wechat_json, xhs_json, updated_at)
-                   VALUES(?,?,?,?,?)
+                """INSERT INTO category_aliases(shop_id, internal_category, wechat_json, xhs_json, youzan_json, updated_at)
+                   VALUES(?,?,?,?,?,?)
                    ON CONFLICT(shop_id, internal_category) DO UPDATE SET
-                     wechat_json=excluded.wechat_json, xhs_json=excluded.xhs_json, updated_at=excluded.updated_at""",
+                     wechat_json=excluded.wechat_json, xhs_json=excluded.xhs_json,
+                     youzan_json=excluded.youzan_json, updated_at=excluded.updated_at""",
                 (shop_id, internal, json.dumps(merged_wechat, ensure_ascii=False) if merged_wechat else None,
-                 json.dumps(merged_xhs, ensure_ascii=False) if merged_xhs else None, now()))
+                 json.dumps(merged_xhs, ensure_ascii=False) if merged_xhs else None,
+                 json.dumps(merged_youzan, ensure_ascii=False) if merged_youzan else None, now()))
         conn.commit(); conn.close()
     return {"ok": True, "result": {"imported": imported, "failed": failed, "skipped": skipped, "report": report}}
 

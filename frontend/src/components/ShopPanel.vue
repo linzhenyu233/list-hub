@@ -15,6 +15,7 @@ import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { bulkApi } from '../bulkApi'
 import { xhsApi } from '../xhsApi'
+import { youzanApi } from '../youzanApi'
 import { storeApi } from '../api'
 
 const props = defineProps({ refreshTick: { type: Number, default: 0 } })
@@ -22,11 +23,16 @@ const props = defineProps({ refreshTick: { type: Number, default: 0 } })
 const loading = ref(false)
 const shops = ref([])
 const xhsStates = reactive({})      // shop_id -> { loading, info, error }
+const youzanStates = reactive({})   // shop_id -> { loading, info, error }
 const wechatStates = reactive({})   // shop_id -> { checking, checked, ok, message }
 const renewing = reactive({})       // shop_id -> true 表示续期请求中
+const renewingYouzan = reactive({}) // 与续期分开计数，避免两个按钮的 loading 互相串台
 
 const hasWechat = (shop) => Boolean(shop.wechat?.appid)
 const hasXhs = (shop) => Boolean(shop.xhs?.app_id)
+// 有赞凭证是三件套；kdt_id / mode=mock 也算"已开通"——
+// 与发布面板 shopPlatforms 同一口径，否则会出现"店铺页显示未开通、发布面板却能勾有赞"。
+const hasYouzan = (shop) => Boolean(shop.youzan?.client_id || shop.youzan?.kdt_id || shop.youzan?.mode === 'mock')
 
 async function loadShopsList() {
   loading.value = true
@@ -34,6 +40,7 @@ async function loadShopsList() {
     const data = await bulkApi.shops()
     shops.value = data?.result || []
     await Promise.all(shops.value.filter(hasXhs).map((shop) => loadXhsToken(shop)))
+    await Promise.all(shops.value.filter(hasYouzan).map((shop) => loadYouzanToken(shop)))
   } catch (error) {
     shops.value = []
     ElMessage.error(`店铺列表加载失败：${error.message}`)
@@ -52,7 +59,46 @@ async function loadXhsToken(shop) {
   }
 }
 
+async function loadYouzanToken(shop) {
+  youzanStates[shop.shop_id] = { loading: true, info: null, error: '' }
+  try {
+    const info = await youzanApi.tokenInfo(shop.shop_id)
+    youzanStates[shop.shop_id] = { loading: false, info, error: '' }
+  } catch (error) {
+    youzanStates[shop.shop_id] = { loading: false, info: null, error: error.message }
+  }
+}
+
+// 有赞的"续期"是静默重取（自用型应用没有 refresh_token，接口不需要 code）
+async function renewYouzanToken(shop) {
+  renewingYouzan[shop.shop_id] = true
+  try {
+    await youzanApi.tokenByCode('', shop.shop_id)
+    ElMessage.success('已重新获取有赞 access_token')
+    await loadYouzanToken(shop)
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    renewingYouzan[shop.shop_id] = false
+  }
+}
+
 // ---- 一句话状态（运营看的结论） ----
+function youzanState(shop) {
+  if (!hasYouzan(shop)) return { text: '未开通', type: 'info' }
+  const state = youzanStates[shop.shop_id]
+  if (!state || state.loading) return { text: '查询中…', type: 'info' }
+  if (state.error) return { text: '查询失败', type: 'danger', hint: state.error, needAction: true }
+  const info = state.info || {}
+  if (!info.configured) return { text: '未配置', type: 'warning', hint: 'shops.json 里这个店缺 client_id / client_secret / kdt_id', needAction: true }
+  const days = info.remain_days
+  if (typeof days !== 'number') return { text: '已授权', type: 'success' }
+  // 有赞 access_token 固定 7 天过期，服务会在失效时自动重取，所以这里只提示不报错
+  return days < 2
+    ? { text: `快到期(${days}天)`, type: 'warning', hint: '有赞 access_token 7 天过期，服务会自动重取；持续失败请联系技术同学' }
+    : { text: `已授权(${days}天)`, type: 'success' }
+}
+
 function xhsState(shop) {
   if (!hasXhs(shop)) return { text: '未开通', type: 'info' }
   const state = xhsStates[shop.shop_id]
@@ -136,6 +182,11 @@ watch(() => props.refreshTick, loadShopsList)
               <span class="status-label">小红书</span>
               <el-tag :type="xhsState(shop).type" effect="light" round>{{ xhsState(shop).text }}</el-tag>
               <el-button v-if="xhsState(shop).needAction" link type="primary" size="small" :loading="renewing[shop.shop_id]" @click="renewXhsToken(shop)">续期</el-button>
+            </span>
+            <span v-if="hasYouzan(shop)" class="status-item" :title="youzanState(shop).hint || ''">
+              <span class="status-label">有赞</span>
+              <el-tag :type="youzanState(shop).type" effect="light" round>{{ youzanState(shop).text }}</el-tag>
+              <el-button v-if="youzanState(shop).needAction" link type="primary" size="small" :loading="renewingYouzan[shop.shop_id]" @click="renewYouzanToken(shop)">重取凭证</el-button>
             </span>
           </span>
         </div>

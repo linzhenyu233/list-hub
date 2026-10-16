@@ -9,7 +9,7 @@ const props = defineProps({
   product: { type: Object, default: null },
   productMapping: { type: Object, default: () => ({}) },
   groupConfig: { type: Object, default: null },
-  platforms: { type: Array, default: () => ['wechat', 'xhs'] },
+  platforms: { type: Array, default: () => ['wechat', 'xhs', 'youzan'] },
   // 补规格图要落到批次上（与第 2 步表格里的「缺图」同一套上传逻辑）
   batchId: { type: [String, Number], default: '' },
 })
@@ -17,9 +17,10 @@ const emit = defineEmits(['update:visible', 'save'])
 
 const showWechat = computed(() => props.platforms.includes('wechat'))
 const showXhs = computed(() => props.platforms.includes('xhs'))
+const showYouzan = computed(() => props.platforms.includes('youzan'))
 
 const editForm = reactive({
-  title: '', wechat_title: '', xhs_title: '', brand: '', description: '',
+  title: '', wechat_title: '', xhs_title: '', youzan_title: '', brand: '', description: '',
   weight: '', wechat_attrs: {}, xhs_attrs: {}, skus: [],
 })
 
@@ -30,6 +31,8 @@ watch(() => [props.visible, props.product], () => {
   editForm.title = p.title || ''
   editForm.wechat_title = m.wechat_title || p.wechat_title || ''
   editForm.xhs_title = m.xhs_title || p.xhs_title || ''
+  // 有赞标题：留空则回落到通用标题（后端 platform_title 同口径）
+  editForm.youzan_title = m.youzan_title || p.youzan_title || ''
   editForm.brand = p.brand || ''
   editForm.description = p.description || ''
   editForm.weight = p.weight || ''
@@ -257,6 +260,7 @@ function handleSave() {
     title: editForm.title,
     wechat_title: editForm.wechat_title,
     xhs_title: editForm.xhs_title,
+    youzan_title: editForm.youzan_title,
     brand: editForm.brand,
     description: editForm.description,
     weight: editForm.weight,
@@ -296,6 +300,7 @@ function handleSave() {
           <el-form-item label="通用标题"><el-input v-model="editForm.title" /></el-form-item>
           <el-form-item v-if="showWechat" label="微信标题"><el-input v-model="editForm.wechat_title" placeholder="留空则用通用标题" /></el-form-item>
           <el-form-item v-if="showXhs" label="小红书标题"><el-input v-model="editForm.xhs_title" placeholder="留空则用通用标题" /></el-form-item>
+          <el-form-item v-if="showYouzan" label="有赞标题"><el-input v-model="editForm.youzan_title" placeholder="留空则用通用标题（上限 60 字，超出会被自动截断）" /></el-form-item>
           <el-form-item label="品牌"><el-input v-model="editForm.brand" /></el-form-item>
           <el-form-item label="重量(g)"><el-input v-model="editForm.weight" /></el-form-item>
         </div>

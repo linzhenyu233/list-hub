@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import { Delete, Download, Plus } from '@element-plus/icons-vue'
 import { bulkApi } from '../bulkApi'
 import { xhsApi } from '../xhsApi'
+import { youzanApi } from '../youzanApi'
 import { storeApi } from '../api'
 
 // el-dialog 首次打开才挂载内部组件,弹窗和独立页面两种模式都在挂载时拉列表即可
@@ -19,11 +20,14 @@ const aliasImportDialogVisible = ref(false)
 const aliasImportResult = ref(null)
 const aliasFormVisible = ref(false)
 const aliasFormSaving = ref(false)
-const aliasForm = ref({ internal_category: '', wechat: null, xhs: null })
+const aliasForm = ref({ internal_category: '', wechat: null, xhs: null, youzan: null })
 const aliasWechatOptions = ref([])
 const aliasWechatLoading = ref(false)
 const aliasXhsLevels = ref([])
 const aliasXhsSelected = ref([])
+// 有赞类目树：逐级读取（★有赞字段名 cid / is_leaf 属待核对项，这里对 id 与 is_leaf/leaf 标记都兼容）
+const aliasYouzanLevels = ref([])
+const aliasYouzanSelected = ref([])
 
 async function loadAliasList() {
   listLoading.value = true
@@ -74,10 +78,12 @@ function aliasReportType(message) {
 }
 
 function openAliasForm() {
-  aliasForm.value = { internal_category: '', wechat: null, xhs: null }
+  aliasForm.value = { internal_category: '', wechat: null, xhs: null, youzan: null }
   aliasWechatOptions.value = []
   aliasXhsLevels.value = []
   aliasXhsSelected.value = []
+  aliasYouzanLevels.value = []
+  aliasYouzanSelected.value = []
   aliasFormVisible.value = true
 }
 
@@ -112,13 +118,40 @@ function chooseAliasXhs(level, value) {
   aliasForm.value.xhs = { category: chain.map((row) => row.name).join(' > '), chain, category_id: value }
 }
 
+async function loadAliasYouzanLevel(level, parentId = null) {
+  const data = await youzanApi.categories(parentId ? { parent_id: parentId } : {})
+  const result = data?.result || data || []
+  const options = Array.isArray(result) ? result : (result.categories || result.list || [])
+  aliasYouzanLevels.value = aliasYouzanLevels.value.slice(0, level).concat([options])
+  aliasYouzanSelected.value = aliasYouzanSelected.value.slice(0, level)
+}
+
+function chooseAliasYouzan(level, value) {
+  aliasYouzanSelected.value = [...aliasYouzanSelected.value.slice(0, level), value]
+  const item = aliasYouzanLevels.value[level].find((row) => String(row.cid || row.id) === String(value))
+  if (!item) return
+  if (!(item.is_leaf || item.isLeaf || item.leaf)) {
+    aliasForm.value.youzan = null
+    void loadAliasYouzanLevel(level + 1, value)
+    return
+  }
+  const chain = aliasYouzanSelected.value.map((id, index) => {
+    const row = aliasYouzanLevels.value[index].find((option) => String(option.cid || option.id) === String(id))
+    return { id, name: row?.name || '' }
+  })
+  // 同时写 cid 与 category_id：后端 _youzan_payload 读 youzan_cid，映射表展示读 category_id，
+  // 两个键都留好，避免联调时因为"键名对不上"出现"映射配了但发布仍报未配置类目"。
+  aliasForm.value.youzan = { category: chain.map((row) => row.name).join(' > '), chain,
+    category_id: value, cid: value }
+}
+
 async function saveAliasForm() {
   const internal = aliasForm.value.internal_category.trim()
   if (!internal) return ElMessage.warning('请填写内部类目')
-  if (!aliasForm.value.wechat && !aliasForm.value.xhs) return ElMessage.warning('请至少选择一个平台类目')
+  if (!aliasForm.value.wechat && !aliasForm.value.xhs && !aliasForm.value.youzan) return ElMessage.warning('请至少选择一个平台类目')
   aliasFormSaving.value = true
   try {
-    await bulkApi.saveCategoryAlias({ internal_category: internal, wechat: aliasForm.value.wechat, xhs: aliasForm.value.xhs })
+    await bulkApi.saveCategoryAlias({ internal_category: internal, wechat: aliasForm.value.wechat, xhs: aliasForm.value.xhs, youzan: aliasForm.value.youzan })
     ElMessage.success('映射已保存，批量发布重新点“立即匹配”即可生效')
     aliasFormVisible.value = false
     void loadAliasList()
@@ -148,6 +181,7 @@ onMounted(() => { void loadAliasList() })
         <el-table-column prop="internal_category" label="内部类目" min-width="220" show-overflow-tooltip />
         <el-table-column label="微信类目" min-width="240" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.wechat" type="success">{{ row.wechat.category }}</el-tag><span v-else class="muted-copy">未确认</span></template></el-table-column>
         <el-table-column label="小红书类目" min-width="240" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.xhs" type="success">{{ row.xhs.category }}</el-tag><span v-else class="muted-copy">未确认</span></template></el-table-column>
+        <el-table-column label="有赞类目" min-width="240" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.youzan" type="success">{{ row.youzan.category }}</el-tag><span v-else class="muted-copy">未确认</span></template></el-table-column>
         <el-table-column label="操作" width="90"><template #default="{ row }"><el-button size="small" type="danger" :icon="Delete" link @click="removeAlias(row)">删除</el-button></template></el-table-column>
       </el-table>
     </section>
@@ -158,6 +192,7 @@ onMounted(() => { void loadAliasList() })
         <el-table-column prop="internal_category" label="内部类目" min-width="180" show-overflow-tooltip />
         <el-table-column label="微信侧" min-width="230" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.wechat" :type="aliasReportType(row.wechat)">{{ row.wechat }}</el-tag><span v-else class="muted-copy">--</span></template></el-table-column>
         <el-table-column label="小红书侧" min-width="230" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.xhs" :type="aliasReportType(row.xhs)">{{ row.xhs }}</el-tag><span v-else class="muted-copy">--</span></template></el-table-column>
+        <el-table-column label="有赞侧" min-width="230" show-overflow-tooltip><template #default="{ row }"><el-tag v-if="row.youzan" :type="aliasReportType(row.youzan)">{{ row.youzan }}</el-tag><span v-else class="muted-copy">--</span></template></el-table-column>
       </el-table>
     </el-dialog>
     <el-dialog v-model="aliasFormVisible" title="新增类目映射" width="680px">
@@ -171,6 +206,11 @@ onMounted(() => { void loadAliasList() })
         <el-form-item label="小红书类目">
           <el-button size="small" @click="loadAliasXhsLevel(0)">读取类目</el-button>
           <template v-for="(options, level) in aliasXhsLevels" :key="level"><el-select :model-value="aliasXhsSelected[level]" :placeholder="`第${level + 1}级类目`" @change="(value) => chooseAliasXhs(level, value)"><el-option v-for="item in options" :key="item.id || item.categoryId" :label="item.name" :value="item.id || item.categoryId" /></el-select></template>
+        </el-form-item>
+        <el-form-item label="有赞类目">
+          <el-button size="small" @click="loadAliasYouzanLevel(0)">读取类目</el-button>
+          <span v-if="aliasForm.youzan" class="muted-copy">已选：{{ aliasForm.youzan.category }}</span>
+          <template v-for="(options, level) in aliasYouzanLevels" :key="level"><el-select :model-value="aliasYouzanSelected[level]" :placeholder="`第${level + 1}级类目`" @change="(value) => chooseAliasYouzan(level, value)"><el-option v-for="item in options" :key="item.cid || item.id" :label="item.name" :value="item.cid || item.id" /></el-select></template>
         </el-form-item>
       </el-form>
       <template #footer><el-button @click="aliasFormVisible = false">取消</el-button><el-button type="primary" :loading="aliasFormSaving" @click="saveAliasForm">保存映射</el-button></template>

@@ -24,7 +24,7 @@ const loading = ref(false)
 const syncing = ref(false)
 // 手动同步的后台任务（POST /orders/sync 只登记任务，进度靠轮询 /orders/sync/status）
 const syncJobId = ref('')
-const syncJob = reactive({ status: '', done: 0, total: 0, synced: 0, failed: 0, current: '', message: '', range: '' })
+const syncJob = reactive({ status: '', done: 0, total: 0, synced: 0, failed: 0, current: '', message: '', range: '', skipped: [] })
 let syncPollTimer = null
 const errorMsg = ref('')
 const granularity = ref('day')
@@ -235,10 +235,14 @@ const syncButtonText = computed(() => {
 // 把「正在同步哪段区间」写出来：面板当前选的是别的区间时，用户看不到数字在动，
 // 不知道该切到哪去看——这一行就是告诉他去哪儿看。
 const syncHintText = computed(() => {
-  if (!syncing.value) return ''
+  // 因为「这家店没配这个平台」被跳过的组合也要说清楚：不然运营会以为那家店漏同步了
+  // （老表现是明细面板里一片「订单拉取失败（HTTP Error 400）」）。
+  const skipped = (syncJob.skipped || []).map((item) => `${item.shop || item.shop_id}/${item.platform}`)
+  const skipText = skipped.length ? `${skipped.join('、')} 未配置该平台凭证，本次已跳过` : ''
+  if (!syncing.value) return skipText
   const range = syncJob.range
   const scope = range && range.start && range.end ? ` ${range.start} ~ ${range.end}` : ''
-  return `正在同步${scope}，已同步的会陆续显示，不用等全部跑完`
+  return `正在同步${scope}，已同步的会陆续显示，不用等全部跑完${skipText ? `；${skipText}` : ''}`
 })
 // 区间文字要能自证"这是什么窗口"：选"周"就是 4 个整周，不是随便 28 天
 const rangeText = computed(() => {
@@ -394,7 +398,9 @@ async function loadProducts(silent = false) {
 // 支持**单日或区间**选择：同步过的天由后端直接读本地库（秒回），没同步过的天
 // 后端并发实时拉（有总超时与截断保护）。仍只共用面板的「店铺范围」，口径一致。
 const detail = reactive({
-  range: [ymd(new Date()), ymd(new Date())], platform: '', keyword: '',
+  // 默认**跟随上面那块统计区间**（日/周/月/自定义切了它就跟着变，和商品明细同一口径）；
+  // 用户在这块自己选了时间就把 follow 关掉，之后切粒度不再把他选的时间冲掉。
+  range: [ymd(daysAgo(6)), ymd(new Date())], follow: true, platform: '', keyword: '',
   page: 1, pageSize: 20, rows: [], total: 0, sumPaidAmount: 0,
   notes: [], loading: false, error: '', loaded: false,
 })
@@ -417,16 +423,32 @@ const detailShortcuts = [
   { text: '近 7 天', value: () => [daysAgo(6), new Date()] },
   { text: '近 30 天', value: () => [daysAgo(29), new Date()] },
 ]
+// 面板当前统计区间（'YYYY-MM-DD' 字符串对）：交易明细默认跟它
+function panelRangePair() {
+  const start = toDay(range.value?.[0])
+  const end = toDay(range.value?.[1])
+  return start && end ? [start, end] : null
+}
+// 明细对齐面板区间：这个函数**只改值**，加载统一交给下面 detail.range 的 watch，
+// 免得同一份数据被两条路径各拉一次。
+function syncDetailRangeToPanel(force = false) {
+  if (!detail.follow && !force) return
+  const pair = panelRangePair()
+  if (!pair) return
+  if (detail.range[0] === pair[0] && detail.range[1] === pair[1]) return
+  detail.range = pair
+}
 function onDetailRangePick(value) {
   if (!Array.isArray(value) || value.length !== 2 || !value[0] || !value[1]) return
-  // YYYY-MM-DD 字符串按字典序比较即日期序；万一选反了自动摆正
-  const [a, b] = [...value].sort()
-  if (detail.range[0] === a && detail.range[1] === b) return   // 没变就别白拉一次接口
-  detail.range = [a, b]
-  detail.page = 1
-  loadDetails()
+  // YYYY-MM-DD 字符串按字典序比较即日期序；万一选反了自动摆正（toDay 兜住 Date 形态）
+  const [a, b] = [...value].map(toDay).sort()
+  if (!a || !b || (detail.range[0] === a && detail.range[1] === b)) return   // 没变就别白拉一次接口
+  detail.follow = false    // 用户自己选了时间 → 解除跟随，之后切粒度不再覆盖这里
+  detail.range = [a, b]    // 下面的 watch 负责重拉
 }
+let detailsSeq = 0
 async function loadDetails() {
+  const seq = ++detailsSeq
   detail.loading = true
   detail.error = ''
   try {
@@ -434,6 +456,8 @@ async function loadDetails() {
                                              detail.platform, panelShop.value,
                                              detail.keyword.trim(), detail.pageSize,
                                              (detail.page - 1) * detail.pageSize)
+    // 连着改日期/切筛选时，旧请求可能后到：只认最后一次，别让表里闪回旧数据
+    if (seq !== detailsSeq) return
     const result = data?.result || {}
     detail.rows = result.rows || []
     detail.total = result.total || 0
@@ -441,11 +465,12 @@ async function loadDetails() {
     detail.notes = result.notes || []
     detail.loaded = true
   } catch (error) {
+    if (seq !== detailsSeq) return
     detail.error = error.message
     detail.rows = []
     detail.total = 0
   } finally {
-    detail.loading = false
+    if (seq === detailsSeq) detail.loading = false
   }
 }
 // 商品成本/运费成本：平台订单接口没有这两个字段，本地也没有成本表，
@@ -610,7 +635,7 @@ function applySyncJob(job) {
   Object.assign(syncJob, {
     status: job.status || '', done: job.done || 0, total: job.total || 0,
     synced: job.synced || 0, failed: job.failed || 0, current: job.current || '',
-    message: job.message || '', range: job.range || '',
+    message: job.message || '', range: job.range || '', skipped: job.skipped || [],
   })
 }
 
@@ -791,7 +816,12 @@ watch(panelShop, (value) => {
   } catch { /* 无痕模式忽略 */ }
   load()
 })
-watch(() => range.value, load)
+watch(() => range.value, () => {
+  // 面板区间（日/周/月/自定义）一变，概览卡片与商品明细重拉，交易明细也跟着对齐——
+  // 不这样就会出现"商品明细会跟着切，交易明细不动"（同一个页面上两套口径）。
+  load()
+  syncDetailRangeToPanel()
+})
 // 商品维度：排序/显示条数/搜索词变化时重拉（搜索做 350ms 防抖，别每敲一个字打一次接口）
 watch([productSort, productLimit], loadProducts)
 let productKeywordTimer = null
@@ -802,6 +832,15 @@ watch(productKeyword, () => {
 // 交易明细：跟着店铺范围走（口径与上面一致）；订单号搜索同样 350ms 防抖，别每敲一个字打一次平台
 watch(() => panelShop.value, () => { detail.page = 1; loadDetails() })
 watch(() => detail.platform, () => { detail.page = 1; loadDetails() })
+// 区间一变就重拉。这里盯值本身，而不是只靠 el-date-picker 的 change：
+// 实测 change 不是每条选择路径都会触发（改完时间表里还是旧数据，必须再动一下别的筛选才刷新），
+// 盯值最稳，也不怕 picker 内部怎么改默认值。
+watch(() => `${detail.range?.[0] || ''}~${detail.range?.[1] || ''}`, () => {
+  detail.page = 1
+  loadDetails()
+})
+// 重新勾上「跟随统计区间」：立刻把明细拉回面板当前区间
+watch(() => detail.follow, (value) => { if (value) syncDetailRangeToPanel(true) })
 let detailKeywordTimer = null
 watch(() => detail.keyword, () => {
   clearTimeout(detailKeywordTimer)
@@ -816,9 +855,10 @@ onMounted(async () => {
       shops.value = data?.result || []
     } catch { /* 拉不到就只显示"全部店铺汇总" */ }
   }
+  syncDetailRangeToPanel(true)   // 交易明细默认跟面板同一区间（第一次进来就与商品明细对齐）
   await load()
   await loadProducts()
-  await loadDetails()      // 交易明细：默认取今天的明细，第一次进页面先取回来
+  await loadDetails()      // 交易明细：第一次进页面先取回来
   // 同步过程中刷新页面：接着轮询后台任务，按钮继续显示进度
   try {
     const data = await bulkApi.orderSyncStatus()
@@ -869,7 +909,7 @@ onUnmounted(stopSyncPolling)
         <el-button link size="small" :icon="InfoFilled" @click="readmeVisible = true">口径说明</el-button>
         <el-button size="small" :icon="Download" :loading="exporting" @click="exportExcel">导出</el-button>
         <el-button type="primary" size="small" :icon="Refresh" :loading="syncing" @click="syncNow">{{ syncButtonText }}</el-button>
-        <span v-if="syncing" class="dash-sync-hint">{{ syncHintText }}</span>
+        <span v-if="syncing || (syncJob.skipped || []).length" class="dash-sync-hint">{{ syncHintText }}</span>
       </div>
     </div>
 
@@ -1101,6 +1141,10 @@ onUnmounted(stopSyncPolling)
                           :shortcuts="detailShortcuts" range-separator="→"
                           start-placeholder="开始日期" end-placeholder="结束日期"
                           @change="onDetailRangePick" />
+          <el-tooltip placement="bottom" effect="light"
+                      content="默认跟着上面的日/周/月区间；自己选了时间就会脱离，取消勾选即恢复跟随">
+            <el-checkbox v-model="detail.follow" size="small">跟随统计区间</el-checkbox>
+          </el-tooltip>
         </div>
       </div>
       <el-alert v-if="detail.error" type="error" show-icon :closable="false" class="dash-alert"

@@ -316,17 +316,23 @@ def test_api_key_auth():
 # 对着代码肉眼看会漏，尤其是 id_headers 顺序、价格单位、gone 文案这类**不会报错**的差异，
 # 错了只会表现成"货盘回填列位置变了 / 在售商品被误判成已删除"，要等运营发现。
 _LEGACY = {
-    "valid_platforms": ("wechat", "xhs"),
-    "creds_key": {"wechat": "appid", "xhs": "app_id"},
-    "required_credentials": {"wechat": ("appid", "secret"), "xhs": ("app_id", "app_secret")},
+    # ⚠️ 接新平台时：把该平台的字段**原样**追加到下面每一张表（这是"新平台不改老平台行为"的机器证据）。
+    #    只往尾部追加，不要改动既有平台的任何一行 —— 改了它就是改了线上行为。
+    "valid_platforms": ("wechat", "xhs", "youzan"),
+    "creds_key": {"wechat": "appid", "xhs": "app_id", "youzan": "client_id"},
+    "required_credentials": {"wechat": ("appid", "secret"), "xhs": ("app_id", "app_secret"),
+                             "youzan": ("client_id", "client_secret", "kdt_id")},
     "param_keys": {
         "wechat": ("brand_id", "freight_template_id", "after_sale_address_id"),
         "xhs": ("brand_id", "category_id", "shipping_template_id", "logistics_plan_id"),
+        "youzan": ("delivery_template_id",),
     },
     "env_credentials": {
         "wechat": {"appid": "WX_APPID", "secret": "WX_SECRET"},
         "xhs": {"app_id": "XHS_APP_ID", "app_secret": "XHS_APP_SECRET",
                 "access_token": "XHS_ACCESS_TOKEN", "refresh_token": "XHS_REFRESH_TOKEN"},
+        "youzan": {"client_id": "YOUZAN_CLIENT_ID", "client_secret": "YOUZAN_CLIENT_SECRET",
+                   "kdt_id": "YOUZAN_KDT_ID", "access_token": "YOUZAN_ACCESS_TOKEN"},
     },
     "env_params": {
         "wechat": {"brand_id": ("WX_BRAND_ID", "2100000000"),
@@ -335,35 +341,44 @@ _LEGACY = {
         "xhs": {"brand_id": ("XHS_BRAND_ID", ""), "category_id": ("XHS_CATEGORY_ID", ""),
                 "shipping_template_id": ("XHS_SHIPPING_TEMPLATE_ID", ""),
                 "logistics_plan_id": ("XHS_LOGISTICS_PLAN_ID", "")},
+        "youzan": {"delivery_template_id": ("YOUZAN_DELIVERY_TEMPLATE_ID", "")},
     },
     "required_shop_params": {
         "wechat": (("wechat_freight_template_id", "freight_template_id", "微信运费模板"),),
         "xhs": (("xhs_shipping_template_id", "小红书运费模板"),
                 ("xhs_logistics_plan_id", "小红书物流方案")),
+        "youzan": (("youzan_delivery_template_id", "有赞运费模板"),),
     },
-    "publish_path": {"wechat": "/products", "xhs": "/items/and-sku"},
+    "publish_path": {"wechat": "/products", "xhs": "/items/and-sku", "youzan": "/products"},
     "image_paths": {"wechat": ("/images/upload-file", "/images/upload", "img_url"),
-                    "xhs": ("/materials/upload-file", "/materials/upload", "url")},
-    "item_path": {"wechat": "/products/{id}", "xhs": "/items/{id}"},
-    "title_fit_max": {"wechat": 60, "xhs": 30},
-    "price_unit": {"wechat": "cent", "xhs": "cent"},
+                    "xhs": ("/materials/upload-file", "/materials/upload", "url"),
+                    "youzan": ("/materials/upload-file", "/materials/upload", "img")},
+    "item_path": {"wechat": "/products/{id}", "xhs": "/items/{id}", "youzan": "/products/{id}"},
+    "title_fit_max": {"wechat": 60, "xhs": 30, "youzan": 60},
+    "price_unit": {"wechat": "cent", "xhs": "cent", "youzan": "yuan"},
     "gone_markers": {
         "wechat": ("10020052", "商品不存在", "商品已删除", "商品在回收站"),
         "xhs": ("商品不存在", "商品已删除",
                 "item not exist", "item_not_exist", "item not found"),
+        "youzan": ("商品不存在", "商品已删除", "item not exist", "item_not_exist"),
     },
     "api_base": {"wechat": ("WECHAT_API_BASE", "http://127.0.0.1:8000"),
-                 "xhs": ("XHS_API_BASE", "http://127.0.0.1:8010")},
+                 "xhs": ("XHS_API_BASE", "http://127.0.0.1:8010"),
+                 "youzan": ("YOUZAN_API_BASE", "http://127.0.0.1:8030")},
     "huopai_id_headers": {
         "wechat": ("微信小店", "微信商品id", "微信小店商品id", "微信产品id"),
         "xhs": ("小红书产品id", "小红书商品id"),
+        "youzan": ("有赞商品id", "有赞商品ID", "有赞产品id"),
         "wechat_sku": ("微信规格id", "微信sku id", "微信规格id(sku)"),
         "xhs_sku": ("小红书规格id", "小红书sku id", "小红书规格id(sku)"),
+        "youzan_sku": ("有赞规格id", "有赞sku id", "有赞规格id(sku)"),
     },
     "huopai_platform_label": {"wechat": "微信小店", "xhs": "小红书产品id",
-                              "wechat_sku": "微信规格id", "xhs_sku": "小红书规格id"},
-    "huopai_field_platform": {"wechat": "wechat", "xhs": "xhs",
-                              "wechat_sku": "wechat", "xhs_sku": "xhs"},
+                              "youzan": "有赞商品id",
+                              "wechat_sku": "微信规格id", "xhs_sku": "小红书规格id",
+                              "youzan_sku": "有赞规格id"},
+    "huopai_field_platform": {"wechat": "wechat", "xhs": "xhs", "youzan": "youzan",
+                              "wechat_sku": "wechat", "xhs_sku": "xhs", "youzan_sku": "youzan"},
 }
 
 
@@ -418,6 +433,9 @@ def test_adapter_registry_parity():
     assert pr.price_to_platform("wechat", 19.99) == 1999, "微信价格换算错了（会超低价卖出）"
     assert pr.price_to_platform("xhs", 12) == 1200, "小红书价格换算错了"
     assert pr.price_to_platform("wechat", None) == 0
+    # 有赞是「元」：这条写错不会报错，只会超低价卖出（docs §6.1 的最高危项）
+    assert pr.price_to_platform("youzan", 19.99) == 19.99, "有赞价格换算错了（元/分搞混）"
+    assert pr.price_to_platform("youzan", 12) == 12, "有赞价格换算不该做任何缩放"
 
     # shop_registry 的四张派生表
     sys.modules.pop("shop_registry", None)
@@ -448,6 +466,9 @@ def test_adapter_registry_parity():
     assert m.platform_title({}, {}, "wechat") == "", "空标题不该报错"
     assert len(m.platform_title({"title": "微" * 80}, {}, "wechat")) == 60, "微信标题兜底上限变了"
     assert len(m.platform_title({"title": "小" * 40}, {}, "xhs")) == 30, "小红书标题兜底上限变了"
+    # 有赞：只截断、不补词（补词是小红书的平台规则，别套到别家）
+    assert len(m.platform_title({"title": "赞" * 80}, {}, "youzan")) == 60, "有赞标题兜底上限变了"
+    assert m.platform_title({"title": "短标题"}, {}, "youzan") == "短标题", "有赞不该有短文补词逻辑"
     assert m.platform_title({"title": "短"}, {}, "xhs") == "短 培育钻石", "小红书短文补词逻辑变了"
     # 平台标题列优先于通用标题（用 ≥8 字的标题，避免被"短文补词"改写，才能断言原样透传）
     assert m.platform_title({"title": "通用标题文案内容", "xhs_title": "小红书专用标题文案"}, {}, "xhs") \
