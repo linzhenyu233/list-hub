@@ -47,6 +47,9 @@ export const xhsApi = {
   createItemAndSku: (body) => http.post('/items/and-sku', body),
   updateItem: (itemId, body) => http.put(`/items/${itemId}`, body),
   updateSku: (skuId, body) => http.put(`/skus/${skuId}`, body),
+  // 编辑页新增/删除规格：平台上就是给商品追加/删除 SKU（product.createSkuV2 / deleteSkuV2）
+  createSkus: (itemId, skuList) => http.post(`/items/${itemId}/skus`, { sku_list: skuList }),
+  deleteSkus: (itemId, skuIds) => http.post(`/items/${itemId}/skus/delete`, { sku_ids: skuIds }),
   setSkuAvailable: (skuId, available) => http.post(`/skus/${skuId}/available`, { available }),
   // 删除商品(平台侧彻底删除,不可恢复)。与微信商品列表的「删除」对齐。
   deleteItem: (itemId) => http.delete(`/items/${itemId}`),

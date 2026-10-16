@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Goods, Picture, Top, Bottom, View } from '@element-plus/icons-vue'
+import { Check, Goods, Picture, Top, Bottom, View } from '@element-plus/icons-vue'
 import { youzanApi } from '../youzanApi'
 // 编辑保存走中台（单位换算 / 库存增量 / "接口说成功但没生效"的回读校验都在中台）
 import { bulkApi } from '../bulkApi'
@@ -311,6 +311,45 @@ const editVisible = ref(false)
 const editLoading = ref(false)
 const editSaving = ref(false)
 const editForm = ref({ id: '', title: '', listing: true, skus: [], warnings: [] })
+// 详情接口返回的原文：编辑表单只开放 4 个字段（标题/上下架/价格/库存），
+// 其余信息（编码、类目、图片、更新时间）用只读区展示，运营不用再去有赞后台对照。
+// 版式与微信/小红书编辑页统一：卡片分节 + 右上角序号 + label 置顶两列栅格。
+const editRaw = ref({})
+const editLoadError = ref('')
+
+// 主图：有赞详情接口给 item_imgs 对象数组，兼容单图 pic_url（与 ProductDetailView 同一套取值）
+const editMainImages = computed(() => {
+  const fromImgs = (editRaw.value.item_imgs || []).map((one) => one?.url || one?.medium).filter(Boolean)
+  return fromImgs.length ? fromImgs : [editRaw.value.pic_url].filter(Boolean)
+})
+// 有赞没有独立的详情图字段：详情图写在 desc 富文本里，只能抽 <img src>
+const editDescImages = computed(() => [...String(editRaw.value.desc || '').matchAll(/<img[^>]+src=["']([^"']+)["']/gi)].map((one) => one[1]))
+const editPreviewImages = computed(() => [...new Set([...editMainImages.value, ...editDescImages.value])])
+
+const editPriceRange = computed(() => {
+  const prices = editForm.value.skus.map((one) => Number(one.price)).filter((one) => Number.isFinite(one))
+  if (!prices.length) return '—'
+  const min = Math.min(...prices)
+  const max = Math.max(...prices)
+  return min === max ? `￥${min.toFixed(2)}` : `￥${min.toFixed(2)} ~ ￥${max.toFixed(2)}`
+})
+const editStockTotal = computed(() => editForm.value.skus.reduce((sum, one) => sum + (Number(one.quantity) || 0), 0))
+const editCategoryId = computed(() => editRaw.value.cid || editRaw.value.category_id || '—')
+const editUpdatedAt = computed(() => {
+  const value = editRaw.value.edit_time || editRaw.value.updateTime
+    || editRaw.value.update_time || editRaw.value.created_time
+  if (!value) return '—'
+  if (typeof value === 'string' && !/^\d+$/.test(value)) return value.replace('T', ' ')
+  const date = new Date(Number(value) < 1e12 ? Number(value) * 1000 : Number(value))
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('zh-CN', { hour12: false })
+})
+// 「在有赞后台打开」：优先用详情返回的 detail_url，没有就按商品 ID 拼 H5 链接
+const editDetailUrl = computed(() => editRaw.value.detail_url
+  || (editForm.value.id ? `https://h5.youzan.com/v2/goods/${editForm.value.id}` : ''))
+
+function openYouzanConsole() {
+  if (editDetailUrl.value) window.open(editDetailUrl.value, '_blank', 'noopener')
+}
 
 function specTextOf(sku) {
   // 规格文本来自 properties_name_json（真机：{"k":"戒托颜色","v":"红色"} 的数组）
@@ -325,10 +364,13 @@ async function openEdit(item) {
   if (!item.id) return ElMessage.warning('当前商品缺少商品 ID')
   editVisible.value = true
   editLoading.value = true
+  editLoadError.value = ''
+  editRaw.value = {}
   editForm.value = { id: item.id, title: item.title || '', listing: true, skus: [], warnings: [] }
   try {
     const data = await youzanApi.getProduct(item.id)
     const raw = data?.result?.item || data?.result || {}
+    editRaw.value = raw
     const skus = raw.skus || raw.sku_list || []
     editForm.value = {
       id: item.id,
@@ -347,7 +389,8 @@ async function openEdit(item) {
     }
     if (!editForm.value.skus.length) ElMessage.warning('这个商品没有规格行（SKU），只能改标题与上下架')
   } catch (error) {
-    ElMessage.error(`读取商品详情失败：${error.message}`)
+    // 详情拉不到也要能改标题/上下架：错误留在抽屉里显示（toast 一闪而过，运营不知道少了什么）
+    editLoadError.value = error.message
   } finally {
     editLoading.value = false
   }
@@ -452,44 +495,98 @@ watch(pageSize, () => { page.value = 1; void loadItems() })
       </el-drawer>
 
       <!-- 编辑抽屉：只开放"改得安全且已真机验证"的字段。
-           类目与详情图不开放（类目改错要重新提交审核；详情图只能写进 desc 富文本，raw HTML 不该手改）。 -->
-      <el-drawer v-model="editVisible" title="编辑有赞商品" size="720px">
+           类目与详情图不开放（类目改错要重新提交审核；详情图只能写进 desc 富文本，raw HTML 不该手改）。
+           版式与微信/小红书编辑页对齐：卡片分节 + 右上角序号 + label 置顶两列栅格 + 吸底操作条。 -->
+      <el-drawer v-model="editVisible" title="编辑有赞商品" size="860px">
         <div v-loading="editLoading" class="edit-form">
-          <el-form label-width="86px" label-position="right">
-            <el-form-item label="商品标题">
-              <el-input v-model="editForm.title" maxlength="90" show-word-limit placeholder="有赞标题上限按 60 字（保守值）" />
-              <div class="muted-copy">当前 {{ String(editForm.title || '').trim().length }} 字，超过 {{ TITLE_MAX }} 字保存会被拦下（有赞标题上限仍待官方核对）。</div>
-            </el-form-item>
-            <el-form-item label="上下架">
-              <el-switch v-model="editForm.listing" active-text="出售中" inactive-text="仓库中" />
-              <span class="muted-copy">切换后商品会移到对应列表</span>
-            </el-form-item>
-          </el-form>
-
-          <div class="section-heading">
-            <div><h3>规格（SKU）</h3><p>价格单位：元（平台内部按分存储，由中台换算）；库存填绝对值，平台只支持增量，中台会自己算差值</p></div>
-          </div>
-          <el-table :data="editForm.skus" size="small" empty-text="这个商品没有规格行">
-            <el-table-column label="规格" min-width="180"><template #default="{ row }">{{ row.spec || '—' }}<div v-if="row.code" class="muted-copy">编码：{{ row.code }}</div></template></el-table-column>
-            <el-table-column label="售价（元）" width="150">
-              <template #default="{ row }"><el-input-number v-model="row.price" :min="0.01" :precision="2" :step="100" controls-position="right" size="small" /></template>
-            </el-table-column>
-            <el-table-column label="库存" width="140">
-              <template #default="{ row }"><el-input-number v-model="row.quantity" :min="0" :precision="0" :step="1" controls-position="right" size="small" /></template>
-            </el-table-column>
-          </el-table>
-
-          <el-alert v-if="editForm.warnings.length" type="warning" show-icon :closable="false" class="edit-warnings">
-            <template #title>以下内容平台没有生效（已回读确认，请对照后再保存）</template>
-            <div v-for="(one, index) in editForm.warnings" :key="index">{{ one }}</div>
+          <el-alert v-if="editLoadError" type="error" show-icon :closable="false" class="edit-tip">
+            <template #title>读取有赞商品详情失败，下面只能改标题与上下架</template>
+            {{ editLoadError }}
           </el-alert>
+
+          <el-form label-position="top" class="product-form">
+            <section class="form-section">
+              <div class="section-heading">
+                <div><h3>有赞商品信息</h3><p>标题与上下架会直接提交到有赞；编码、类目、图片请在有赞后台改</p></div>
+                <span class="section-index">01</span>
+              </div>
+              <div class="form-grid form-grid-2">
+                <el-form-item label="商品标题" required>
+                  <el-input v-model="editForm.title" maxlength="90" show-word-limit placeholder="有赞标题上限按 60 字（保守值）" />
+                  <div class="muted-copy">当前 {{ String(editForm.title || '').trim().length }} 字，超过 {{ TITLE_MAX }} 字保存会被拦下（有赞标题上限仍待官方核对）</div>
+                </el-form-item>
+                <el-form-item label="上下架">
+                  <el-switch v-model="editForm.listing" active-text="出售中" inactive-text="仓库中" />
+                  <div class="muted-copy">切换后商品会移到对应列表</div>
+                </el-form-item>
+              </div>
+              <!-- 只读区：这些字段详情接口本来就返回，以前全丢掉，改价时看不到编码/类目/图片 -->
+              <el-descriptions :column="2" border size="small" class="edit-readonly">
+                <el-descriptions-item label="商品 ID">{{ editForm.id || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="商家编码">{{ editRaw.item_no || '—' }}</el-descriptions-item>
+                <el-descriptions-item label="售价区间">{{ editPriceRange }}</el-descriptions-item>
+                <el-descriptions-item label="库存合计">{{ editStockTotal }}</el-descriptions-item>
+                <el-descriptions-item label="类目 ID">{{ editCategoryId }}</el-descriptions-item>
+                <el-descriptions-item label="更新时间">{{ editUpdatedAt }}</el-descriptions-item>
+              </el-descriptions>
+            </section>
+
+            <section class="form-section">
+              <div class="section-heading">
+                <div><h3>规格、价格与库存</h3><p>价格单位：元（平台内部按分存储，由中台换算）；库存填绝对值，平台只支持增量，中台会自己算差值</p></div>
+                <span class="section-index">02</span>
+              </div>
+              <div class="sku-table-wrap">
+                <el-table :data="editForm.skus" class="xhs-sku-table" empty-text="这个商品没有规格行（只能改标题与上下架）">
+                  <el-table-column label="规格" min-width="200"><template #default="{ row }"><span class="sku-spec-value">{{ row.spec || '—' }}</span></template></el-table-column>
+                  <el-table-column label="商家编码" min-width="140"><template #default="{ row }">{{ row.code || '—' }}</template></el-table-column>
+                  <el-table-column label="售价（元）" width="150">
+                    <template #default="{ row }"><el-input-number v-model="row.price" :min="0.01" :precision="2" :step="100" controls-position="right" size="small" /></template>
+                  </el-table-column>
+                  <el-table-column label="库存" width="140">
+                    <template #default="{ row }"><el-input-number v-model="row.quantity" :min="0" :precision="0" :step="1" controls-position="right" size="small" /></template>
+                  </el-table-column>
+                </el-table>
+              </div>
+              <div class="sku-table-footer">
+                <span class="muted-copy">共 {{ editForm.skus.length }} 个规格 · 售价区间 {{ editPriceRange }} · 库存合计 {{ editStockTotal }}</span>
+              </div>
+            </section>
+
+            <section v-if="editMainImages.length || editDescImages.length" class="form-section">
+              <div class="section-heading">
+                <div><h3>商品图片</h3><p>这里只做对照，改图要回有赞后台（编辑接口不支持改图）</p></div>
+                <span class="section-index">03</span>
+              </div>
+              <template v-if="editMainImages.length">
+                <div class="field-label">商品主图 <span>{{ editMainImages.length }} 张 · 点击可放大</span></div>
+                <div class="detail-image-grid">
+                  <el-image v-for="(image, index) in editMainImages" :key="`${image}-main`" :src="image" :preview-src-list="editPreviewImages" :initial-index="index" fit="cover" lazy />
+                </div>
+              </template>
+              <template v-if="editDescImages.length">
+                <div class="field-label description-label">商品详情图 <span>{{ editDescImages.length }} 张 · 取自详情富文本</span></div>
+                <div class="detail-image-grid">
+                  <el-image v-for="(image, index) in editDescImages" :key="`${image}-desc`" :src="image" :preview-src-list="editPreviewImages" :initial-index="editMainImages.length + index" fit="cover" lazy />
+                </div>
+              </template>
+            </section>
+
+            <el-alert v-if="editForm.warnings.length" type="warning" show-icon :closable="false" class="edit-warnings">
+              <template #title>以下内容平台没有生效（已回读确认，请对照后再保存）</template>
+              <div v-for="(one, index) in editForm.warnings" :key="index">{{ one }}</div>
+            </el-alert>
+
+            <div class="form-actions edit-actions">
+              <el-button v-if="editDetailUrl" link type="primary" :icon="View" @click="openYouzanConsole">在有赞后台打开</el-button>
+              <span v-else></span>
+              <div class="edit-actions__buttons">
+                <el-button @click="editVisible = false">取消</el-button>
+                <el-button type="primary" :icon="Check" :loading="editSaving" @click="saveEdit">保存到有赞</el-button>
+              </div>
+            </div>
+          </el-form>
         </div>
-        <template #footer>
-          <div class="form-actions">
-            <el-button @click="editVisible = false">取消</el-button>
-            <el-button type="primary" :loading="editSaving" @click="saveEdit">保存到有赞</el-button>
-          </div>
-        </template>
       </el-drawer>
     </div>
   </div>
@@ -497,10 +594,14 @@ watch(pageSize, () => { page.value = 1; void loadItems() })
 
 <style scoped>
 /* 详情体由 ProductDetailView 提供（三平台同一套样式），本页不再自定义详情样式 */
-.edit-form { display: flex; flex-direction: column; gap: 6px; }
-.edit-form .section-heading { margin: 10px 0 2px; }
-.edit-form .section-heading h3 { margin: 0 0 2px; font-size: 14px; }
-.edit-form .section-heading p { margin: 0; color: var(--muted); font-size: 12px; }
-.edit-warnings { margin-top: 12px; }
+/* 编辑抽屉的分节卡片 / 两列栅格 / 吸底操作条都走全局的 .product-form / .form-section / .form-actions，
+   这里只补本页特有的间距和只读区，避免又长出一套"有赞专用样式" */
+.edit-form { display: flex; flex-direction: column; }
+.edit-tip { margin-bottom: 16px; }
+.edit-readonly { margin-top: 2px; }
+.edit-readonly :deep(.el-descriptions__label) { width: 96px; color: #667085; }
+.edit-actions { justify-content: space-between; }
+.edit-actions__buttons { display: flex; gap: 10px; }
+.edit-warnings { margin-top: 8px; }
 .edit-warnings :deep(.el-alert__content) { font-size: 12px; }
 </style>

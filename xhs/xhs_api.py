@@ -1006,6 +1006,67 @@ def update_sku(sku_id: str, request: Request, body: dict = Body(..., example={
 
 
 # ==================================================================
+# 商品编辑页:SKU 增 / 删
+#   编辑时改规格不能只改价格库存 —— 新增/删掉一个规格,平台上就是
+#   新建/删除一个 SKU,得真的有接口落地,否则运营点保存看着是成功、
+#   平台侧毫无变化(2026-10-16 前的实际状态)。
+# ==================================================================
+@app.post("/items/{item_id}/skus")
+def create_item_skus(item_id: str, request: Request, body: dict = Body(..., example={
+    "sku_list": [{"price": 9000, "originalPrice": 9000, "stock": 50,
+                  "logisticsPlanId": "物流方案ID", "erpCode": "SKU-003",
+                  "variants": [], "deliveryTime": {"time": "24", "type": "RELATIVE_TIME_NEW"}}]})):
+    """给已有商品追加 SKU(编辑页「新增规格」走这里)。
+
+    与发品用的是同一个平台方法 product.createSkuV2,区别只是商品已存在,
+    所以 itemId 从路径取,不再先 createItemV2。
+    ⚠️ 逐个创建:单个失败不阻塞其余,返回 skuErrors 明细 —— 前端必须如实提示,
+       不能让运营看到"保存成功"而新规格一个都没建起来。
+    """
+    sid = shop_of(request)["shop_id"]
+    sku_list = body.get("sku_list") or ([body["sku"]] if body.get("sku") else [])
+    if not sku_list:
+        raise HTTPException(status_code=400, detail="请求体需要 sku_list 列表")
+    sku_ids, errors = [], []
+    for sku in sku_list:
+        label = sku.get("erpCode") or sku.get("price")
+        try:
+            data = _xhs_call("product.createSkuV2", {"itemId": str(item_id), **sku}, shop_id=sid)
+            sku_id = (data or {}).get("id") or (data or {}).get("skuId")
+            if sku_id:
+                sku_ids.append(sku_id)
+            else:
+                errors.append({"sku": label, "error": "SKU 创建接口未返回 skuId"})
+        except HTTPException as exc:
+            errors.append({"sku": label, "error": str(exc.detail)})
+    _clear_product_cache(sid)
+    return {"ok": not errors, "partial": bool(errors) and bool(sku_ids), "result": {
+        "skuIds": sku_ids,                    # 与请求 sku_list 同序,前端按序回填 skuId
+        "skuRequestedCount": len(sku_list),
+        "skuCount": len(sku_ids),
+        "skuErrors": errors,
+    }}
+
+
+@app.post("/items/{item_id}/skus/delete")
+def delete_item_skus(item_id: str, request: Request, body: dict = Body(..., example={"sku_ids": ["sku1", "sku2"]})):
+    """批量删除商品下的 SKU(编辑页「删掉某个规格」走这里)。
+
+    对应平台方法 product.deleteSkuV2(见 xhs_store.delete_skus)。
+    ⚠️ 删除不可恢复:这个 SKU 的销量/评价跟着一起没,所以前端必须先弹确认再调。
+    ⚠️ ★待真机核对:入参目前只传 skuIds(与 xhs_store.delete_skus 一致);
+       真机删一次确认口径,若平台报「入参itemId不能为空」,在这里补 payload["itemId"] 即可。
+    """
+    sid = shop_of(request)["shop_id"]
+    sku_ids = [str(x) for x in (body.get("sku_ids") or []) if str(x).strip()]
+    if not sku_ids:
+        raise HTTPException(status_code=400, detail="请求体需要 sku_ids 列表")
+    result = ok_or_400(lambda: _xhs_call("product.deleteSkuV2", {"skuIds": sku_ids}, shop_id=sid))
+    _clear_product_cache(sid)
+    return result
+
+
+# ==================================================================
 # 启动入口:python xhs_api.py 直接跑(端口 8010,避开微信小店 8000)
 # ==================================================================
 if __name__ == "__main__":

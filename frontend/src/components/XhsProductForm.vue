@@ -18,6 +18,11 @@ const props = defineProps({
 })
 const isEdit = computed(() => !!props.itemId)
 
+// 编辑模式：平台侧「原始 SKU 快照」= 保存时用来算差集的那份底账
+//   界面上还在的 → 改（updateSku）；界面上新出现的（没有 _skuId）→ 增（createSku）；
+//   底账里有、界面上没了 → 删（deleteSku，不可恢复，删前要弹确认）。
+const originalSkus = ref([])
+
 const formRef = ref()
 const saving = ref(false)
 const loadingOptions = ref(false)
@@ -369,6 +374,9 @@ function generateSkusFromVariations() {
     const imageKey = imageVariant ? (imageVariant.valueId || imageVariant.value || '') : ''
     const specImage = (imageId && specValueImages[imageId]?.[imageKey]) || previous?.specImage || ''
     return {
+      // ⚠️ _skuId 必须跟着组合一起传下去：规格一改就重建整张表，丢了它就认不出
+      //    哪一行是平台上已有的 SKU，保存时会被当成"新增"重复建一个。
+      _skuId: previous?._skuId || '',
       erpCode: previous?.erpCode || `SKU-${String(i + 1).padStart(3, '0')}`,
       barcode: previous?.barcode || '',
       specImage,
@@ -527,6 +535,45 @@ async function uploadXhsVideo({ filename, contentBase64 }) {
   return materialUrl(await xhsApi.uploadMaterialFile(filename, contentBase64, 'VIDEO'))
 }
 
+// ============ 提交给平台的 SKU 载荷：发布 / 编辑时新增规格 共用一份口径 ============
+function buildSkuPayload(sku) {
+  const payload = {
+    ipq: 1,
+    originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100),
+    price: Math.round(Number(sku.priceYuan) * 100),
+    stock: Number(sku.stock),
+    logisticsPlanId: sku.logisticsPlanId || shippingDefaults.logisticsPlanId,
+    erpCode: sku.erpCode,
+    variants: sku._variants || [],
+    deliveryTime: { time: String(sku.deliveryHours || shippingDefaults.deliveryHours || 24), type: 'RELATIVE_TIME_NEW' },
+  }
+  if (sku.barcode) payload.barcode = sku.barcode
+  if (sku.specImage) payload.specImage = sku.specImage
+  return payload
+}
+
+// SKU 的人话标签（确认删规格时给运营看"删的是哪一行"）
+function skuLabel(sku) {
+  return [sku.erpCode, ...((sku._variants || sku.variants || []).map((v) => v.valueName || v.value || ''))]
+    .filter(Boolean).join(' / ')
+}
+
+// 商品详情里 SKU 字段有好几层（skus / skuInfos / itemInfo.skus），统一取一次
+function skuRowsOf(data) {
+  const d = data?.result || data || {}
+  const nested = d.itemInfo || d.data?.itemInfo || d.product || d.data?.product || d.data || {}
+  return d.skus || d.skuInfos || nested.skus || nested.skuInfos || []
+}
+
+// 重新从平台拉一次 SKU 底账：保存后回读校验 + 刷新差集基准
+async function syncOriginalSkus() {
+  const rows = skuRowsOf(await xhsApi.getItem(props.itemId))
+  originalSkus.value = rows
+    .map((sku) => ({ skuId: String(sku.skuId || sku.id || ''), label: skuLabel(sku) }))
+    .filter((row) => row.skuId)
+  return rows.length
+}
+
 async function submit() {
   try {
     await formRef.value.validate()
@@ -577,34 +624,75 @@ async function submit() {
       const updatedFields = ['name', 'images', 'attributes', 'description', 'shippingTemplateId', 'shippingGrossWeight', 'freeReturn']
       if (form.articleNo) updatedFields.push('articleNo')
       await xhsApi.updateItem(props.itemId, { item, updated_fields: updatedFields })
-      // 更新 SKU
+
+      // ---- SKU 三件事：改（已有）/ 增（界面上新出现的规格）/ 删（界面上消失的老规格）----
+      // 平台上对应 updateSkuV2 / createSkuV2 / deleteSkuV2，三条都是真接口，
+      // 失败会把平台原文透出来 —— 不再出现"提示成功、平台侧其实没动"。
+      const failures = []
       for (const sku of form.skuList) {
-        if (sku._skuId) {
-          await xhsApi.updateSku(sku._skuId, {
-            sku: {
-              price: Math.round(Number(sku.priceYuan) * 100),
-              originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100),
-              stock: Number(sku.stock),
-              logisticsPlanId: sku.logisticsPlanId || shippingDefaults.logisticsPlanId,
-            },
-            updated_fields: ['price', 'originalPrice', 'stock', 'logisticsPlanId'],
-          })
-        }
+        if (!sku._skuId) continue
+        await xhsApi.updateSku(sku._skuId, {
+          sku: {
+            price: Math.round(Number(sku.priceYuan) * 100),
+            originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100),
+            stock: Number(sku.stock),
+            logisticsPlanId: sku.logisticsPlanId || shippingDefaults.logisticsPlanId,
+          },
+          updated_fields: ['price', 'originalPrice', 'stock', 'logisticsPlanId'],
+        })
       }
-      ElMessage.success('小红书商品已更新')
+
+      const newRows = form.skuList.filter((sku) => !sku._skuId)
+      let createdCount = 0
+      if (newRows.length) {
+        const data = await xhsApi.createSkus(props.itemId, newRows.map(buildSkuPayload))
+        const result = data?.result || {}
+        const ids = result.skuIds || []
+        createdCount = ids.length
+        // 按序回填新 skuId：同一个会话里再点保存，不会把刚建的 SKU 又建一遍
+        newRows.forEach((row, i) => { if (ids[i]) row._skuId = String(ids[i]) })
+        for (const entry of (result.skuErrors || [])) failures.push(`${entry.sku || '新增 SKU'}：${entry.error}`)
+      }
+
+      const aliveIds = form.skuList.map((sku) => sku._skuId).filter(Boolean)
+      const gone = originalSkus.value.filter((row) => !aliveIds.includes(row.skuId))
+      if (gone.length) {
+        // 删 SKU 不可恢复（该规格的销量/评价一起没），删哪几个、是什么规格先摊开给运营看
+        try {
+          await ElMessageBox.confirm(
+            `以下 ${gone.length} 个 SKU 会从小红书平台删除，删除后不可恢复：\n\n${gone.map((row) => `· ${row.label || row.skuId}`).join('\n')}`,
+            '确认删除这些规格？',
+            { type: 'warning', confirmButtonText: '删除并保存', cancelButtonText: '不删了' },
+          )
+        } catch {
+          // 运营选择不删：商品字段已经更新了，SKU 一个没动，如实说明，别让人以为整单没保存
+          ElMessage.warning('已取消：商品信息已更新，SKU 未做任何增删')
+          emit('updated', item)
+          return
+        }
+        await xhsApi.deleteSkus(props.itemId, gone.map((row) => row.skuId))
+      }
+
+      // 保存后回读一次平台：SKU 数量对不上就直说（防"提示成功其实没生效"）
+      try {
+        const platformCount = await syncOriginalSkus()
+        if (platformCount !== form.skuList.length) {
+          failures.push(`平台回读：商品下实际 ${platformCount} 个 SKU，界面上是 ${form.skuList.length} 个，请刷新后核对`)
+        }
+      } catch { /* 回读失败不影响保存结果 */ }
+
+      if (failures.length) {
+        await ElMessageBox.alert(
+          `商品信息已更新，但 SKU 有 ${failures.length} 处没对上：\n\n${failures.join('\n')}`,
+          '部分 SKU 未生效', { type: 'warning', confirmButtonText: '我知道了' })
+      } else {
+        const parts = [`新增 ${createdCount} 个规格`]
+        if (gone.length) parts.push(`删除 ${gone.length} 个`)
+        ElMessage.success(`小红书商品已更新（${parts.join('，')}）`)
+      }
       emit('updated', item)
     } else {
-      const sku_list = form.skuList.map((sku) => {
-        const s = {
-          ipq: 1, originalPrice: Math.round(Number(sku.originalPriceYuan || sku.priceYuan) * 100),
-          price: Math.round(Number(sku.priceYuan) * 100), stock: Number(sku.stock),
-          logisticsPlanId: sku.logisticsPlanId || shippingDefaults.logisticsPlanId, erpCode: sku.erpCode, variants: sku._variants || [],
-          deliveryTime: { time: String(sku.deliveryHours || shippingDefaults.deliveryHours || 24), type: 'RELATIVE_TIME_NEW' },
-        }
-        if (sku.barcode) s.barcode = sku.barcode
-        if (sku.specImage) s.specImage = sku.specImage
-        return s
-      })
+      const sku_list = form.skuList.map(buildSkuPayload)
       const data = await xhsApi.createItemAndSku({ item, sku_list })
       const result = data.result || {}
       const skuErrors = result.skuErrors || []
@@ -678,6 +766,10 @@ onMounted(async () => {
       if (plan) shippingDefaults.logisticsPlanId = plan.logisticsPlanId
       const hours = form.skuList.find((sku) => sku.deliveryHours)?.deliveryHours
       if (hours) shippingDefaults.deliveryHours = hours
+      // 记下平台原始 SKU 底账：保存时用它算"哪些被删掉了"（_variants 此刻还是平台原文，标签可读）
+      originalSkus.value = form.skuList
+        .map((sku) => ({ skuId: String(sku._skuId || ''), label: skuLabel(sku) }))
+        .filter((row) => row.skuId)
     }
     // 加载类目属性和规格
     if (form.categoryId) {
