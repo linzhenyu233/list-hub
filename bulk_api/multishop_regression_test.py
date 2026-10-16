@@ -355,12 +355,13 @@ _LEGACY = {
                     "youzan": ("/materials/upload-file", "/materials/upload", "img")},
     "item_path": {"wechat": "/products/{id}", "xhs": "/items/{id}", "youzan": "/products/{id}"},
     "title_fit_max": {"wechat": 60, "xhs": 30, "youzan": 60},
-    "price_unit": {"wechat": "cent", "xhs": "cent", "youzan": "yuan"},
+    "price_unit": {"wechat": "cent", "xhs": "cent", "youzan": "cent"},
     "gone_markers": {
         "wechat": ("10020052", "商品不存在", "商品已删除", "商品在回收站"),
         "xhs": ("商品不存在", "商品已删除",
                 "item not exist", "item_not_exist", "item not found"),
-        "youzan": ("商品不存在", "商品已删除", "item not exist", "item_not_exist"),
+        # 122001001 = 有赞"商品不存在!"（2026-10-15 真机核对：youzan.item.get 已删除商品时返回该码）
+        "youzan": ("122001001", "商品不存在", "商品已删除", "item not exist", "item_not_exist"),
     },
     "api_base": {"wechat": ("WECHAT_API_BASE", "http://127.0.0.1:8000"),
                  "xhs": ("XHS_API_BASE", "http://127.0.0.1:8010"),
@@ -433,9 +434,10 @@ def test_adapter_registry_parity():
     assert pr.price_to_platform("wechat", 19.99) == 1999, "微信价格换算错了（会超低价卖出）"
     assert pr.price_to_platform("xhs", 12) == 1200, "小红书价格换算错了"
     assert pr.price_to_platform("wechat", None) == 0
-    # 有赞是「元」：这条写错不会报错，只会超低价卖出（docs §6.1 的最高危项）
-    assert pr.price_to_platform("youzan", 19.99) == 19.99, "有赞价格换算错了（元/分搞混）"
-    assert pr.price_to_platform("youzan", 12) == 12, "有赞价格换算不该做任何缩放"
+    # 有赞也是「分」（2026-10-15 真机纠正：官方对接说明写 price 单位:分，且后台建的商品
+    # 填 28000 元 / 接口读回 2800000 分）。曾经误配成「元」，真机一发布就便宜了 100 倍。
+    assert pr.price_to_platform("youzan", 19.99) == 1999, "有赞价格换算错了（元/分搞混→超低价卖出）"
+    assert pr.price_to_platform("youzan", 12) == 1200, "有赞价格换算错了"
 
     # shop_registry 的四张派生表
     sys.modules.pop("shop_registry", None)
@@ -552,6 +554,214 @@ def test_publish_mode_isolation():
 
     os.unlink(p)
     print("  [OK] mock 记录不污染 live 统计（mode 列 + 默认 live 口径）")
+
+
+def test_publish_status_latest_wins():
+    """发布状态必须"**最新记录为准**" + 有赞要有判定分支。
+
+    真机踩到的两件事（2026-10-15）：
+      ① 商品在有赞后台删掉、核对已把最新记录标成 deleted，面板仍显示"已发布"
+         —— 因为聚合是把历史上**所有**状态堆在一起，更早批次的 success 永远顶在上面；
+      ② 有赞在 platform_item_state 里**没有分支**，3 个在售商品全被判成"查不动
+         （网络或权限问题）"，看着像网络问题，其实是分支没写。
+    """
+    p = _new_db_path()
+    m = _boot(p)
+    conn = m.db()
+    sid = m.shop_registry.default_shop()["shop_id"]
+    inserts = [
+        # Q1：先成功、后核对出"平台已删除" → 最新是 deleted，必须显示未发布（可重发）
+        ("Q1", "success", "OLD_ID", "2026-10-15T06:00:00+00:00"),
+        ("Q1", "deleted", "NEW_ID", "2026-10-15T07:00:00+00:00"),
+        # Q2：先失败、后成功 → 最新是 success
+        ("Q2", "failed", "", "2026-10-15T06:00:00+00:00"),
+        ("Q2", "success", "OK_ID", "2026-10-15T07:00:00+00:00"),
+        # Q3：只有历史成功（没有更新的记录）→ 仍是已发布
+        ("Q3", "success", "ONLY_ID", "2026-10-15T06:00:00+00:00"),
+    ]
+    # ⚠️ publish_items 的唯一键是 (job_id, product_code, platform)：一个任务里同一商品只能有一条记录，
+    #    多条历史记录必然来自**不同批次/任务**（真机就是这样：同一个商品在 5 个批次里各有一条）。
+    for index, (code, status, pid, finished_at) in enumerate(inserts):
+        job = f"job_latest_{index}_" + uuid.uuid4().hex[:6]
+        batch = f"batch_latest_{index}"
+        conn.execute("INSERT INTO publish_jobs (id,shop_id,batch_id,platforms_json,status,total,operator,created_at,mode) "
+                     "VALUES (?,?,?,?,?,?,?,datetime('now'),?)",
+                     (job, sid, batch, '["youzan"]', "done", 1, "tester", "live"))
+        conn.execute("INSERT INTO publish_items (job_id,shop_id,batch_id,product_code,platform,status,"
+                     "priority,mode,platform_product_id,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (job, sid, batch, code, "youzan", status, 1, "live", pid, finished_at))
+    conn.commit()
+    conn.close()
+
+    api_key = os.environ.get("API_KEY") or None
+    code, body = _asgi_call(m.app, "/publish-status", key=api_key)
+    assert code == 200, f"/publish-status 返回 {code}"
+    result = json.loads(body)["result"]
+    assert "success" not in result["Q1"]["platforms"]["youzan"], \
+        f"历史 success 顶掉了最新状态：{result['Q1']}（删掉的商品会一直显示已发布，运营重发不了）"
+    assert "deleted" in result["Q1"]["platforms"]["youzan"], f"最新状态应是 deleted：{result['Q1']}"
+    assert "success" in result["Q2"]["platforms"]["youzan"] and \
+        "failed" not in result["Q2"]["platforms"]["youzan"], f"重发成功后应只报最新状态：{result['Q2']}"
+    assert "success" in result["Q3"]["platforms"]["youzan"], f"没有更新的记录时仍是已发布：{result['Q3']}"
+
+    # 有赞的"还在不在"判定：把 HTTP 调用替换掉，只看分支逻辑（真机报文两种形状）
+    saved_get = m._http_get_json
+    try:
+        m._http_get_json = lambda *a, **k: {"ok": True, "result": {"item": {"item_id": "1", "title": "在售"}}}
+        assert m.platform_item_state("youzan", "1", sid)[0] == m.ITEM_EXISTS, "在售商品被判成查不动/已删除"
+        m._http_get_json = lambda *a, **k: {"ok": False, "detail": "业务失败"}
+        assert m.platform_item_state("youzan", "1", sid)[0] == m.ITEM_UNKNOWN, "业务失败不该下结论"
+        m._http_get_json = lambda *a, **k: {"ok": True, "result": {}}
+        assert m.platform_item_state("youzan", "1", sid)[0] == m.ITEM_GONE, "200 但没商品数据应判已删除"
+    finally:
+        m._http_get_json = saved_get
+    # 已删除的错误码来自真机报文（youzan.item.get → code=122001001 商品不存在!）
+    assert "122001001" in m.platform_registry.adapter("youzan")["gone_markers"], \
+        "有赞「商品不存在」错误码没进标记表"
+
+    os.unlink(p)
+    print("  [OK] 发布状态以最新记录为准 + 有赞判定分支（gone/exists/unknown）")
+
+
+def test_scanner_collects_own_detail_images():
+    """共享盘扫描要收集「商品自有详情图」，且不能污染主图。
+
+    真机问题（2026-10-15 运营反馈）：有赞（以及微信/小红书）的商品详情里只有「通用通栏」，
+    没有该商品自己的详情页 —— 因为扫描器只认「主图 / SKU 图 / 通用通栏」三类，
+    共享盘上的 `<编码>详情页.jpg`、`images/<编码>详情页_01..05.jpg` 一张都没进 detail_images
+    （实测全盘 749 张、覆盖 102 个商品）。
+    """
+    import tempfile
+    import image_scanner as scanner
+    import bulk_api as m
+
+    root = tempfile.mkdtemp(prefix="scan_detail_")
+    root_dirs = {"common": os.path.join(root, "通用通栏"),
+                 "a": os.path.join(root, "1-3月", "ZSTZ106JR-15星运钻"),
+                 "a_img": os.path.join(root, "1-3月", "ZSTZ106JR-15星运钻", "images"),
+                 "b": os.path.join(root, "1-3月", "HZE118福运钻")}
+    for folder in root_dirs.values():
+        os.makedirs(folder, exist_ok=True)
+
+    def touch(folder, name):
+        with open(os.path.join(folder, name), "wb") as handle:
+            handle.write(b"x")
+
+    touch(root_dirs["common"], "详情通栏_01.jpg")
+    touch(root_dirs["common"], "详情通栏_02.jpg")          # 拼接长图（内容与分段重复）→ 应被跳过
+    for index in range(1, 6):
+        touch(root_dirs["a"], f"ZSTZ106JR-15主图{index}.jpg")
+    touch(root_dirs["a"], "ZSTZ106JR-15详情页.jpg")                      # 整张长图
+    for index in range(1, 4):
+        touch(root_dirs["a_img"], f"ZSTZ106JR-15详情页_{index:02d}.jpg")  # 分片（应优先，且不含整图）
+    touch(root_dirs["b"], "HZE118主图1.jpg")
+    touch(root_dirs["b"], "HZE118详情页.jpg")                             # 只有整图
+
+    scan = scanner.scan_image_root(root)
+    detail = {key: [os.path.basename(p) for p in scanner.pick_detail_images(paths)]
+               for key, paths in scan["detail_images"].items()}
+    assert set(detail) == {"ZSTZ106J", "HZE118"}, f"详情图应按款号主干归类：{detail}"
+    assert detail["ZSTZ106J"] == ["ZSTZ106JR-15详情页_01.jpg", "ZSTZ106JR-15详情页_02.jpg",
+                                  "ZSTZ106JR-15详情页_03.jpg"], f"有分片时应只用分片：{detail['ZSTZ106J']}"
+    assert detail["HZE118"] == ["HZE118详情页.jpg"], f"没有分片时用整图：{detail['HZE118']}"
+    # 详情图绝不能混进主图（主图不足 5 张时会把详情长图当主图发出去）
+    mains = [os.path.basename(p) for p in scan["root_images"].get("ZSTZ106J", [])]
+    assert not any("详情" in name for name in mains), f"详情图混进主图了：{mains}"
+    assert scan["unmatched"] == [], f"详情图不该算未识别：{scan['unmatched']}"
+
+    # 通用通栏里的「整页拼接长图」与分段图内容重复（实测 详情通栏_02.jpg 790x3741 就是
+    # 1包装/2项链/2戒指/详情通栏_01/品牌介绍 拼起来的），两个都发会让详情里同一段出现两遍。
+    common_names = [os.path.basename(one) for one in scan["common_images"]]
+    assert "详情通栏_02.jpg" not in common_names, f"拼接长图不该进通用详情图：{common_names}"
+    assert "详情通栏_01.jpg" in common_names, f"分段通栏必须保留：{common_names}"
+    assert [os.path.basename(one) for one in scan["common_skipped_long"]] == ["详情通栏_02.jpg"]
+    # 兜底判据：文件名不在名单里、但高 ≥ 宽×3 的长图也要跳（运营以后再拼一张也不会漏）
+    assert scanner.is_stitched_long_image("x/详情通栏_02.jpg") is True
+    assert scanner.is_stitched_long_image("x/详情通栏_01.jpg") is False
+    assert scanner.is_stitched_long_image("x/不存在的图.jpg") is False   # 读不到就当"不是长图"，不误删
+
+    # 运营口径（2026-10-15 确认）：详情页 = 商品图 + 通用详情图 —— 主图打头、通用通栏收尾。
+    # 两个导入路径共用 merge_detail_images，口径不能各写一套（否则同样一批货换个导入方式详情就变了）。
+    merged = m.merge_detail_images(["m1", "m2"], ["own1"], [], ["c1", "c2"])
+    assert merged == ["m1", "m2", "own1", "c1", "c2"], f"详情图顺序不对：{merged}"
+    # 主图与已有详情图有重叠时只保留一次，且主图仍在最前
+    assert m.merge_detail_images(["m1", "m2"], [], ["m2", "x1"], ["c1"]) == ["m1", "m2", "x1", "c1"]
+    assert m.merge_detail_images([], [], [], []) == [], "空输入不该产出空串占位"
+
+    print("  [OK] 扫描收集商品自有详情图（分片优先、不混进主图）+ 详情图=商品图+通用详情图口径")
+
+
+class _FakeRequest:
+    """让路由函数能取到店铺：最小化的 request 替身。"""
+
+    class headers:  # noqa: N801
+        @staticmethod
+        def get(_key, _default=None):
+            return ""
+
+    operator = "tester"
+
+
+def test_youzan_edit_units_and_stock_delta():
+    """有赞商品编辑的两条真机口径（错一个就改不动或改错）。
+
+    ① **改价接口 `youzan.item.sku.update` 的 price 单位是「元」**，与创建时
+       `item.create` 的 `sku_stocks[].price`（分）**方向相反** —— 按分传会被读成
+       上万倍的价格，报 `code=123001065 SKU价格超过最大限制`。
+    ② **库存只支持增量**（`youzan.item.quantity.update` 的 type 只认 1=增量，
+       2/3 报 `123000104 不支持的库存更新类型`），平台没有"全量覆盖"，
+       所以"把库存设成绝对值"必须自己回读现值算差值。
+
+    这里不真调平台，只钉住「提交给有赞服务的请求体长什么样」——单位错、差值算错都会在真机上体现。
+    """
+    p = _new_db_path()
+    m = _boot(p)
+    m.db().close()          # 本用例不碰业务数据，但临时库文件要先建出来，最后才能 os.unlink 收尾
+    calls = []
+
+    def fake_request(url, payload, method="POST", timeout=180, shop_id=None, extra_headers=None):
+        calls.append((method, url, payload))
+        return {"ok": True, "result": {"is_success": True}}
+
+    reads = {"n": 0}
+
+    def fake_get(url, timeout=60, shop_id=None, extra_headers=None):
+        # 第一次读 = 改前现值(库存 7)；第二次读 = 改后回读(库存 2)
+        reads["n"] += 1
+        quantity = 7 if reads["n"] == 1 else 2
+        return {"ok": True, "result": {"item": {
+            "item_id": "1", "title": "新标题",
+            "skus": [{"sku_id": "151", "item_no": "S1", "price": 20128600, "quantity": quantity}]}}}
+
+    saved_request, saved_get = m._json_request, m._http_get_json
+    saved_has = m.shop_registry.has_platform
+    m._json_request = fake_request
+    m._http_get_json = fake_get
+    # 默认店没配有赞会被前置检查拦下（这本身是对的），这里只测"改的报文长什么样"
+    m.shop_registry.has_platform = lambda shop_id, platform: True
+    try:
+        result = m.youzan_item_edit(
+            m.YouzanItemEditBody(item_id="1", title="新标题",
+                                skus=[{"sku_id": "151", "price": 201286.0, "quantity": 2}]),
+            _FakeRequest())
+    finally:
+        m._json_request, m._http_get_json = saved_request, saved_get
+        m.shop_registry.has_platform = saved_has
+
+    # 改价：提交的是元（不是分）
+    sku_updates = [c for c in calls if c[0] == "PUT" and "/skus/" in c[1]]
+    assert sku_updates, f"没有调用改 SKU 接口：{calls}"
+    assert sku_updates[0][2]["price"] == 201286.0, f"改价必须按元提交（真机口径）：{sku_updates[0][2]}"
+    assert sku_updates[0][2]["item_id"] == "1", "改 SKU 必须带 item_id（有赞要求）"
+    # 库存：提交的是差值（现值 7 → 目标 2 即 -5）且 type=1（唯一支持的类型）
+    stock_calls = [c for c in calls if "/quantity" in c[1]]
+    assert stock_calls and stock_calls[0][2]["quantity"] == -5, \
+        f"库存只能增量，应提交差值 -5：{stock_calls[0][2] if stock_calls else None}"
+    assert stock_calls[0][2]["type"] == 1, f"type 只认 1=增量：{stock_calls[0][2]}"
+    # 回读校验：平台里价格是分（20128600 → 201286 元）、库存 2，与提交一致 → 不该报"没生效"
+    assert result["warnings"] == [], f"回读一致时不该有告警：{result['warnings']}"
+    os.unlink(p)
+    print("  [OK] 有赞商品编辑：改价按元 + 库存增量差值 + 回读校验")
 
 
 def test_mock_mode_and_faults():
@@ -877,6 +1087,277 @@ def test_product_dimension_metrics():
     print("  [OK] 商品维度：金额等比分摊、无名订单单独计数")
 
 
+def test_youzan_auth_real_machine_contract():
+    """钉住 2026-10-15 真机换 token 踩到的三条（改回去会立刻红）。
+
+    ① /auth/token 不接受表单，必须 JSON；② 入参名是 authorize_type + grant_id，
+    不是 grant_type + kdt_id；③ 返回的 expires 是**绝对毫秒时间戳**，
+    而且 token 包在 data 里（失败壳是 success=false + message）。
+    """
+    import sys
+    import time
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "youzan"))
+    import mock_platform as mp
+    import youzan_api as ya
+    import youzan_store as ys
+
+    # --- ③ 过期时间换算：毫秒绝对时间戳 / 距现在多少秒 / 缺省 7 天 ---
+    assert ya._expire_at_from({"expires": 1792649474000}) == 1792649474, "毫秒时间戳没被换回秒"
+    now = int(time.time())
+    assert now + 3590 <= ya._expire_at_from({"expires_in": 3600}) <= now + 3600
+    assert ya._expire_at_from({}) - now == 7 * 24 * 3600, "缺省应回落有赞固定 7 天"
+
+    # --- ①② 请求体与提交方式：拦在网关出口上验证 ---
+    captured = {}
+    original = mp.gateway_call
+
+    class _Resp:
+        status_code = 200
+        text = '{"success":true,"code":200,"data":{"access_token":"tok","expires":1792649474000}}'
+
+        def json(self):
+            import json
+            return json.loads(self.text)
+
+    def fake_gateway_call(platform, url, *, method_key, body=None, **kwargs):
+        captured.update(platform=platform, method_key=method_key, body=dict(body or {}),
+                        form=kwargs.get("form", False))
+        return _Resp()
+
+    mp.gateway_call = fake_gateway_call
+    try:
+        store = ys.YouzanStore("cid", "sec", "182722505", shop_id="probe")
+        data = store.request_token()
+    finally:
+        mp.gateway_call = original
+
+    assert captured["method_key"] == "auth.token"
+    assert captured["form"] is False, "换成表单提交会被有赞以 code=1000 拒绝"
+    assert captured["body"].get("authorize_type") == "silent", "入参名必须是 authorize_type"
+    assert captured["body"].get("grant_id") == "182722505", "店铺 id 走 grant_id，不是 kdt_id"
+    assert "grant_type" not in captured["body"] and "kdt_id" not in captured["body"]
+    assert store.access_token == "tok", "token 应从 data 壳里取出来"
+    assert data.get("access_token") == "tok"
+
+    # --- 失败壳（success=false + message）必须把 message 透出来 ---
+    class _FailResp:
+        status_code = 200
+        text = '{"success":false,"code":1000,"data":null,"message":"参数错误"}'
+
+        def json(self):
+            import json
+            return json.loads(self.text)
+
+    mp.gateway_call = lambda *a, **k: _FailResp()
+    try:
+        try:
+            ys.YouzanStore("cid", "sec", "1", shop_id="probe").request_token()
+        except ys.YouzanError as exc:
+            assert "参数错误" in str(exc), f"失败壳的 message 没透出来: {exc}"
+        else:
+            raise AssertionError("失败壳没有被识别为错误")
+    finally:
+        mp.gateway_call = original
+        sys.path.remove(str(Path(__file__).resolve().parent.parent / "youzan"))
+    print("  [OK] 有赞换 token 真机契约（JSON + authorize_type/grant_id + expires 毫秒）")
+
+
+def test_youzan_sku_stocks_rules():
+    """有赞 SKU 组包的两条运营口径（2026-10-15 定，改回去要红）。
+
+    ① 笛卡尔积补全：不存在的组合必须以库存 0 出现（有赞硬要求），
+       且**编码留空、价格取该商品最低价**（不拼假编码、不虚高）；
+    ② 规格缺值的 SKU **直接拦下并点名**，不许静默丢弃（货盘里 19% 的 SKU 缺值）。
+    """
+    import bulk_api as m
+
+    def sku(code, price, stock, specs):
+        return {"sku_code": code, "price": price, "stock": stock,
+                "specs": [{"name": k, "value": v} for k, v in specs]}
+
+    # ① 网格完整：1×3 → 3 条，全部是真实 SKU
+    grid = {"product_code": "P1", "skus": [
+        sku("P1-R", 100, 1, [("颜色", "红")]),
+        sku("P1-W", 200, 2, [("颜色", "白")]),
+        sku("P1-Y", 300, 3, [("颜色", "黄")]),
+    ]}
+    stocks, images = m._youzan_sku_stocks(grid)
+    assert len(stocks) == 3, stocks
+    assert [one["item_no"] for one in stocks] == ["P1-R", "P1-W", "P1-Y"]
+    assert [one["quantity"] for one in stocks] == [1, 2, 3]
+    assert all(len(one["skus"]) == 1 for one in stocks)
+    assert stocks[0]["price"] == m._youzan_price(100), "价格应按适配器换算成平台单位"
+    assert images == [], "没有规格图时不该给出空壳条目"
+
+    # ② 稀疏网格：2×2 只有 2 个真实组合 → 另外 2 条是占位（编码空、库存 0、价格取最低价）
+    sparse = {"product_code": "P2", "skus": [
+        sku("P2-A", 500, 5, [("颜色", "红"), ("尺寸", "L")]),
+        sku("P2-B", 300, 0, [("颜色", "白"), ("尺寸", "S")]),
+    ]}
+    stocks, _ = m._youzan_sku_stocks(sparse)
+    assert len(stocks) == 4, f"必须按笛卡尔积补全（有赞硬要求）: {stocks}"
+    placeholders = [one for one in stocks if not one["item_no"]]
+    assert len(placeholders) == 2, f"占位组合应恰好 2 条: {stocks}"
+    assert all(one["quantity"] == 0 for one in placeholders), "占位组合必须是 0 库存"
+    assert {one["price"] for one in placeholders} == {m._youzan_price(300)}, \
+        "占位组合的价格应取该商品最低价（不是首个 SKU 的价）"
+    assert all(len(one["skus"]) == 2 for one in stocks), "每条都要带齐两个维度"
+
+    # ③ 规格缺值：拦下并点名（不静默丢）
+    broken = {"product_code": "P3", "skus": [
+        sku("P3-A", 100, 1, [("颜色", "红"), ("尺寸", "L")]),
+        sku("P3-B", 200, 1, [("颜色", ""), ("尺寸", "S")]),
+    ]}
+    try:
+        m._youzan_sku_stocks(broken)
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "P3-B" in message, f"失败原因里要点名缺值的 SKU: {message}"
+        assert "颜色" in message, f"失败原因里要写缺哪个维度: {message}"
+    else:
+        raise AssertionError("规格缺值的 SKU 必须拦下，不能静默丢弃")
+
+    # ④ 超过三级规格：有赞上限，直接报错而不是把规格悄悄丢掉
+    too_many = {"product_code": "P4", "skus": [
+        sku("P4-A", 100, 1, [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")])]}
+    try:
+        m._youzan_sku_stocks(too_many)
+    except RuntimeError as exc:
+        assert "3 级" in str(exc)
+    else:
+        raise AssertionError("超过三级规格必须报错（静默丢规格 = 发出去没规格）")
+
+    # ⑤ 规格图：图片缓存对 youzan 存的是 {"id","url"} JSON，而 sku_images 只能填**URL**。
+    #    2026-10-15 真机裂图就是这个：把 JSON 字符串 / 素材 ID 当成了图片地址。
+    with_image = {"product_code": "P5", "skus": [
+        {"sku_code": "P5-R", "price": 100, "stock": 1,
+         "specs": [{"name": "颜色", "value": "红"}],
+         "uploaded_sku_image": '{"id": "123", "url": "https://img.example/r.jpg"}'},
+        # 撞图重传那条路返回的是**裸 URL**（不是 JSON）—— 曾被我按"历史素材 ID"处理而丢掉
+        {"sku_code": "P5-W", "price": 100, "stock": 1,
+         "specs": [{"name": "颜色", "value": "白"}],
+         "uploaded_sku_image": "https://img.example/w.jpg"},
+        {"sku_code": "P5-B", "price": 100, "stock": 1,
+         "specs": [{"name": "颜色", "value": "蓝"}],
+         "uploaded_sku_image": "12074683460"}]}          # 更早的缓存：纯素材 ID（拿不到 URL）
+    _, image_rows = m._youzan_sku_stocks(with_image)
+    assert image_rows == [{"v": "红", "img_url": "https://img.example/r.jpg"},
+                          {"v": "白", "img_url": "https://img.example/w.jpg"}], image_rows
+    assert all(row["img_url"].startswith("http") for row in image_rows), \
+        "规格图必须是可访问 URL，不能是 JSON 串或素材 ID"
+
+    # 图片引用三种形态：JSON（缓存）/ 裸 URL（撞图重传）/ 纯素材 ID（更早的缓存）
+    ref = m._youzan_image_ref
+    assert ref('{"id": "9", "url": "https://a/b.jpg"}', "id") == "9"
+    assert ref('{"id": "9", "url": "https://a/b.jpg"}', "url") == "https://a/b.jpg"
+    assert ref("https://a/b.jpg", "url") == "https://a/b.jpg", "裸 URL 要能当 URL 用（曾误判成素材 ID）"
+    assert ref("https://a/b.jpg", "id") == "", "裸 URL 不是素材 ID，不能塞进主图 image_ids"
+    assert ref("12074683460", "id") == "12074683460"
+    assert ref("12074683460", "url") == "", "纯素材 ID 拿不到 URL（旧缓存），规格图应跳过而不是拼错串"
+
+    # ⑥ 规格图归属：有赞 sku_images **只认第一级规格**，而货盘的图是按颜色拍的。
+    #    若第一级是「主钻分数」，图会被挂到分数上（后台看着像配错图）、颜色反而没图。
+    #    规则：把"有图的取值更多"的那个维度提到第一级。
+    reorder = {"product_code": "P6", "skus": [
+        {"sku_code": "P6-R", "price": 100, "stock": 1,
+         "specs": [{"name": "主钻分数", "value": "100分"}, {"name": "颜色", "value": "红"}],
+         "uploaded_sku_image": '{"id": "1", "url": "https://img.example/red.jpg"}'},
+        {"sku_code": "P6-W", "price": 100, "stock": 1,
+         "specs": [{"name": "主钻分数", "value": "100分"}, {"name": "颜色", "value": "白"}],
+         "uploaded_sku_image": '{"id": "2", "url": "https://img.example/white.jpg"}'},
+        # 这条没有图：它让「主钻分数」只剩 1 个取值配得上图，「颜色」有 2 个 → 颜色该排第一级
+        {"sku_code": "P6-Y", "price": 100, "stock": 1,
+         "specs": [{"name": "主钻分数", "value": "200分"}, {"name": "颜色", "value": "黄"}]}]}
+    stocks, image_rows = m._youzan_sku_stocks(reorder)
+    assert [one["k"] for one in stocks[0]["skus"]][0] == "颜色", \
+        f"有图的维度应排到第一级: {stocks[0]['skus']}"
+    assert image_rows == [{"v": "红", "img_url": "https://img.example/red.jpg"},
+                          {"v": "白", "img_url": "https://img.example/white.jpg"}], image_rows
+    assert {one["kid"] for dim in [stocks[0]["skus"]] for one in dim} == {1, 2}, "kid 要按展示顺序重编号"
+
+    print("  [OK] 有赞 SKU 组包口径（笛卡尔积补占位 + 缺值拦下点名 + 三级上限 + 规格图取 URL/归属）")
+
+
+def test_youzan_image_upload_contract():
+    """钉住 ★3：图片素材上传必须是 multipart，字段名 `image`。
+
+    2026-10-15 真机试错结论（都会红在这条断言上）：
+      JSON {"img": …} / {"file": …}    → 160400100 file 参数错误
+      JSON {"image": base64}          → 5001 系统异常
+      multipart 字段名 img/file        → 160400100 file 参数错误
+      multipart 字段名 image + 字节    → ✅ image_id
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "youzan"))
+    import mock_platform as mp
+    import youzan_store as ys
+
+    captured = {}
+    original = mp.gateway_call
+
+    class _Resp:
+        status_code = 200
+        text = '{"success":true,"code":200,"data":{"image_id":9480524327,"image_url":"https://x/a.jpg"}}'
+
+        def json(self):
+            import json
+            return json.loads(self.text)
+
+    def fake_gateway_call(platform, url, *, method_key, body=None, files=None, **kwargs):
+        captured.update(method_key=method_key, body=body, files=files)
+        return _Resp()
+
+    mp.gateway_call = fake_gateway_call
+    try:
+        data = ys.YouzanStore("cid", "sec", "1", "tok", shop_id="probe").upload_image_bytes(
+            b"\xff\xd8jpeg", "戒指.png")
+    finally:
+        mp.gateway_call = original
+        sys.path.remove(str(Path(__file__).resolve().parent.parent / "youzan"))
+
+    assert captured["method_key"] == "youzan.materials.storage.platform.img.upload"
+    assert captured["files"], "图片上传必须走 multipart，传 JSON 会被平台拒"
+    assert set(captured["files"]) == {"image"}, f"字段名必须是 image: {set(captured['files'])}"
+    name, content, mime = captured["files"]["image"]
+    assert name == "戒指.png" and content == b"\xff\xd8jpeg"
+    assert mime == "image/png", f"mime 应随扩展名推断: {mime}"
+    assert data.get("image_id") == 9480524327
+    print("  [OK] 有赞图片上传真机契约（multipart + 字段名 image + 字节）")
+
+
+def test_mock_mode_counts_as_configured():
+    """mock 模式也算「这家店配了这个平台」。
+
+    否则会前后端打架：前端（店铺管理页 / 批量发布面板）把 mode=mock 当作已开通，
+    中台却认为没配 —— 数据面板不给有赞建页、不同步有赞订单，运营看到"能勾有赞但没有数据"。
+    has_platform 与 platform_creds 必须同口径放行（一个判 True、另一个抛错同样自相矛盾）。
+    """
+    import mock_platform as mp
+    import shop_registry as sr
+
+    shop_id = sr.default_shop()["shop_id"]
+    key = mp.env_mode_key("youzan")
+    saved = os.environ.get(key)
+    try:
+        os.environ[key] = "mock"
+        assert sr.has_platform(shop_id, "youzan"), "mock 模式下 has_platform 必须为 True"
+        creds = sr.platform_creds(shop_id, "youzan")     # mock 模式凭证是占位，不该抛错
+        assert isinstance(creds, dict)
+        # 订单模块按 orders 能力建页：有赞声明了 orders，mock 店的这条路必须走得通
+        import bulk_api as m
+        assert "youzan" in m.order_platforms(shop_id), "mock 店的有赞订单页/同步被漏掉了"
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
+    print("  [OK] mock 模式算已配置（has_platform / platform_creds / 订单平台口径一致）")
+
+
 def main():
     print("多店铺中台回归测试：")
     test_migration_idempotent()
@@ -889,6 +1370,13 @@ def main():
     test_adapter_registry_parity()
     test_publish_mode_isolation()
     test_mock_mode_and_faults()
+    test_mock_mode_counts_as_configured()
+    test_publish_status_latest_wins()
+    test_scanner_collects_own_detail_images()
+    test_youzan_edit_units_and_stock_delta()
+    test_youzan_auth_real_machine_contract()
+    test_youzan_image_upload_contract()
+    test_youzan_sku_stocks_rules()
     test_dev_reload_default_off()
     test_gateway_json_post_keeps_params()
     test_order_metrics_aggregation()

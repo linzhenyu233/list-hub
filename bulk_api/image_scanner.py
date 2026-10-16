@@ -18,6 +18,8 @@
       'ZNJ1725W-50主图2.jpg' -> 'ZNJ1725W-50';  'ZNJ1725W-50 三色' -> 'ZNJ1725W-50'
     - SKU 图     : 取该 SKU 的「主图2」(运营指定, 每个 SKU 固定用第 2 张)
     - 商品主图   : 商品文件夹根下的本色图, 按「商品编码」(去掉颜色字母的款号主干)归类
+    - 商品详情图 : 文件名带「详情页/详情图/长图」的图(如 HZE118详情页.jpg / images/HZE118详情页_01..05.jpg),
+                   按「商品编码」归类; 整图与分片同时在时只用分片(内容重复, 见 pick_detail_images)
     - 通用详情图 : 通用通栏目录下的图
     - 同色不同分数(如 ZSTZ106SLW-20 与图片 ZSTZ106SLW-10)共用一套图: 去掉尾部 -数字 后匹配
     - 前缀匹配必须落在分隔符上: 'C065XAM00021R' 可匹配 'C065XAM00021R-30',
@@ -44,11 +46,30 @@ NAME_TAGS = ("三色", "二色", "双色", "四色", "五色")
 # 通用详情图目录(不受月份过滤影响)
 COMMON_DETAIL_NAMES = {"通用通栏", "放置于详情内的通用通栏"}
 
+# ⚠️ 通用通栏里混着「整页拼接长图」，与同目录的分段图内容重复（2026-10-15 实测+用户反馈）：
+#   通用通栏\详情通栏_02.jpg 是 790x3741 的长图，缩略图逐段比对下来就是
+#   1包装 / 2项链 / 2戒指 / 详情通栏_01 / 3品牌介绍---通栏_01 … 这些分段拼起来的，
+#   两个一起发 = 详情里同一段内容连着出现两遍。
+# 口径：**保留分段图、跳过拼接长图**（分段图手机端加载快、能点开看大图，长图要点很久）。
+COMMON_DETAIL_SKIP_STEMS = ("详情通栏_02",)
+# 兜底：文件名不在上面这张表里、但"高 ≥ 宽 × 该倍数"的一律当拼接长图跳过，
+# 免得运营以后又拼一张新的长图进来，我们又发了两遍内容。
+COMMON_DETAIL_LONG_ASPECT = 3.0
+
 # 非商品目录
 NON_PRODUCT_NAMES = {"文档", "__MACOSX"}
 
 # 文件名里的主图标记, 编码段取它之前的部分
 MAIN_MARK = "主图"
+
+# 商品自有详情图的文件名标记(编码段同样取它之前的部分):
+#   HZE118详情页.jpg            整张长图
+#   images/HZE118详情页_01.jpg  长图切成的分片(实测多数商品是"整图 + 5 片"同时在)
+# 2026-10-15 补: 以前只收集「主图 / SKU 图 / 通用通栏」, 商品自己的详情页完全没进
+# 详情图列表 —— 表现就是各平台详情里只有通用通栏, 没有该商品自己的图。
+DETAIL_MARKS = ("详情页", "详情图", "详情长图", "详情", "长图")
+# 分片文件名的序号(用于排序 + 判断"这是分片而不是整图")
+_DETAIL_INDEX = re.compile(r"_(\d+)\s*$")
 
 # 非数字主图角色排序权重
 ROLE_ORDER = {"白底": 2, "PNG": 3}
@@ -110,6 +131,73 @@ def sort_key(path):
     if role.isdigit():
         return (0, int(role), os.path.basename(path))
     return (1, ROLE_ORDER.get(role, 9), os.path.basename(path))
+
+
+def detail_mark_of(filename):
+    """文件名里的详情图标记('详情页'/'详情图'/'详情'/'长图'), 没有返回 ''。"""
+    stem = os.path.splitext(filename)[0]
+    for mark in DETAIL_MARKS:
+        index = stem.find(mark)
+        if index > 0:                      # 必须在编码之后出现(纯"详情.jpg"没有编码, 不认)
+            return mark
+    return ""
+
+
+def detail_code_of_filename(filename):
+    """详情图文件名 -> 编码段。'HZE118详情页_01.jpg' -> 'HZE118'; 'ZSTZ106JR-15详情页.jpg' -> 'ZSTZ106JR-15'"""
+    mark = detail_mark_of(filename)
+    if not mark:
+        return ""
+    return _clean(os.path.splitext(filename)[0].split(mark)[0])
+
+
+def detail_slice_index(filename):
+    """分片序号: 'HZE118详情页_02.jpg' -> 2; 整图 'HZE118详情页.jpg' -> None。"""
+    stem = os.path.splitext(filename)[0]
+    match = _DETAIL_INDEX.search(stem)
+    return int(match.group(1)) if match else None
+
+
+def is_stitched_long_image(path):
+    """是否是「整页拼接长图」（内容与同目录分段图重复，发出去详情里会出现两遍）。
+
+    两种判据任一命中即算：
+      ① 文件名在 ``COMMON_DETAIL_SKIP_STEMS`` 里（已确认的那张：详情通栏_02.jpg）；
+      ② 高 ≥ 宽 × ``COMMON_DETAIL_LONG_ASPECT``（靠图片头判断尺寸，不解码整张）。
+    读不到尺寸时按"不是长图"处理 —— 宁可多发一张，也不要误删运营的图。
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem in COMMON_DETAIL_SKIP_STEMS:
+        return True
+    try:
+        from PIL import Image
+        with Image.open(path) as image:
+            width, height = image.size
+    except Exception:  # noqa: BLE001
+        return False
+    return width > 0 and height >= width * COMMON_DETAIL_LONG_ASPECT
+
+
+def pick_detail_images(paths):
+    """从同一商品的详情图候选里挑出"一套"。
+
+    实测命名是「整张长图 + 切成若干分片」同时在(HZE118详情页.jpg 与 images/HZE118详情页_01..05.jpg),
+    两者内容重复: 直接用会把同一段详情放两遍。规则 = 有分片就用分片(按序号排序), 否则用整图。
+    多个不同前缀(可能按颜色各一套)时各出一套, 顺序按文件名稳定排序。
+    """
+    groups = {}
+    for path in paths or []:
+        name = os.path.basename(path)
+        stem = os.path.splitext(name)[0]
+        match = _DETAIL_INDEX.search(stem)
+        base = stem[: match.start()] if match else stem
+        groups.setdefault(base, []).append((detail_slice_index(name), name, path))
+    picked = []
+    for base in sorted(groups):
+        items = sorted(groups[base], key=lambda one: (one[0] is None, one[0] or 0, one[1]))
+        slices = [one for one in items if one[0] is not None]
+        picked.extend(one[2] for one in (slices if len(slices) >= 2 else items))
+    return picked
 
 
 def _walk_images(folder, skip_dir_names, nested_product_dirs=None):
@@ -220,8 +308,8 @@ def scan_image_root(root, months=None, skip_dir_names=None):
     }
     """
     skip_dir_names = set(skip_dir_names or SKIP_DIR_NAMES)
-    result = {"sku_images": {}, "root_images": {}, "common_images": [],
-              "unmatched": [], "scanned": 0, "folders": 0}
+    result = {"sku_images": {}, "root_images": {}, "detail_images": {}, "common_images": [],
+              "common_skipped_long": [], "unmatched": [], "scanned": 0, "folders": 0}
 
     for month in sorted(os.scandir(root), key=lambda e: e.name):
         if not month.is_dir() or month.name in NON_PRODUCT_NAMES:
@@ -229,7 +317,12 @@ def scan_image_root(root, months=None, skip_dir_names=None):
         # 通用详情图目录: 不受月份过滤影响, 所有商品共用
         if month.name in COMMON_DETAIL_NAMES:
             for dirpath, filename in _walk_images(month.path, skip_dir_names):
-                result["common_images"].append(os.path.join(dirpath, filename))
+                full = os.path.join(dirpath, filename)
+                # 拼接长图与分段图内容重复, 跳过(见 is_stitched_long_image 的实测说明)
+                if is_stitched_long_image(full):
+                    result["common_skipped_long"].append(full)
+                    continue
+                result["common_images"].append(full)
             continue
         if months and month.name not in months:
             continue
@@ -242,6 +335,14 @@ def scan_image_root(root, months=None, skip_dir_names=None):
             for dirpath, filename in _walk_images(product_dir, skip_dir_names, nested_product_dirs):
                 full = os.path.join(dirpath, filename)
                 result["scanned"] += 1
+                # 商品自有详情图(详情页/详情图/长图): 单独归类, 直接跳到下一张 ——
+                # 它们既不是主图也不是 SKU 图, 若混进去会顶掉主图(主图不足 5 张时尤其明显),
+                # 还会把 SKU 图匹配引到一张没有「主图2」的候选上。
+                detail_code = detail_code_of_filename(filename)
+                if detail_code:
+                    key = product_code_of(detail_code) or detail_code
+                    result["detail_images"].setdefault(key, []).append(full)
+                    continue
                 at_root = os.path.normcase(dirpath) == os.path.normcase(product_dir)
                 if at_root:
                     # 按商品编码归类: 文件夹名是 SKU 编码(含颜色字母/分数), 商品级主图要用款号主干查
@@ -406,6 +507,12 @@ def build_report(scan_result):
         len(scan_result["sku_images"]),
         sum(1 for v in scan_result["sku_images"].values() if v.get("main2"))))
     lines.append("商品主图(按商品编码): %d 个商品" % len(scan_result["root_images"]))
+    own_detail = scan_result.get("detail_images") or {}
+    lines.append("商品自有详情图: %d 张 / %d 个商品" % (sum(len(v) for v in own_detail.values()), len(own_detail)))
     lines.append("通用详情图: %d 张" % len(scan_result["common_images"]))
+    skipped_long = scan_result.get("common_skipped_long") or []
+    if skipped_long:
+        lines.append("跳过拼接长图(与分段重复): %d 张 %s" % (
+            len(skipped_long), [os.path.basename(one) for one in skipped_long]))
     lines.append("未识别编码的图片: %d 张" % len(scan_result["unmatched"]))
     return "\n".join(lines)

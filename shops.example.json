@@ -11,9 +11,16 @@
     "  xhs/tokens/<shop_id>.json。首次接入用 POST /token/code（带 X-Shop-Id）授权，之后自动续期。",
     "  这里的 access_token/refresh_token 保持空串即可。",
     "",
-    "【一个 shop = 一个运营单元】同时含微信 + 小红书两套配置，不是单平台单店。",
+    "【一个 shop = 一个运营单元】同时含各平台配置（微信 / 小红书 / 有赞 …），不是单平台单店。",
     "  运营在前端切换 shop，切换后批次/任务/图片缓存/类目映射全部按 shop 隔离；",
     "  某个平台不需要就把那段留空（如 \"wechat\": {}）。",
+    "",
+    "【有赞段的写法】有赞是自用型无容器应用，凭证是**三件套**：",
+    "  client_id / client_secret（应用凭证，控制台→应用中心→应用概况）",
+    "  kdt_id（店铺 ID，授权信息页）。一个应用可绑多家店，token 按 kdt_id 隔离，",
+    "  所以每个 shop 必须写自己的 kdt_id，否则会拿到别家店的 token。",
+    "  没有 refresh_token：access_token 7 天过期后静默重取（服务自动做）。",
+    "  还没拿到凭证时把 \"mode\": \"mock\" 写进 youzan 段，服务不发外网请求即可跑通链路。",
     "",
     "【命名】shop_id 用后台店铺名的拼音全拼（如 zuanshishijia），不要用序号（shop_01 这种）；",
     "  不要带平台词（xhs_/wx_ 前缀），因为一个 shop 同时管两个平台。只用小写字母/数字/下划线。",
@@ -52,8 +59,27 @@
         "shipping_template_id": "${XHS_SHIPPING_TEMPLATE_ID}",
         "logistics_plan_id": "${XHS_LOGISTICS_PLAN_ID}"
       },
+      "youzan": {},
       "image_root": "\\\\192.168.10.250\\电子商务部\\网销部共享\\SHINING HOUSE培育钻",
-      "remark": "现有店铺。小红书后台名：钻石世家。归属验证锚点：商品 <该店一个已知商品ID>。"
+      "remark": "现有店铺。小红书后台名：钻石世家。归属验证锚点：商品 <该店一个已知商品ID>。该店未接有赞（youzan 段留空）。"
+    },
+    {
+      "shop_id": "youzanshidian",
+      "name": "有赞试点店",
+      "enabled": false,
+      "is_default": false,
+      "wechat": {},
+      "xhs": {},
+      "youzan": {
+        "client_id": "${YOUZAN_CLIENT_ID}",
+        "client_secret": "${YOUZAN_CLIENT_SECRET}",
+        "kdt_id": "${YOUZAN_KDT_ID}",
+        "access_token": "",
+        "delivery_template_id": "${YOUZAN_DELIVERY_TEMPLATE_ID}",
+        "mode": "mock"
+      },
+      "image_root": "",
+      "remark": "有赞店示例。mode=mock 时不需要真实凭证即可跑通导入→映射→发布→状态；拿到 client_id/client_secret/kdt_id 并申请到类目能力包后把 mode 改成 live（或删掉本行，默认 live）。"
     },
     {
       "shop_id": "xianshangmaodedian",

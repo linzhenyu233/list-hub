@@ -8,6 +8,7 @@ import base64
 import csv
 import io
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -700,16 +701,16 @@ def _reassign_legacy_shop(conn):
     print(f"[db-migrate] 历史数据已从 '{legacy}' 迁移到默认店 '{target}'（共 {moved} 行）")
 
 
-def _json_post(url, payload, timeout=180, shop_id=None, extra_headers=None):
+def _json_request(url, payload, method="POST", timeout=180, shop_id=None, extra_headers=None):
     headers = {"Content-Type": "application/json"}
     if shop_id:
         headers[SHOP_HEADER] = shop_id
     if extra_headers:
         headers.update(extra_headers)
-    # 调 wechat/xhs 服务：它们开启鉴权后必须带 X-API-Key，否则一律 401
+    # 调 wechat/xhs/youzan 服务：它们开启鉴权后必须带 X-API-Key，否则一律 401
     headers.update(api_auth.auth_headers())
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                                     headers=headers, method="POST")
+                                     headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -722,6 +723,15 @@ def _json_post(url, payload, timeout=180, shop_id=None, extra_headers=None):
     except Exception as exc:
         raise RuntimeError(str(exc)[:500]) from exc
     return data
+
+
+def _json_post(url, payload, timeout=180, shop_id=None, extra_headers=None):
+    return _json_request(url, payload, "POST", timeout, shop_id, extra_headers)
+
+
+def _json_put(url, payload, timeout=180, shop_id=None, extra_headers=None):
+    """PUT 版本（改商品 / 改 SKU 用）。以前只有 _json_post，接第三方平台的改类接口时要另写一份。"""
+    return _json_request(url, payload, "PUT", timeout, shop_id, extra_headers)
 
 
 def fit_wechat_title(title):
@@ -925,12 +935,20 @@ def _platform_image(platform, source_url, shop_id=None):
                               {entry["image_url_payload_key"]: source_url}, shop_id=shop_id)
     if response.get("ok") is False: raise RuntimeError(str(response.get("detail") or response)[:500])
     result = response.get("result")
-    if isinstance(result, str): platform_url = result
-    else: platform_url = ((result or {}).get("url") or (result or {}).get("materialUrl")
-                          or (result or {}).get("fileUrl") or (result or {}).get("img_url")
-                          # 有赞：商品接口只收素材 ID（image_ids），所以这里缓存的是 image_id，
-                          # 不是可访问 URL（平台侧素材 ID 本来就不可外链，能拼进 payload 即可）。
-                          or (result or {}).get("image_id"))
+    if isinstance(result, str):
+        platform_url = result
+    elif platform == "youzan":
+        # 有赞素材上传返回 {"image_id":…, "image_url":…} 两个都要用：
+        #   商品主图走 `image_ids`（逗号分隔的素材 ID）；
+        #   商品详情图要塞进 `desc` 富文本的 <img src>，只能用 image_url。
+        # 所以缓存里同时存（JSON），取用方各取所需；旧缓存是纯 ID 字符串，取用方要兼容。
+        raw = result or {}
+        platform_url = json.dumps({"id": str(raw.get("image_id") or ""),
+                                   "url": str(raw.get("image_url") or "")},
+                                  ensure_ascii=False)
+    else:
+        platform_url = ((result or {}).get("url") or (result or {}).get("materialUrl")
+                        or (result or {}).get("fileUrl") or (result or {}).get("img_url"))
     if not platform_url: raise RuntimeError(f"{platform} 图片上传未返回地址")
     conn = db()
     conn.execute("INSERT OR REPLACE INTO image_upload_cache(shop_id,platform,source_hash,source_url,platform_url,updated_at) VALUES(?,?,?,?,?,?)",
@@ -938,6 +956,39 @@ def _platform_image(platform, source_url, shop_id=None):
     conn.commit(); conn.close()
     _image_cache_mem_put(cache_key, platform_url)
     return platform_url
+
+
+def _youzan_image_ref(value, field):
+    """从有赞图片引用里取素材 ID 或 URL。
+
+    一共三种形态，都要认（2026-10-15 实测踩到）：
+      ① ``{"id":…,"url":…}`` JSON —— 走缓存的上传（当前主路径），两个都能取；
+      ② 纯 URL 字符串 —— 撞图重传（``_upload_image_uncached``）返回的形态，
+         只有 URL、没有素材 ID；
+      ③ 纯素材 ID 字符串 —— 更早的历史缓存，只有 ID、拿不到 URL。
+    ⚠️ ②和③都是"非 JSON 的字符串"，早期版本一律按 ③ 处理，于是撞图重传回来的 URL
+      被当成素材 ID → 规格图取不到 URL 被跳过（真机表现：7 张规格图只上去 2 张）。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        if text.startswith("http"):          # ② 纯 URL
+            return text if field == "url" else ""
+        return text if field == "id" else ""  # ③ 纯素材 ID
+    if isinstance(data, dict):
+        return str(data.get(field) or "")
+    return text if field == "id" else ""
+
+
+def _youzan_image_id(value):
+    return _youzan_image_ref(value, "id")
+
+
+def _youzan_image_url(value):
+    return _youzan_image_ref(value, "url")
 
 
 def _image_cache_mem_put(cache_key, platform_url):
@@ -992,6 +1043,15 @@ def _upload_image_uncached(platform, source_url, shop_id=None):
     result = response.get("result")
     if isinstance(result, str):
         return result
+    if platform == "youzan":
+        # ⚠️ 有赞**规格图只能填可访问 URL**（sku_images[].img_url 是地址，不是素材 ID）。
+        # 这里以前跟着下面的兜底链取到 image_id，平台后台就是一堆裂图（2026-10-15 实测）。
+        # 返回形态与缓存路径保持一致（{"id","url"}），取值统一走 _youzan_image_ref。
+        raw = result or {}
+        url = str(raw.get("image_url") or "")
+        if raw.get("image_id"):
+            return json.dumps({"id": str(raw["image_id"]), "url": url}, ensure_ascii=False)
+        return url
     return ((result or {}).get("url") or (result or {}).get("materialUrl")
             or (result or {}).get("fileUrl") or (result or {}).get("img_url")
             or (result or {}).get("image_id") or "")
@@ -1154,10 +1214,12 @@ def _xhs_payload(product, mapping, group_config=None, shop_id=None):
 
 
 def _youzan_price(amount_yuan):
-    """中台价格（元）→ 有赞价格。
+    """中台价格（元）→ 有赞价格（**分**）。
 
-    ⚠️ 有赞 item.create 的 price 官方注明"单位:元"（与微信/小红书的"分"不同）。
-    换算走适配器的 price_unit，不在业务代码里写死 —— 否则平台改口径时两处会打架。
+    ⚠️ 2026-10-15 真机纠正：有赞商品接口的 price 单位是**分**（与微信/小红书一致）。
+    曾经按"官方文档注明单位:元"写成 yuan，真机发布会把商品价格**便宜 100 倍**
+    （货盘上架价 699000 元 → 平台存成 699000 分 = 6990 元）。
+    换算一律走适配器的 price_unit，不在业务代码里写死。
     """
     value = platform_registry.price_to_platform("youzan", amount_yuan)
     return round(float(value or 0), 2)
@@ -1192,48 +1254,183 @@ def _youzan_payload(product, mapping, group_config=None, shop_id=None):
 
     item = {
         "title": title,
-        "desc": description,
-        "image_ids": ",".join(images[:15]),
+        "desc": _youzan_desc_html(product, description),
+        # 主图只收素材 ID（_platform_image 缓存的是 {"id","url"}，这里取 id）
+        "image_ids": ",".join(_youzan_image_id(one) for one in images[:15] if _youzan_image_id(one)),
         "cid": str(cid),
         "delivery_template_id": str(template_id),
         # 商家编码：ID 回填与"重发去重"都靠它（对应有赞 items.custom.get 的查询键）
         "item_no": product.get("product_code"),
     }
 
-    skus = []
-    for sku in product.get("skus", []):
-        item_sku = {
-            "price": _youzan_price(sku.get("price")),
-            "quantity": int(float(sku.get("stock") or 0)),
-            "sku_no": sku.get("sku_code"),
-        }
-        if sku.get("uploaded_sku_image"):
-            item_sku["image_id"] = sku["uploaded_sku_image"]      # ★字段名待核对
-        skus.append(item_sku)
-    if skus:
-        item["sku_list"] = skus
-        # 商品级 price/quantity 同样是必填：取首个 SKU 价 + 库存合计兜底
-        # （多规格时平台以 sku_list 为准，这两个值只影响后台列表展示）
-        item["price"] = skus[0]["price"]
-        item["quantity"] = sum(one["quantity"] for one in skus)
-    else:
-        item["price"] = _youzan_price(product.get("price"))
-        item["quantity"] = int(float(product.get("stock") or 0))
-
-    # 规格维度（"颜色/重量"这类）：货盘 specs → 有赞 sku_properties（★结构待核对）
-    properties = {}
-    for sku in product.get("skus", []):
-        for spec in sku.get("specs") or []:
-            name = str(spec.get("name") or "").strip()
-            value = str(spec.get("value") or "").strip()
-            if name and value:
-                properties.setdefault(name, [])
-                if value not in properties[name]:
-                    properties[name].append(value)
-    if properties:
-        item["sku_properties"] = [{"name": name, "values": [{"name": v} for v in values]}
-                                  for name, values in properties.items()]
+    item["price"] = _youzan_price(product.get("price"))
+    item["quantity"] = int(float(product.get("stock") or 0))
+    sku_stocks, sku_images = _youzan_sku_stocks(product)
+    if sku_stocks:
+        # 商品级 price/quantity 永远是必填（有赞会拿它们做列表展示兜底），
+        # 多规格时真实价格以 sku_stocks 为准。
+        item["price"] = sku_stocks[0]["price"]
+        item["quantity"] = sum(one["quantity"] for one in sku_stocks)
+        item["sku_stocks"] = json.dumps(sku_stocks, ensure_ascii=False)
+        if sku_images:
+            item["sku_images"] = json.dumps(sku_images, ensure_ascii=False)
     return item
+
+
+def _youzan_desc_html(product, description):
+    """有赞商品描述（富文本 HTML）：文字 + 详情图。
+
+    ✅ 2026-10-15 真机结论：有赞**没有独立的「详情图」字段**（不像微信 desc_info.imgs /
+    小红书 imageDescriptions），详情图只能写进 ``desc`` 富文本的 ``<img src>``；
+    而 desc 必须 >5 且 <25000 字符 —— 图多时只放得下前若干张，这里按字符预算截断并留提示。
+    ⚠️ 素材上传返回的是 image_id + image_url 两个值：主图用 id、详情图只能用 **url**。
+    """
+    parts = [f"<p>{description}</p>"]
+    used, skipped = 0, 0
+    for reference in product.get("detail_images") or []:
+        url = _youzan_image_url(reference)
+        if not url:
+            skipped += 1
+            continue
+        # 预留 200 字符给结尾提示；有赞 desc 上限 25000
+        if sum(len(one) for one in parts) + len(url) + 40 > 24000:
+            skipped += 1
+            continue
+        parts.append(f'<p><img src="{url}" /></p>')
+        used += 1
+    if skipped:
+        parts.append(f"<p>（另有 {skipped} 张详情图因超出平台描述长度上限未展示）</p>")
+    return "".join(parts)
+
+
+def _youzan_sku_stocks(product):
+    """货盘 SKU → 有赞 ``sku_stocks`` / ``sku_images``（都是 **JSON 字符串**）。
+
+    ✅ 2026-10-15 核对（官方《有赞云开放接口商品场景对接说明》+ 真机）：
+      ``sku_stocks`` = ``[{"price":分, "quantity":n, "item_no":"规格编码",
+                            "skus":[{"k":"尺寸","kid":2,"v":"2克拉","vid":35997}, …]}]``
+      · 编码字段是 **item_no**（不是 sku_no）；规格维度放在每个 SKU 的 ``skus`` 数组里，
+        ``kid``/``vid`` **由我们自定义**，只要同一维度/同一值在所有 SKU 中保持一致；
+      · 最多三级规格；``sku_stocks`` 条数必须等于各维度取值数的**笛卡尔积**，
+        不存在的组合也要以 **库存 0** 传进来，否则平台报「sku 信息不完整」；
+      · ``sku_images`` = ``[{"v":"规格值","img_url":"…"}]``，**仅第一级规格**，
+        必须与第一级规格取值一一对应。
+    ⚠️ 踩过的坑：之前发的是 ``sku_list``（键名不存在）→ 平台**静默忽略**，
+      商品建出来了但一个规格都没有（详情 ``skus`` 为空），只能靠真机发现。
+
+    两条运营口径（2026-10-15 定）：
+      1. **规格缺值的 SKU 直接拦下**（不静默丢）：货盘里「戒托颜色」空着很常见（实测整批
+         560 个 SKU 里 109 个），有赞要求每个 SKU 的规格维度完全一致，表达不了 → 以前是
+         静默丢弃 + 补 0 库存占位，运营只会看到"少了一个规格"。现在失败并把缺哪个值点名。
+      2. **占位组合**（笛卡尔积里货盘没有的组合）编码留空、价格取该商品最低价 —— 不拼假编码
+         （拼出来的 `XXX-510分-白色` 在后台看着像真规格）、价格也不虚高。
+    """
+    skus = product.get("skus") or []
+    if not skus:
+        return [], []
+
+    def combo_of(sku):
+        """该 SKU 的 ``{维度名: 取值}``（只收非空的，缺值在 ② 会单独拦）。"""
+        combo = {}
+        for spec in sku.get("specs") or []:
+            name = str(spec.get("name") or "").strip()[:20]
+            value = str(spec.get("value") or "").strip()[:20]
+            if name and value:
+                combo[name] = value
+        return combo
+
+    # ① 收集维度与取值（保持出现顺序，kid/vid 从 1 起编号并全局一致）
+    dims = []            # [{"name": k, "kid": n, "values": [v, …]}]
+    for sku in skus:
+        for spec in sku.get("specs") or []:
+            name = str(spec.get("name") or "").strip()[:20]      # 有赞限制 ≤20 字符
+            value = str(spec.get("value") or "").strip()[:20]
+            if not name or not value:
+                continue
+            dim = next((one for one in dims if one["name"] == name), None)
+            if dim is None:
+                dim = {"name": name, "kid": len(dims) + 1, "values": []}
+                dims.append(dim)
+            if value not in dim["values"]:
+                dim["values"].append(value)
+    if not dims:
+        return [], []                    # 商品本来就没有规格：交给商品级价格
+    if len(dims) > 3:
+        # 有赞最多三级规格。静默丢掉规格会让商品"发出去但没有规格"，比报错更难发现。
+        raise RuntimeError(
+            f"有赞最多支持 3 级规格，本商品有 {len(dims)} 级（{'、'.join(dim['name'] for dim in dims)}）；"
+            "请合并规格维度后再发")
+
+    # ② 规格缺值的 SKU 直接拦下并点名（不静默丢数据）
+    #    货盘里常见「戒托颜色」空着（实测整批 560 个 SKU 里有 109 个），这种 SKU 在有赞里
+    #    无法表达（有赞要求每个 SKU 的规格维度完全一致），以前是静默丢弃 + 补一条 0 库存占位，
+    #    结果运营看到的是"少了一个规格"却查不出原因。现在直接失败，把缺哪个值写进失败清单。
+    incomplete = []
+    for sku in skus:
+        combo = combo_of(sku)
+        missing = [dim["name"] for dim in dims if not combo.get(dim["name"])]
+        if missing:
+            incomplete.append(f"{sku.get('sku_code') or '(无编码)'}（缺 {'、'.join(missing)}）")
+    if incomplete:
+        raise RuntimeError(
+            "有赞规格不完整，未发布：以下 SKU 的规格值在货盘里是空的，请先在货盘表补上再发 —— "
+            + "；".join(incomplete[:12])
+            + (f"；另有 {len(incomplete) - 12} 个" if len(incomplete) > 12 else ""))
+
+    # ②.5 把「真的有规格图」的维度排到第一级。
+    #   有赞的 ``sku_images`` **只认第一级规格**；而货盘的图是按颜色拍的一整套，
+    #   若第一级是「主钻分数」，图就会被挂到分数上（后台看着像配错图），颜色反而一张图都没有。
+    #   这里按「该维度有多少个取值能配上图」挑第一级，让图和运营的预期一致（仅影响有赞的
+    #   规格图归属与展示顺序，不改变规格名与取值，不影响微信/小红书）。
+    if len(dims) > 1:
+        def image_coverage(dim):
+            covered = set()
+            for sku in skus:
+                combo = combo_of(sku)
+                if combo.get(dim["name"]) and _youzan_image_url(sku.get("uploaded_sku_image")):
+                    covered.add(combo[dim["name"]])
+            return len(covered)
+
+        best = max(dims, key=image_coverage)
+        if image_coverage(best) > image_coverage(dims[0]):
+            dims.remove(best)
+            dims.insert(0, best)
+    for index, dim in enumerate(dims, 1):        # kid 重新按展示顺序编号，保持 1..n
+        dim["kid"] = index
+        dim["vids"] = {value: index2 + 1 for index2, value in enumerate(dim["values"])}
+
+    # ③ 笛卡尔积补全：有赞要求条数 = 各维度取值数的乘积，不存在的组合必须以库存 0 出现。
+    by_combo = {}
+    for sku in skus:
+        combo = combo_of(sku)
+        by_combo[tuple(combo[dim["name"]] for dim in dims)] = sku
+
+    # 占位组合（货盘没有的组合）：编码留空 + 价格取该商品**最低价**
+    # （拼出来的假编码会在后台看起来像真规格；取最低价则不会虚高）
+    real_prices = [_youzan_price(sku.get("price")) for sku in by_combo.values()]
+    placeholder_price = min(real_prices) if real_prices else _youzan_price(product.get("price"))
+    stocks = []
+    for combo in itertools.product(*[dim["values"] for dim in dims]):
+        sku = by_combo.get(tuple(combo))
+        stocks.append({
+            "price": _youzan_price(sku.get("price")) if sku else placeholder_price,
+            "quantity": int(float(sku.get("stock") or 0)) if sku else 0,
+            "item_no": str((sku or {}).get("sku_code") or "")[:40],
+            "skus": [{"k": dim["name"], "kid": dim["kid"], "v": value, "vid": dim["vids"][value]}
+                     for dim, value in zip(dims, combo)],
+        })
+
+    # ④ 第一级规格图：值 → 图；只取真的有图的规格（没有 URL 的跳过，绝不塞 JSON/素材 ID）
+    first = dims[0]
+    images = {}
+    for sku in skus:
+        combo = combo_of(sku)
+        url = _youzan_image_url(sku.get("uploaded_sku_image"))
+        if url and combo.get(first["name"]):
+            images.setdefault(combo[first["name"]], url)
+    sku_image_list = [{"v": value, "img_url": images[value]}
+                      for value in first["values"] if value in images]
+    return stocks, sku_image_list
 
 
 # 跨店发布：任务(job)里存了目标店的店铺私有参数，执行时必须覆盖批次里的来源店参数，
@@ -1340,8 +1537,10 @@ def _publish_xhs(product, mapping, group_config, shop_id):
 def _publish_youzan(product, mapping, group_config, shop_id):
     """有赞发布：一个接口创建商品（含 SKU）。
 
-    返回体归一：有赞返回 item_id / sku_ids（★字段名待核对），这里补一个中台通用的
-    ``product_id`` 键，让 publish_items.platform_product_id 的写入与别家平台一致。
+    返回体归一：有赞 ``item.create`` 返回的是**完整商品对象**，而且外面多包一层 ``item``
+    （``{"ok":true,"result":{"item":{"item_id":…, "skus":[…]}}}``）—— 2026-10-15 真机核对。
+    ⚠️ 踩过的坑：原先直接读 ``value["item_id"]``，于是平台商品建出来了、本地
+    ``platform_product_id`` 却是空（结果就是「发布成功但没有 ID」，回填货盘表时无 ID 可写）。
     """
     product = _prepare_platform_images(product, "youzan", shop_id=shop_id)
     path = platform_registry.adapter("youzan")["publish_path"]
@@ -1350,11 +1549,16 @@ def _publish_youzan(product, mapping, group_config, shop_id):
     if result.get("ok") is False:
         raise RuntimeError(str(result.get("detail") or result)[:500])
     value = result.get("result")
-    if isinstance(value, dict):
-        if value.get("item_id") and not value.get("product_id"):
-            value["product_id"] = value["item_id"]
-        return value
-    return {"product_id": value}
+    if not isinstance(value, dict):
+        return {"product_id": value}
+    # 解包 item（真机形态）；老写法/未来形态也兼容：没有 item 就用外层
+    inner = value.get("item") if isinstance(value.get("item"), dict) else value
+    item_id = inner.get("item_id") or inner.get("id") or value.get("item_id")
+    if inner.get("skus") and not inner.get("skuIds"):
+        inner["skuIds"] = [str(one.get("sku_id")) for one in inner["skus"] if one.get("sku_id")]
+    if item_id:
+        inner["product_id"] = item_id
+    return inner
 
 
 # 平台 → 发布处理器。接新平台 = 在 platform_registry 加一条适配器 + 在这里加一个 _publish_<平台>，
@@ -1825,6 +2029,19 @@ def fetch_share_image(source, shop_id=None):
     return target, content
 
 
+def merge_detail_images(main_images, own_details, extra_details, common_details):
+    """拼「详情图」：商品主图 → 商品自有详情页 → 已有详情图 → 通用通栏（去重、保序）。
+
+    运营口径（2026-10-15 明确）：**详情页 = 商品图 + 通用详情图** —— 详情开头就是商品图，
+    通用通栏（包装/品牌/证书）收尾；共享盘上带「<编码>详情页」的商品，自己的详情页夹在中间。
+    两个导入路径（服务器扫描 / 浏览器文件夹上传）必须共用这一份口径，否则同样一批货
+    换个导入方式发出去的详情就不一样了（这次就是这么踩出来的：文件夹路径有商品图、
+    扫描路径只有通用通栏）。
+    """
+    parts = [*(main_images or []), *(own_details or []), *(extra_details or []), *(common_details or [])]
+    return list(dict.fromkeys(str(one).strip() for one in parts if str(one or "").strip()))
+
+
 def _store_folder_images(files, batch_id, rows, common_detail_files=None):
     """Save browser-selected folder files and resolve Excel image filenames."""
     batch_dir = os.path.join(IMAGE_DIR, batch_id)
@@ -1883,9 +2100,9 @@ def _store_folder_images(files, batch_id, rows, common_detail_files=None):
                     # 没有「详情/detail」字样且多张时,除主图外都当详情图
                     detail_candidates = [ref for name, ref in sorted(matches)[1:]]
                 row["detail_images"] = detail_candidates
-            for reference in common_details:
-                if reference not in row["detail_images"]:
-                    row["detail_images"].append(reference)
+            # 详情图 = 商品主图 + 商品自己的详情图 + 通用详情图（与扫描路径同一口径）
+            row["detail_images"] = merge_detail_images(
+                row.get("main_images"), [], row.get("detail_images"), common_details)
             # 兜底:商品没匹配到主图时,优先用本次批次里 1:1 且 ≥800 的图(KGN 这类),其次才用通用详情
             # 1:1 + ≥800 才能过小红书 createItemV2 的「图片像素不低于800x800 (1:1)」
             if not row.get("main_images"):
@@ -2849,6 +3066,17 @@ def platform_sku_ids(platform, product_id, shop_id=None):
             sku_id = str(sku.get("id") or sku.get("skuId") or "").strip()
             if code and sku_id:
                 mapping[code] = sku_id
+    elif platform == "youzan":
+        # 真机：GET /products/{id} → {"ok":true,"result":{"item":{…,"skus":[{sku_id,item_no,…}]}}}
+        if data.get("ok") is False:
+            raise RuntimeError(str(data.get("detail") or data)[:200])
+        item = (data.get("result") or {}).get("item") or {}
+        for sku in item.get("skus") or []:
+            # 规格编码字段是 item_no（create 入参与详情出参都叫 item_no）
+            code = _sku_key(sku.get("item_no"))
+            sku_id = str(sku.get("sku_id") or "").strip()
+            if code and sku_id:
+                mapping[code] = sku_id
     else:
         raise RuntimeError(f"平台 {platform} 的规格ID解析尚未实现（按接口清单确认响应字段后补分支）")
     return mapping
@@ -3009,7 +3237,8 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
     匹配规则见 image_scanner.py:
       - 商品主图   = 商品文件夹根下的本色图(按 主图1 -> 主图2 -> 白底 -> PNG 排序)
       - SKU 图     = 该 SKU 的「主图2」(运营指定), 落到 row["sku_image"]
-      - 通用详情图 = 通用通栏目录, 追加到每个商品的详情图
+      - 商品详情图 = 商品文件夹里的「<编码>详情页」(整张长图或 images/ 下的分片), 排在通用通栏之前
+      - 通用详情图 = 通用通栏目录, 追加到每个商品的详情图(包装/品牌/证书等收尾图)
     扫描阶段只记录共享盘路径(懒拷贝), 不占磁盘; 真正发布到某个商品时,
     才读它的图片字节落盘缓存(内容 sha256 去重), 再上传平台拿素材 URL。
 
@@ -3041,6 +3270,7 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
         raise HTTPException(500, f"扫描图片失败：{exc}")
 
     product_main = {}      # 商品编码 -> [共享盘图片引用]    (多 SKU 行共用, 只解析一次)
+    product_detail = {}    # 商品编码 -> [共享盘图片引用]（商品自有详情图，多 SKU 行共用）
     sku_image = {}         # SKU 编码  -> 共享盘图片引用
     errors = []
     unmatched_skus = []
@@ -3060,22 +3290,29 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
 
     products_matched = 0
     skus_matched = 0
+    detail_products_matched = 0
+
+    def resolve_by_code(table, code):
+        """按「精确 → 去系列标签 → 最长前缀」命中扫描表（主图与详情图共用同一套口径）。
+
+        ① 精确；② 去系列标签(如 ZSTZ106XL-星悦 → ZSTZ106XL)；
+        ③ 图库文件夹名可能带中文后缀(如 HZL253福运钻 vs 商品编码 HZL253-如愿)，取最长前缀兜底。
+        """
+        base = code.split("-", 1)[0]
+        paths = table.get(code) or table.get(base)
+        if paths:
+            return paths
+        best_key = ""
+        for key in table:
+            if key and (key.startswith(base) or base.startswith(key)) and len(key) > len(best_key):
+                best_key = key
+        return table.get(best_key) if best_key else []
+
     for row in rows:
         code = str(row.get("product_code") or "")
         if code not in product_main:
-            base = code.split("-", 1)[0]
-            # ① 精确 → ② 去系列标签(如 ZSTZ106XL-星悦 → ZSTZ106XL)
-            paths = scan["root_images"].get(code) or scan["root_images"].get(base)
-            if not paths:
-                # ③ 图库文件夹名可能带中文后缀(如 HZL253福运钻 vs 商品编码 HZL253-如愿),
-                #    取最长前缀兜底; 仍匹配不到 = 图库里确实没有这个款
-                best_key = ""
-                for key in scan["root_images"]:
-                    if key and (key.startswith(base) or base.startswith(key)) and len(key) > len(best_key):
-                        best_key = key
-                paths = scan["root_images"].get(best_key) if best_key else None
             references = []
-            for path in (paths or [])[:5]:      # 平台主图最多 5 张
+            for path in resolve_by_code(scan["root_images"], code)[:5]:   # 平台主图最多 5 张
                 try:
                     references.append(localize(path))
                 except Exception as exc:
@@ -3085,10 +3322,27 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
                 products_matched += 1
             elif code:
                 unmatched_products.append(code)
+            # 商品自有详情图（共享盘上的 <编码>详情页.jpg / images/<编码>详情页_01..05.jpg）。
+            # 以前完全不收集 → 各平台详情里只有「通用通栏」，运营反馈"没有商品图"就是这个。
+            own_detail = []
+            for path in image_scanner.pick_detail_images(resolve_by_code(scan["detail_images"], code)):
+                try:
+                    own_detail.append(localize(path))
+                except Exception as exc:
+                    errors.append(f"详情图 {os.path.basename(path)}: {exc}")
+            product_detail[code] = own_detail
+            if own_detail:
+                detail_products_matched += 1
         if product_main[code]:
             row["main_images"] = product_main[code]
-        if common_refs:
-            row["detail_images"] = list(dict.fromkeys((row.get("detail_images") or []) + common_refs))
+                    # 详情图 = 商品主图 + 商品自有详情页 + 通用通栏（与「文件夹上传」路径同一口径，
+        # 见 merge_detail_images：运营口径是"详情页 = 商品图 + 通用详情图"）
+        # ⚠️ 这里**覆盖**而不是追加：扫出来的就是最终口径。若沿用上一次的值，反复扫图会把
+        #   "上一轮加过的图"（含后来判定为重复的拼接长图）一直留在详情里，永远删不掉。
+        merged_detail = merge_detail_images(
+            product_main.get(code) or [], product_detail.get(code) or [], [], common_refs)
+        if merged_detail:
+            row["detail_images"] = merged_detail
 
         sku_code = str(row.get("sku_code") or "")
         if sku_code not in sku_image:
@@ -3120,6 +3374,9 @@ def scan_batch_images(batch_id: str, body: ImageScanBody | None = None, request:
         "root": root, "months": months,
         "folders": scan["folders"], "scanned_images": scan["scanned"],
         "common_detail_images": len(scan["common_images"]),
+        # 商品自有详情图：共享盘上 <编码>详情页.jpg / images/<编码>详情页_01..05.jpg 的张数与命中商品数
+        "own_detail_images": sum(len(v) for v in product_detail.values()),
+        "own_detail_products": detail_products_matched,
         "products_matched": products_matched,
         "products_total": len({r.get("product_code") for r in rows}),
         "skus_matched": skus_matched, "skus_total": len(rows),
@@ -3410,8 +3667,8 @@ REFUND_DONE_STATUS = {
 }
 # 金额单位：微信=分（官方文档），小红书=元（字段名 refundAmountYuan 暗示「元」，待真机核对）
 # 订单「支付金额」单位：实测小红书订单详情 totalPayAmount 也是**分**（109900 = 1099.00 元）
-# 有赞：★待真机对账一次（item.create 的 price 确定是「元」，订单金额字段须实测确认；
-#       写错不会报错，只会让面板金额放大/缩小 100 倍）。
+# 有赞：★待真机对账一次（2026-10-15 已确认**商品**接口的 price 是「分」；
+#       订单/退款金额字段仍未实测，写错不会报错，只会让面板金额放大/缩小 100 倍）。
 ORDER_AMOUNT_UNIT = {"wechat": "cent", "xhs": "cent", "youzan": "yuan"}
 # 售后退款金额单位与订单不同：小红书字段名 refundAmountYuan/expectedRefundAmountYuan 带 Yuan → 元
 REFUND_AMOUNT_UNIT = {"wechat": "cent", "xhs": "yuan", "youzan": "yuan"}
@@ -3632,15 +3889,45 @@ def _local_order_rows(shop_id, platform, stat_date):
         conn.close()
 
 
-def _order_detail_rows(platform, shop_id, stat_date):
+def _orders_confirmed_empty(shop_id, platform, stat_date):
+    """这一天是否已经由同步确认「一单都没有」。
+
+    没有订单明细行 ≠ 还有订单没拉：像「钻石世家/微信」「喜安商贸/小红书」这种当天
+    确实零单的店×平台，本地明细表天然是空的，而 _order_detail_rows 只看有没有行，
+    于是每次查明细都要为这些天白等一次平台接口往返（近 7 天就是十几次），
+    表格在那儿一直转圈。同步时已经把"这天 0 单"写进聚合表了，这里直接用那个事实。
+
+    ⚠️ 只有 sync_error 为空才算数：同步失败时聚合行是 0 填充的，不能当成"确认没单"。
+    ⚠️ 当天也适用：平台当天没返回就是没有；第二天补同步会把 order_count 与明细一起改写
+       （_write_order_items 先删当天旧行再写），所以最坏情况就是当天少显示，第二天自动补上。
+    """
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT order_count, sync_error FROM order_daily_metrics"
+            " WHERE shop_id=? AND platform=? AND stat_date=?",
+            (shop_id, platform, stat_date)).fetchone()
+    finally:
+        conn.close()
+    return bool(row) and not str(row[1] or "").strip() and int(row[0] or 0) == 0
+
+
+def _order_detail_rows(platform, shop_id, stat_date, allow_live=True):
     """某店某平台某天的订单明细行 + 备注。
 
     **本地优先**：同步时已经把明细落库了，所以这里直接读 SQLite（毫秒级）。
     只有"还没同步过的日子"才实时打平台接口（带短 TTL 缓存）——这正是导出变慢的根源。
+    allow_live=False 时**绝不**打平台接口（只读本地），明细面板用它先秒出已有数据、
+    再单独补拉没同步过的部分。
     """
     local = _local_order_rows(shop_id, platform, stat_date)
     if local:
         return local, []
+    if not allow_live:
+        return [], []
+    # 同步过且确认 0 单：本地没有明细行就是真的没有，不必再去问平台一次
+    if _orders_confirmed_empty(shop_id, platform, stat_date):
+        return [], []
     key = f"{shop_id}|{platform}|{stat_date}"
     cached = _order_detail_cache_get(key)
     if cached:
@@ -4668,7 +4955,7 @@ def _load_order_views(shop_ids, start, end, platform=""):
 # 结构对齐运营给的《日销售数据统计表》：① 汇总页（周期×平台）② 每个平台一张日销售
 # ③ 每个平台一张交易清单（逐笔订单）④ 口径说明。
 # 三个键：列键、列名、数字格式（money/int/rate/date/datetime；None=原样写出）。
-PLATFORM_DISPLAY = {"wechat": "微信小店", "xhs": "小红书"}
+PLATFORM_DISPLAY = {"wechat": "微信小店", "xhs": "小红书", "youzan": "有赞"}
 EXPORT_SUMMARY_COLUMNS = [
     ("seq", "序号", None), ("period", "日期", None), ("week_seg", "周段", None),
     ("platform", "平台", None), ("visits", "访客流量", "int"),
@@ -5262,15 +5549,20 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
                    end: str = Query("", description="YYYY-MM-DD；区间模式结束"),
                    platform: str = Query("", description="wechat / xhs；不传=该店已配的全部平台"),
                    shop: str = Query("", description="店铺范围：all=全部店铺汇总；不传=跟随当前店铺"),
-                   keyword: str = Query("", description="按订单编号/订单号模糊搜"),
-                   limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0)):
+                  keyword: str = Query("", description="按订单编号/订单号模糊搜"),
+                  live: bool = Query(True, description="false=只读本地已同步的明细（毫秒级），"
+                                                       "不实时打平台接口；前端用它先秒出再补拉"),
+                  limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0)):
     """【商品明细】订单级明细（面板下方那张表的数据源）：支持单日（date）或区间（start/end）。
 
     和 /orders/metrics 的区别：那个是按天聚合的日报，这个是逐笔订单。
     **本地优先**：同步过的天直接读 SQLite（毫秒级）；没同步过的天才实时打平台接口
     （带 5 分钟内存缓存，区间模式下并发拉 + 总超时，超时的天跳过并在 notes 写明）。
     区间最长 62 天，超出自动截断并在 notes 里说明。
-    店铺范围沿用面板自己的 shop 参数（'all'=全部店铺汇总），与顶栏当前店铺解耦。
+    店铺范围沿用面板自己的 shop 参数（all = 全部店铺汇总），与顶栏当前店铺解耦。
+
+    live=false 是给前端的两段式用的：先只要本地数据（毫秒级，表格立刻有内容），
+    拿返回的 pending_live 判断还有多少没同步，再决定要不要发第二次带实时拉的请求。
     """
     stat_date = date or datetime.now().strftime("%Y-%m-%d")
     try:
@@ -5283,6 +5575,9 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
     rows, notes = [], []
     # 显式筛了平台、但某家店压根没配这个平台 → 跳过该店（下面写进 notes 说明原因）
     skipped_shops = []
+    # 本地没有明细、只能靠实时拉才算齐的「店×平台×天」数量。
+    # live=false 那轮前端用它决定"要不要再补一次请求"，别让整张表陪着平台接口一起转圈。
+    pending_live = 0
     # 区间模式（start/end 任传一个即生效；只传一个就当单日查）
     range_mode = bool(start or end)
     range_first = range_last = stat_date
@@ -5303,7 +5598,7 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
         range_last = last_day.strftime("%Y-%m-%d")
         days = [(first_day + timedelta(days=off)).strftime("%Y-%m-%d")
                 for off in range((last_day - first_day).days + 1)]
-        live = []
+        live_pairs = []
         for shop_id in shop_ids:
             targets = _detail_targets(shop_id, platform)
             if platform and not targets:
@@ -5315,14 +5610,20 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
                     if local:
                         rows.extend(local)
                     else:
-                        live.append((target, shop_id, day))
-        if live:
-            notes.append(f"区间里有 {len(live)} 个「店×平台×天」没同步过明细，正在实时向平台拉取；"
+                        live_pairs.append((target, shop_id, day))
+        pending_live = len(live_pairs)
+        if live_pairs and not live:
+            # 只读本地这一轮：先把"还差多少没同步"说清楚，已有的数据立刻就能看，
+            # 要不要补拉由前端自己决定（它会再发一次带实时拉的请求）。
+            notes.append(f"还有 {pending_live} 个「店×平台×天」没同步过明细，"
+                         f"正在后台补拉；点「同步数据」后重查可秒出")
+        elif live_pairs:
+            notes.append(f"区间里有 {len(live_pairs)} 个「店×平台×天」没同步过明细，正在实时向平台拉取；"
                          f"先点「同步数据」再查可秒出")
             deadline = time.time() + EXPORT_DETAIL_FETCH_TIMEOUT
             with ThreadPoolExecutor(max_workers=EXPORT_DETAIL_FETCH_WORKERS) as pool:
                 futures = {pool.submit(_order_detail_rows, target, shop_id, day): (target, shop_id, day)
-                           for target, shop_id, day in live}
+                           for target, shop_id, day in live_pairs}
                 for future in as_completed(futures, timeout=max(1, deadline - time.time())):
                     try:
                         day_rows, day_notes = future.result()
@@ -5346,7 +5647,10 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
                 skipped_shops.append(_shop_display_name(shop_id))
                 continue
             for target in targets:
-                day_rows, day_notes = _order_detail_rows(target, shop_id, stat_date)
+                day_rows, day_notes = _order_detail_rows(target, shop_id, stat_date,
+                                                          allow_live=live)
+                if not day_rows:
+                    pending_live += 1
                 rows.extend(day_rows)
                 notes.extend(day_notes)
     if skipped_shops:
@@ -5367,6 +5671,8 @@ def orders_details(request: Request, date: str = Query("", description="YYYY-MM-
         "platforms": sorted({row["platform"] for row in rows}),
         "shops": sorted({row["shop_id"] for row in rows}),
         "notes": list(dict.fromkeys(notes)),
+        # 本地没有、这次也没实时拉的「店×平台×天」数量：前端据此决定要不要再补一次请求
+        "pending_live": pending_live,
         "amount_unit": ORDER_AMOUNT_UNIT,
         # 实付金额合计只统计当前这一页之外的**全量**，前端用来对一下总额对不对
         "sum_paid_amount": round(sum(row["paid_amount"] for row in rows), 2),
@@ -5563,6 +5869,143 @@ def orders_metrics(request: Request, start: str = Query(""), end: str = Query(""
     }}
 
 
+# ==================================================================
+# 有赞商品编辑（列表页「编辑」抽屉用）
+# ==================================================================
+# 为什么放在中台而不是让前端直连 8030:
+#   ① 单位换算必须走适配器（内部统一元、有赞接口收分）—— 散在前端就会重演"元/分搞反"；
+#   ② 标题上限、必填项校验要跟发布链路同一套规则（platform_registry），不能各写一份；
+#   ③ **必须回读校验**：真机实测 youzan.item.update 对不支持的字段会返回
+#      {"is_success": true} 但字段根本没变（sku_images 就是这么骗人的），只看返回值会误报成功。
+#
+# 只开放"改得安全且已真机验证"的字段：标题 / SKU 价格 / SKU 库存 / 上下架。
+# 类目与详情图不开放：类目改错要重新提交审核，详情图只能写进 desc 富文本（raw HTML 不该让人手改）。
+class YouzanItemEditBody(BaseModel):
+    item_id: str
+    title: str | None = None
+    # [{"sku_id": …, "price": 元, "quantity": 整数}]，只传要改的行
+    skus: list[dict] | None = None
+    listing: int | None = None            # 1=上架 0=下架（可选）
+
+
+def _youzan_item_detail(item_id, shop_id):
+    """回读有赞商品详情，返回 ``{"ok":bool, "item":{…}}``（统一异常文案）。"""
+    try:
+        data = _http_get_json(f"{YOUZAN_API_BASE}/products/{item_id}", timeout=60, shop_id=shop_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": _http_error_message(exc)}
+    if data.get("ok") is False:
+        return {"ok": False, "error": str(data.get("detail") or data)[:300]}
+    item = (data.get("result") or {}).get("item") or {}
+    return {"ok": True, "item": item}
+
+
+@app.post("/youzan/item-edit")
+def youzan_item_edit(body: YouzanItemEditBody, request: Request):
+    """【有赞商品编辑】改标题 / SKU 价格 / SKU 库存 / 上下架，并**回读校验**是否真生效。
+
+    ⚠️ 两条真机实测出来的口径（都曾把我们坑了，改这块前务必看一眼）：
+
+      ① **价格单位在"创建"和"修改"上是相反的**：
+         ``item.create`` 的 ``sku_stocks[].price`` 收**分**（``_youzan_price`` 换算），
+         而 ``item.sku.update`` 的 ``price`` 收**元**。按分传 20128600 会被平台读成
+         2012 万**元**，直接报 ``code=123001065 SKU价格超过最大限制``。
+      ② **库存只能"增量"**（``youzan.item.quantity.update`` 的 ``type`` 只认 1=增量，
+         type=2/3 报 ``code=123000104 不支持的库存更新类型``）—— 平台**没有全量覆盖**，
+         所以要把库存设成绝对值，必须先回读现值、自己算差值。
+
+    返回 ``{ok, changed, warnings, item}``：
+      - ``warnings`` 是"接口说成功但回读没变"的项（``item.update`` 会这样骗人，必须让运营看见）；
+      - ``item`` 是回读后的标题与规格，前端据此刷新，不必再单独查一次详情。
+    """
+    shop_id = _current_shop_id(request)
+    item_id = str(body.item_id or "").strip()
+    if not item_id:
+        raise HTTPException(400, "缺少商品 ID")
+    if not shop_registry.has_platform(shop_id, "youzan"):
+        raise HTTPException(400, f"店铺 {shop_id} 未开通有赞")
+
+    adapter = platform_registry.adapter("youzan")
+    title_max = int(adapter.get("title_fit_max") or 60)
+    changed, warnings = [], []
+
+    # ① 先回读一次：算库存增量用（平台只能增量），同时留作校验基线
+    before = _youzan_item_detail(item_id, shop_id)
+    if not before.get("ok"):
+        raise HTTPException(502, f"读取商品详情失败：{before.get('error')}")
+    before_item = before.get("item") or {}
+    before_skus = {str(one.get("sku_id")): one for one in (before_item.get("skus") or [])}
+
+    # ② 标题
+    new_title = (body.title or "").strip()
+    if new_title:
+        if len(new_title) > title_max:
+            raise HTTPException(400, f"标题超长：{len(new_title)} 字，有赞上限按 {title_max} 字（保守值），请缩短后再保存")
+        _json_put(f"{YOUZAN_API_BASE}/products/{item_id}", {"title": new_title}, shop_id=shop_id)
+        changed.append("标题")
+
+    # ③ SKU 价格：**单位是元**（与创建的 sku_stocks 用分相反，见上面口径①）
+    for row in (body.skus or []):
+        sku_id = str(row.get("sku_id") or "").strip()
+        if not sku_id:
+            continue
+        if row.get("price") not in (None, ""):
+            price = round(float(row.get("price")), 2)
+            if price <= 0:
+                raise HTTPException(400, "价格必须大于 0")
+            _json_put(f"{YOUZAN_API_BASE}/skus/{sku_id}", {"item_id": item_id, "price": price}, shop_id=shop_id)
+            changed.append(f"SKU {sku_id} 价格")
+        # ④ SKU 库存：平台只支持增量，先回读现值再算差值（口径②）
+        if row.get("quantity") not in (None, ""):
+            target = int(float(row.get("quantity")))
+            if target < 0:
+                raise HTTPException(400, "库存不能为负")
+            current = int(float((before_skus.get(sku_id) or {}).get("quantity") or 0))
+            delta = target - current
+            if delta:
+                _json_post(f"{YOUZAN_API_BASE}/skus/{sku_id}/quantity",
+                           {"item_id": item_id, "quantity": delta, "type": 1}, shop_id=shop_id)
+                changed.append(f"SKU {sku_id} 库存({current}→{target})")
+            else:
+                warnings.append(f"规格 {sku_id} 的库存已经是 {target}，无需修改")
+
+    # ⑤ 上下架
+    if body.listing is not None:
+        _json_post(f"{YOUZAN_API_BASE}/products/{item_id}/listing",
+                   {"listing": 1 if int(body.listing) else 0}, shop_id=shop_id)
+        changed.append("上架" if int(body.listing) else "下架")
+
+    if not changed:
+        return {"ok": True, "changed": [], "warnings": warnings or ["没有要改的内容"], "item": {}}
+
+    # ⑥ 回读校验：接口返回成功 ≠ 字段真的变了（真机实测 item.update 会这样）
+    detail = _youzan_item_detail(item_id, shop_id)
+    item = detail.get("item") or {}
+    if not detail.get("ok"):
+        warnings.append(f"回读失败，无法确认是否生效：{detail.get('error')}")
+    else:
+        if new_title and str(item.get("title") or "").strip() != new_title:
+            warnings.append("标题在平台上没有变成提交的值（有赞可能仍在审核，稍后再看）")
+        live = {str(one.get("sku_id")): one for one in (item.get("skus") or [])}
+        for row in (body.skus or []):
+            sku_id = str(row.get("sku_id") or "")
+            sku = live.get(sku_id)
+            if not sku:
+                warnings.append(f"规格 {sku_id} 回读不到，平台可能已删除该规格")
+                continue
+            if row.get("price") not in (None, "") and \
+                    abs(round(float(sku.get("price") or 0) / 100, 2) - round(float(row.get("price")), 2)) > 0.01:
+                warnings.append(f"规格 {sku_id} 的价格平台没改成功（回读 {float(sku.get('price') or 0) / 100:.2f} 元）")
+            if row.get("quantity") not in (None, "") and int(float(sku.get("quantity") or 0)) != int(float(row.get("quantity"))):
+                warnings.append(f"规格 {sku_id} 的库存平台没改成功（回读 {sku.get('quantity')}）")
+
+    summary = {"title": item.get("title") or "", "listing": item.get("is_listing"),
+               "skus": [{"sku_id": str(one.get("sku_id")), "item_no": one.get("item_no") or "",
+                          "price": one.get("price"), "quantity": one.get("quantity")}
+                         for one in (item.get("skus") or [])]}
+    return {"ok": True, "changed": changed, "warnings": warnings, "item": summary}
+
+
 @app.get("/publish-status")
 def publish_status(request: Request):
     """【发布状态】按商品编码汇总**当前店铺所有批次**的发布记录。
@@ -5573,9 +6016,11 @@ def publish_status(request: Request):
       未发布, 于是再重复发一遍 —— 平台对重复标题直接拒绝(-5000500 标题不能与现有商品标题重复)。
       商品编码跨批次稳定, 所以这里全局汇总, 换批次也不会丢。
 
-    只统计"有意义的终态": success/partial 表示确实发出去过; queued/running 表示正在发;
-    failed 表示发过但失败; cancelled 是被手动停掉的, 不算发过(前端按 none 处理);
-    deleted 是核对后发现平台商品已被删除的, 同样按 none 处理(可以重新发)。
+    状态口径：**每个 (商品, 平台) 只取最新一条记录的状态**（不是"历史上出现过成功就算已发布"）。
+    success/partial = 发出去过; queued/running = 正在发; failed = 发过但失败;
+    cancelled = 被手动停掉（前端按 none 处理）; deleted = 核对后发现平台已删（同样按 none，可重发）。
+    ⚠️ 为什么必须"最新为准"：商品在平台后台删掉后，核对只会把**最新那条**记录标成 deleted，
+    更早批次留下的 success 还躺在库里；按计数堆叠的话面板会永远显示"已发布"，运营以为删不掉。
 
     **模式隔离**：默认只统计 ``mode='live'`` 的记录（mock 是假成功，不能当已发布用），
     要看模拟记录加 ``?mode=mock``，全都要加 ``?mode=all``。
@@ -5585,18 +6030,23 @@ def publish_status(request: Request):
     shop_id = _current_shop_id(request)
     mode_where, mode_args = _mode_where(request)
     conn = db()
-    rows = conn.execute("SELECT product_code, platform, status, COUNT(*) n, MAX(finished_at) last_at "
+    # ⚠️ 2026-10-15 真机踩到：以前按 (商品,平台,状态) GROUP BY 后再把**所有**状态堆在一起，
+    #    于是"历史上成功过一次"就永远显示已发布 —— 商品在平台被删掉、核对已把最新记录标成
+    #    deleted，面板仍然显示"已发布"（KGN1000330-永恒：3 条 deleted + 2 条更早的 success）。
+    #    改成**只看每个 (商品,平台) 的最新一条记录**：最新那次是什么状态，就是当前事实。
+    #    这同时修掉另一类误导：旧记录 platform_product_id 为空/换批次重发后的旧成功，都不会再顶掉新状态。
+    rows = conn.execute("SELECT product_code, platform, status, finished_at "
                         "FROM publish_items WHERE shop_id=?" + mode_where +
-                        " GROUP BY product_code, platform, status",
+                        " ORDER BY finished_at",
                         (shop_id, *mode_args)).fetchall()
     conn.close()
     result = {}
-    for row in rows:
+    for row in rows:                      # 已按 finished_at 升序 → 后面的覆盖前面的 = 最新的
         entry = result.setdefault(row["product_code"], {"platforms": {}, "last_success_at": None})
-        entry["platforms"].setdefault(row["platform"], {})[row["status"]] = row["n"]
-        if row["status"] == "success" and row["last_at"]:
-            if not entry["last_success_at"] or row["last_at"] > entry["last_success_at"]:
-                entry["last_success_at"] = row["last_at"]
+        entry["platforms"][row["platform"]] = {row["status"]: 1}
+        if row["status"] == "success" and row["finished_at"]:
+            if not entry["last_success_at"] or row["finished_at"] > entry["last_success_at"]:
+                entry["last_success_at"] = row["finished_at"]
     # mode 回显：前端要据此标注"这批是模拟记录"，避免把 mock 当真实发布
     return {"ok": True, "result": result, "mode": mode_args[0] if mode_args else "live"}
 
@@ -5679,6 +6129,19 @@ def platform_item_state(platform, product_id, shop_id=None):
             return ITEM_GONE, "平台未返回商品数据"
         if str(product.get("status")) == "6":
             return ITEM_GONE, "商品在平台回收站（后台已删除）"
+        return ITEM_EXISTS, ""
+    if platform == "youzan":
+        # ✅ 2026-10-15 真机核对（云测试店铺，实测两种情况的原始返回）：
+        #   仍存在 → HTTP 200 {"ok":true,"result":{"item":{…title/cid/skus…}}}；
+        #   已删除 → HTTP 400 detail = "[youzan.item.get] 调用失败: code=122001001 商品不存在!"
+        #            （走上面的 gone_markers 分支判定，已经能用）。
+        # ⚠️ 以前**没有这个分支**，于是"商品还在"的 3 条全部落到末尾的"尚未实现"→
+        #    前端提示"3 条查不动（网络或权限问题）"，看起来像网络问题，其实是分支没写。
+        if data.get("ok") is False:
+            return ITEM_UNKNOWN, f"平台返回业务失败：{str(data.get('detail') or data)[:200]}"
+        item = (data.get("result") or {}).get("item") or {}
+        if not (item.get("item_id") or item.get("id") or item.get("title")):
+            return ITEM_GONE, f"平台未返回商品数据：{str(data)[:200]}"
         return ITEM_EXISTS, ""
     if platform == "xhs":
         # 小红书: 200 也要看返回体。商品被后台删掉后, 网关很可能回 200 + 空 result 而不是报错,
