@@ -22,6 +22,8 @@ shops.json*
 **/token_store.json
 # 小红书按店铺分 token 文件（xhs/tokens/<shop_id>.json）
 xhs/tokens/
+# 有赞按店铺分 token 文件（youzan/tokens/<shop_id>.json，含真实 access_token 与 kdt_id）
+youzan/tokens/
 *.pem
 *.key
 *.p12
@@ -44,6 +46,8 @@ images/
 **/images/
 # 批次来源记录 + 货盘表备份（bulk_api/_sources）：运行时数据、含本机绝对路径，不应进仓库
 bulk_api/_sources/
+# 商品图 URL 缓存（bulk_api/_cache_product_images.json）：运行时产物，含真实商品 ID 与图床链接
+bulk_api/_cache_product_images.json
 # 管易云同步产物（含平台 SKU 绑定映射，敏感）
 **/guanyi_xhs_mapping.json
 **/guanyi_sync_state.json
@@ -92,3 +96,8 @@ Thumbs.db
 .codebuddy/
 ui-preview/
 generated-images/
+# 设计/UI 工具生成的过程截图（ardot 等），只在本机看，不进仓库
+.ardot_shots/
+.screens/
+# 软著登记材料（源程序 PDF / 用户操作手册 / 说明书插图）：内部报送材料，不进公开仓库
+软著登记材料/
